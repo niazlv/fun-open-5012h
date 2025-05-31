@@ -1,0 +1,6 @@
+.settings
+#.vscode
+debug
+make/build
+.DS_Store
+.project

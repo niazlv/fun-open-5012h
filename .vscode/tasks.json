@@ -1,0 +1,64 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "type": "shell",
+            "label": "Build embedded project",
+            "command": "make",
+            "args": [],
+            "options": {
+                "cwd": "${workspaceFolder}/make"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "Сборка embedded проекта через Makefile"
+        },
+        {
+            "type": "shell",
+            "label": "Clean embedded project",
+            "command": "make",
+            "args": ["clean"],
+            "options": {
+                "cwd": "${workspaceFolder}/make"
+            },
+            "group": "build",
+            "detail": "Очистка build директории"
+        },
+        {
+            "type": "shell",
+            "label": "Flash with OpenOCD",
+            "dependsOn": "Build embedded project",
+            "options": {
+                "cwd": "${workspaceRoot}"
+            },
+            "command": "openocd",
+            "args": [
+                "-f",
+                "/opt/homebrew/Cellar/open-ocd/0.12.0_1/share/openocd/scripts/interface/wch-cmsis-dap.cfg",
+                "-f",
+                "/opt/homebrew/Cellar/open-ocd/0.12.0_1/share/openocd/scripts/target/stm32f4x.cfg",
+                "-c",
+                "program ${workspaceRoot}/make/build/open-5012h.elf verify reset exit"
+            ],
+            "group": "test",
+            "detail": "Прошивка микроконтроллера через OpenOCD"
+        },
+        {
+            "type": "shell",
+            "label": "Flash binary with edbg",
+            "dependsOn": "Build embedded project",
+            "command": "make",
+            "args": ["prog"],
+            "options": {
+                "cwd": "${workspaceFolder}/make"
+            },
+            "group": "test",
+            "detail": "Прошивка через edbg (как в Makefile)"
+        }
+    ]
+}

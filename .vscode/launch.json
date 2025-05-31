@@ -1,0 +1,35 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug (OpenOCD)",
+            "cwd": "${workspaceRoot}",
+            "executable": "${workspaceRoot}/make/build/open-5012h.elf",
+            "request": "launch",
+            "type": "cortex-debug",
+            "preLaunchTask": "Build embedded project",
+            "servertype": "openocd",
+            "interface": "swd",
+            "device": "GD32F407VET",
+            "runToEntryPoint": "main",
+            "svdFile": "${workspaceRoot}/resources/STM32F40x.svd",
+            "configFiles": [
+                "/opt/homebrew/Cellar/open-ocd/0.12.0_1/share/openocd/scripts/interface/wch-cmsis-dap.cfg",
+                "/opt/homebrew/Cellar/open-ocd/0.12.0_1/share/openocd/scripts/target/stm32f4x.cfg"
+            ],
+            "preLaunchCommands": [
+                "set mem inaccessible-by-default off",
+                "monitor reset"
+            ],
+            "postLaunchCommands": [
+                "monitor reset init",
+                "monitor sleep 100"
+            ],
+            "showDevDebugOutput": "raw",
+            "gdbPath": "/opt/homebrew/bin/arm-none-eabi-gdb"
+        }
+    ]
+}

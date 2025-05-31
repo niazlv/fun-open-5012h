@@ -1,0 +1,16 @@
+{
+    "files.associations": {
+        "*.h": "c",
+        "*.c": "c"
+    },
+    "C_Cpp.default.configurationProvider": "ms-vscode.cpptools",
+    "C_Cpp.default.intelliSenseMode": "gcc-arm",
+    "C_Cpp.default.cStandard": "gnu11",
+    "C_Cpp.default.cppStandard": "gnu++14",
+    "files.exclude": {
+        "**/make/build": true
+    },
+    "search.exclude": {
+        "**/make/build": true
+    }
+}
