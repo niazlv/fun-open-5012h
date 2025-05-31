@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdalign.h>
+#include <stddef.h>
 #include "gd32f4xx.h"
 #include "hal_gpio.h"
 #include "utils.h"
