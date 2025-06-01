@@ -157,4 +157,6 @@ Perform this procedure for both positive and negative vertical position settings
 
 This step must be performed for all vertical scale settings separately.
 
+### TODOLIST
 
+[here](doc/TODOLIST.md)
