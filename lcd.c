@@ -98,9 +98,14 @@ static inline void lcd_data_set_out(void)
 }
 
 //-----------------------------------------------------------------------------
-static inline void lcd_data_write(uint8_t value)
+// Precomputed GPIOE BOP word for a data byte: set bits in [7:0], clear bits in
+// [23:16]. The mask keeps the clear half to PE0-PE7 so PE8-PE15 (buttons) are
+// never touched.
+#define LCD_BOP_WORD(value)  ((((uint32_t)(uint8_t)~(value)) << 16) | (uint8_t)(value))
+
+static inline void lcd_data_write_bop(uint32_t bop)
 {
-  GPIOE->BOP = (~value << 16) | value;
+  GPIOE->BOP = bop;
   asm("nop");
   asm("nop");
   asm("nop");
@@ -115,6 +120,11 @@ static inline void lcd_data_write(uint8_t value)
   asm("nop");
   asm("nop");
   asm("nop");
+}
+
+static inline void lcd_data_write(uint8_t value)
+{
+  lcd_data_write_bop(LCD_BOP_WORD(value));
 }
 
 //-----------------------------------------------------------------------------
@@ -275,8 +285,9 @@ void lcd_draw_buf(int x, int y, int w, int h, const uint16_t *buf)
 
   for (int i = 0; i < size; i++)
   {
-    lcd_data_write(buf[i] >> 8);
-    lcd_data_write(buf[i]);
+    uint16_t v = buf[i];
+    lcd_data_write_bop(LCD_BOP_WORD(v >> 8));
+    lcd_data_write_bop(LCD_BOP_WORD(v));
   }
 
   HAL_GPIO_LCD_CS_set();
@@ -294,8 +305,9 @@ void lcd_draw_image(int x, int y, const Image *image)
 
   for (int i = 0; i < size; i++)
   {
-    lcd_data_write(image->data[i] >> 8);
-    lcd_data_write(image->data[i]);
+    uint16_t v = image->data[i];
+    lcd_data_write_bop(LCD_BOP_WORD(v >> 8));
+    lcd_data_write_bop(LCD_BOP_WORD(v));
   }
 
   HAL_GPIO_LCD_CS_set();
@@ -316,8 +328,8 @@ void lcd_draw_rect(int x, int y, int w, int h, int color)
 void lcd_fill_rect(int x, int y, int w, int h, int color)
 {
   int size = w * h;
-  int c0 = (color >> 8) & 0xff;
-  int c1 = color & 0xff;
+  uint32_t bop0 = LCD_BOP_WORD((color >> 8) & 0xff);
+  uint32_t bop1 = LCD_BOP_WORD(color & 0xff);
 
   lcd_set_rect(x, y, w, h);
 
@@ -326,8 +338,8 @@ void lcd_fill_rect(int x, int y, int w, int h, int color)
 
   for (int i = 0; i < size; i++)
   {
-    lcd_data_write(c0);
-    lcd_data_write(c1);
+    lcd_data_write_bop(bop0);
+    lcd_data_write_bop(bop1);
   }
 
   HAL_GPIO_LCD_CS_set();
@@ -365,6 +377,10 @@ void lcd_set_color(int bg, int fg)
 void lcd_putc(int x, int y, char ch)
 {
   int size = lcd_font->width * lcd_font->height;
+  uint32_t fg0 = LCD_BOP_WORD(fg_color[0]);
+  uint32_t fg1 = LCD_BOP_WORD(fg_color[1]);
+  uint32_t bg0 = LCD_BOP_WORD(bg_color[0]);
+  uint32_t bg1 = LCD_BOP_WORD(bg_color[1]);
   const uint8_t *bitmap;
 
   lcd_set_rect(x, y, lcd_font->width, lcd_font->height);
@@ -384,13 +400,13 @@ void lcd_putc(int x, int y, char ch)
 
     if (pixel)
     {
-      lcd_data_write(fg_color[0]);
-      lcd_data_write(fg_color[1]);
+      lcd_data_write_bop(fg0);
+      lcd_data_write_bop(fg1);
     }
     else
     {
-      lcd_data_write(bg_color[0]);
-      lcd_data_write(bg_color[1]);
+      lcd_data_write_bop(bg0);
+      lcd_data_write_bop(bg1);
     }
   }
 
