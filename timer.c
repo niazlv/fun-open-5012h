@@ -34,33 +34,58 @@
 #include "timer.h"
 
 /*- Definitions -------------------------------------------------------------*/
-#define MAX_TIMERS     16
-#define MS             (F_CPU / 8 / 1000)
+#define MAX_TIMERS     32
+
+/*
+ * Timekeeping is done with TIMER1, a true 32-bit general-purpose timer on
+ * APB1. main.c programs APB1PSC = DIV4, and a timer on a bus with a
+ * prescaler != 1 receives 2 x PCLK, so the TIMER1 kernel clock is
+ * F_CPU/2 = 125 MHz. The 16-bit prescaler divides this to a 1 MHz (1 us)
+ * free-running counter.
+ *
+ * The counter wraps every 2^32 us ~= 71.6 minutes and all delta math on it
+ * is unsigned 32-bit, so a wrap between two timer_task() calls is handled
+ * transparently by modular subtraction. The hardware counter keeps running
+ * while the CPU is stalled, so any stall shorter than ~71 minutes (config
+ * flash sector erase ~1-2 s, long redraw, debugger halt) is absorbed with
+ * zero time loss. The previous SysTick scheme killed the device with a
+ * white "Timer overflow" screen after a stall of only ~0.27-0.54 s.
+ *
+ * No interrupts are used. TIMER0/TIMER7 belong to capture.c and TIMER2 to
+ * the lcd.c backlight PWM; TIMER1 is free (TIMER4 is the other 32-bit
+ * timer if TIMER1 is ever needed elsewhere).
+ */
+#define TIMER_CLOCK    (F_CPU / 2)
+#define US_PER_SEC     1000000ul
+#define US_PER_MS      1000ul
 
 /*- Variables ---------------------------------------------------------------*/
 static int *g_timer_list[MAX_TIMERS];
 static int g_timer_count = 0;
 static int g_timer_max_delta = 0;
-static int g_timer_prev_value = 0;
+static uint32_t g_timer_prev_cnt = 0;
+static uint32_t g_timer_ms_counter = 0;
 
 /*- Implementations ---------------------------------------------------------*/
 
 //-----------------------------------------------------------------------------
-static void timer_restart(void)
-{
-  SysTick->CTRL = 0;
-  SysTick->VAL  = 0;
-  SysTick->LOAD = 0xffffff;
-  SysTick->CTRL = SysTick_CTRL_ENABLE_Msk;
-}
-
-//-----------------------------------------------------------------------------
 void timer_init(void)
 {
-  g_timer_count      = 0;
-  g_timer_max_delta  = 0;
-  g_timer_prev_value = 0xffffff;
-  timer_restart();
+  g_timer_count     = 0;
+  g_timer_max_delta = 0;
+
+  RCU->APB1EN_b.TIMER1EN = 1;
+
+  TIMER1->CTL0  = 0;
+  TIMER1->PSC   = (TIMER_CLOCK / US_PER_SEC) - 1; // 125 MHz / 125 = 1 MHz tick
+  TIMER1->CAR   = 0xffffffff;                     // full 32-bit period
+  TIMER1->SWEVG = TIMER1_SWEVG_UPG_Msk;           // latch PSC/CAR, clear CNT
+  TIMER1->CTL0  = TIMER1_CTL0_CEN_Msk;
+
+  g_timer_prev_cnt = TIMER1->CNT;
+
+  // SysTick is no longer used for timekeeping
+  SysTick->CTRL = 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -73,7 +98,7 @@ void timer_add(int *timer)
   }
 
   if (g_timer_count == MAX_TIMERS)
-    while (1);
+    error("Too many timers");
 
   g_timer_list[g_timer_count++] = timer;
 }
@@ -103,37 +128,33 @@ int timer_get_max_delta(void)
 //-----------------------------------------------------------------------------
 void timer_task(void)
 {
-  int value = SysTick->VAL;
-  int delta = g_timer_prev_value - value;
+  uint32_t cnt = TIMER1->CNT;
+  uint32_t delta_us = cnt - g_timer_prev_cnt; // unsigned modular math: wrap-safe
 
-  if (delta > MS)
+  if (delta_us >= US_PER_MS)
   {
-    int ms  = delta / MS;
-    int rem = delta % MS;
+    uint32_t ms  = delta_us / US_PER_MS;
+    uint32_t rem = delta_us % US_PER_MS;
+    int ms_i = (int)ms; // max 2^32/1000, fits in int
 
     for (int i = 0; i < g_timer_count; i++)
     {
-      if (*g_timer_list[i] > ms)
-        *g_timer_list[i] -= ms;
+      if (*g_timer_list[i] > ms_i)
+        *g_timer_list[i] -= ms_i;
       else if (*g_timer_list[i] > 0)
         *g_timer_list[i] = 0;
     }
 
-    g_timer_prev_value = value - rem;
+    g_timer_prev_cnt = cnt - rem; // carry sub-ms remainder, no tick ever lost
+    g_timer_ms_counter += ms;
 
-    if (ms > g_timer_max_delta)
-      g_timer_max_delta = ms;
+    if (ms_i > g_timer_max_delta)
+      g_timer_max_delta = ms_i;
   }
-
-  if (value < 0x7fffff)
-  {
-    g_timer_prev_value += 0x7fffff;
-    SysTick->LOAD = SysTick->VAL + 0x7fffff;
-    SysTick->VAL  = 0;
-  }
-
-  if (SysTick->CTRL & SysTick_CTRL_COUNTFLAG_Msk)
-    error("Timer overflow");
 }
 
-
+//-----------------------------------------------------------------------------
+uint32_t timer_ms(void)
+{
+  return g_timer_ms_counter;
+}

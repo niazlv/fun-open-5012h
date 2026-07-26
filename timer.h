@@ -38,6 +38,6 @@ void timer_add(int *timer);
 void timer_remove(int *timer);
 int timer_get_max_delta(void);
 void timer_task(void);
+uint32_t timer_ms(void);
 
 #endif // _TIMER_H_
-
