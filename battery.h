@@ -33,6 +33,7 @@
 void battery_init(void);
 int battery_voltage(void);
 void battery_task(void);
+void battery_redraw(void);
 
 void battery_low_handler(void);
 

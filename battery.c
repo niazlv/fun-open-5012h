@@ -46,6 +46,7 @@
 #define BATTERY_FULL_VOLTAGE     4150
 #define BATTERY_BLINK_INTERVAL   500
 #define BATTERY_UPDATE_INTERVAL  5000
+#define BATTERY_LOW_SAMPLES      3
 
 HAL_GPIO_PIN(VBAT,     B, 1)
 HAL_GPIO_PIN(CHARGING, B, 15)
@@ -65,6 +66,7 @@ static const int battery_thresholds_charging[BATTERY_THRESHOLDS_SIZE] =
 static int g_battery_blink_timer = TIMER_DISABLE;
 static int g_battery_update_timer = TIMER_DISABLE;
 static int g_battery_voltage = 0;
+static int g_battery_low_count = 0;
 static bool g_battery_blink_state = true;
 
 /*- Implementations ---------------------------------------------------------*/
@@ -174,14 +176,33 @@ int battery_voltage(void)
 }
 
 //-----------------------------------------------------------------------------
+void battery_redraw(void)
+{
+  battery_draw_frame();
+  battery_draw_level();
+}
+
+//-----------------------------------------------------------------------------
 void battery_task(void)
 {
   if (0 == g_battery_update_timer)
   {
     int voltage = read_battery_voltage();
 
-    if (voltage < BATTERY_LOW_VOLTAGE)
-      battery_low_handler();
+    // Require several consecutive low readings before halting the device:
+    // a single ADC dip (load step, backlight PWM change, charger plug) used
+    // to be enough to trip the permanent "BATTERY LOW" screen
+    if (voltage < BATTERY_LOW_VOLTAGE && !battery_charging())
+    {
+      g_battery_low_count++;
+
+      if (g_battery_low_count >= BATTERY_LOW_SAMPLES)
+        battery_low_handler();
+    }
+    else
+    {
+      g_battery_low_count = 0;
+    }
 
     if (voltage != g_battery_voltage)
     {
