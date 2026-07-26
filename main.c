@@ -43,7 +43,11 @@
 #include "buttons.h"
 #include "battery.h"
 #include "capture.h"
-#include "scope.h"
+#include "ui.h"
+#include "input.h"
+#include "launcher.h"
+#include "system_menu.h"
+#include "debug_coredump.h"
 
 /*- Definitions -------------------------------------------------------------*/
 #define RESET_TO_DEFAULT     (BTN_SHIFT | BTN_SAVE)
@@ -138,6 +142,9 @@ void irq_handler_hard_fault_c(uint32_t lr, uint32_t msp, uint32_t psp)
 
   asm("nop"); // Setup breakpoint here
 
+  // Capture coredump before displaying error
+  debug_coredump_capture_hard_fault(lr, msp, psp);
+
   lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, LCD_BLACK_COLOR);
   lcd_set_color(LCD_BLACK_COLOR, LCD_WHITE_COLOR);
   lcd_set_font(FONT_LARGE);
@@ -168,12 +175,11 @@ void irq_handler_hard_fault_c(uint32_t lr, uint32_t msp, uint32_t psp)
 //-----------------------------------------------------------------------------
 __attribute__((naked)) void irq_handler_hard_fault(void)
 {
-  asm volatile (R"asm(
-    mov    r0, lr
-    mrs    r1, msp
-    mrs    r2, psp
-    b      irq_handler_hard_fault_c
-    )asm"
+  asm volatile (
+    "mov    r0, lr\n"
+    "mrs    r1, msp\n"
+    "mrs    r2, psp\n"
+    "b      irq_handler_hard_fault_c\n"
   );
 }
 
@@ -183,6 +189,9 @@ void error(char *text)
   int len;
 
   __disable_irq();
+
+  // Capture coredump for general errors
+  COREDUMP_CAPTURE(ERROR_TYPE_GENERAL_ERROR, text);
 
   capture_stop();
   capture_disable_clock();
@@ -208,15 +217,22 @@ void battery_low_handler(void)
 //-----------------------------------------------------------------------------
 void buttons_handler(int buttons)
 {
-  scope_buttons_handler(buttons);
+  buttons = input_translate(buttons);
 
-#if 1  // Debug only, makes it easier to program things
+#ifdef DEBUG_F2_HALT  // Debug only, makes it easier to program things
   if (buttons & BTN_F2)
   {
     capture_disable_clock();
     while (1);
   }
 #endif
+
+  if (ui_handle_input(buttons))
+    return;
+
+  // Unconsumed MENU press opens the system menu over whatever is running
+  if ((buttons & BTN_MENU) && !(buttons & BTN_REPEAT))
+    system_menu_open();
 }
 
 //-----------------------------------------------------------------------------
@@ -243,12 +259,18 @@ int main(void)
   if ((buttons & RESET_TO_DEFAULT) == RESET_TO_DEFAULT)
     config_reset();
 
-  scope_init((buttons & CALIBRATION_MODE) == CALIBRATION_MODE);
+  ui_init();
+  input_init();
+  debug_coredump_init();
+
+  // The launcher menu becomes the root of the UI stack
+  launcher_start();
 
   while (1)
   {
     timer_task();
-    scope_task();
+    ui_task();
+    shift_mode_task();
     battery_task();
     buttons_task();
     config_task();
@@ -256,4 +278,3 @@ int main(void)
 
   return 0;
 }
-
