@@ -40,4 +40,9 @@ int timer_get_max_delta(void);
 void timer_task(void);
 uint32_t timer_ms(void);
 
+// Free-running 1 MHz counter, read straight from the hardware. timer_ms() is a
+// software counter that only advances inside timer_task(), so anything timing a
+// single pass of the main loop with it measures zero.
+uint32_t timer_us(void);
+
 #endif // _TIMER_H_

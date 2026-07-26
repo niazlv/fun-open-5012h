@@ -158,3 +158,11 @@ uint32_t timer_ms(void)
 {
   return g_timer_ms_counter;
 }
+
+//-----------------------------------------------------------------------------
+// The counter TIMER1 free-runs at 1 MHz and wraps every ~71 minutes; unsigned
+// subtraction of two readings is correct across the wrap
+uint32_t timer_us(void)
+{
+  return TIMER1->CNT;
+}

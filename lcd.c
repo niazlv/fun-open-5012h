@@ -297,6 +297,30 @@ void lcd_draw_buf(int x, int y, int w, int h, const uint16_t *buf)
 }
 
 //-----------------------------------------------------------------------------
+// Palette-indexed blit. DOOM renders into 8-bit indices - that is what its
+// colormaps operate on - so the expansion to RGB565 happens here, on the way
+// out, instead of costing 64 KB of a second frame buffer.
+void lcd_draw_indexed(int x, int y, int w, int h, const uint8_t *pix,
+    const uint16_t *palette)
+{
+  int size = w * h;
+
+  lcd_set_rect(x, y, w, h);
+
+  HAL_GPIO_LCD_CS_clr();
+  lcd_command_write(ST7789_RAMWR);
+
+  for (int i = 0; i < size; i++)
+  {
+    uint16_t v = palette[pix[i]];
+    lcd_data_write_bop(LCD_BOP_WORD(v >> 8));
+    lcd_data_write_bop(LCD_BOP_WORD(v));
+  }
+
+  HAL_GPIO_LCD_CS_set();
+}
+
+//-----------------------------------------------------------------------------
 void lcd_draw_image(int x, int y, const Image *image)
 {
   int size = image->width * image->height;

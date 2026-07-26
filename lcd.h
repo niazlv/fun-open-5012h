@@ -53,6 +53,8 @@ void lcd_init(void);
 void lcd_set_backlight_level(int level);
 void lcd_draw_pixel(int x, int y, int color);
 void lcd_draw_buf(int x, int y, int w, int h, const uint16_t *buf);
+void lcd_draw_indexed(int x, int y, int w, int h, const uint8_t *pix,
+    const uint16_t *palette);
 void lcd_draw_image(int x, int y, const Image *image);
 void lcd_draw_rect(int x, int y, int w, int h, int color);
 void lcd_fill_rect(int x, int y, int w, int h, int color);
