@@ -33,6 +33,13 @@
 void scope_init(bool calibration_mode);
 void scope_buttons_handler(int buttons);
 void scope_task(void);
+void scope_redraw_all(void);
+
+// Draw-free trigger helpers for the system menu (the scope screen is
+// repainted in full when the menu closes)
+void scope_apply_trigger_level(void);
+void scope_trigger_50_percent(void);
+int scope_get_fps(void);
 
 #endif // _SCOPE_H_
 
