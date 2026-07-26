@@ -39,11 +39,15 @@
             "command": "openocd",
             "args": [
                 "-f",
-                "/opt/homebrew/Cellar/open-ocd/0.12.0_1/share/openocd/scripts/interface/wch-cmsis-dap.cfg",
-                "-f",
-                "/opt/homebrew/Cellar/open-ocd/0.12.0_1/share/openocd/scripts/target/stm32f4x.cfg",
+                "interface/cmsis-dap.cfg",
                 "-c",
-                "program ${workspaceRoot}/make/build/open-5012h.elf verify reset exit"
+                "transport select swd",
+                "-c",
+                "adapter speed 2000",
+                "-f",
+                "target/stm32f4x.cfg",
+                "-c",
+                "program ${workspaceRoot}/make/build/open-5012h.bin verify reset exit 0x08000000"
             ],
             "group": "test",
             "detail": "Прошивка микроконтроллера через OpenOCD"

@@ -19,10 +19,17 @@
             },
             "device": "GD32F407VET",
             "runToEntryPoint": "main",
-            "svdFile": "${workspaceRoot}/resources/STM32F40x.svd",
+            // Resolved from OpenOCD's own script directory, so this keeps
+            // working after a openocd upgrade moves the Cellar path. Any
+            // CMSIS-DAP probe works; interface/wch-cmsis-dap.cfg is the
+            // WCH-Link variant. GD32F4 is programmed as an STM32F4.
             "configFiles": [
-                "/opt/homebrew/Cellar/open-ocd/0.12.0_1/share/openocd/scripts/interface/wch-cmsis-dap.cfg",
-                "/opt/homebrew/Cellar/open-ocd/0.12.0_1/share/openocd/scripts/target/stm32f4x.cfg"
+                "interface/cmsis-dap.cfg",
+                "target/stm32f4x.cfg"
+            ],
+            "openOCDLaunchCommands": [
+                "transport select swd",
+                "adapter speed 2000"
             ],
             "preLaunchCommands": [
                 "set mem inaccessible-by-default off",
