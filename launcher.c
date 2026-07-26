@@ -81,7 +81,7 @@ static const app_desc_t g_apps[] =
   { "Snake Game", "Classic snake game",
     snake_game_init, snake_game_task, snake_game_buttons_handler,
     snake_game_cleanup, snake_game_redraw, &snake_game_menu },
-  { "DOOM Port", "Raycasting FPS demo",
+  { "DOOM", "id Software's renderer on a real WAD level",
     doom_port_init, doom_port_task, doom_port_buttons_handler,
     doom_port_cleanup, doom_port_redraw, &doom_port_menu },
   { "CoreDump Viewer", "View crash dumps and stack traces",

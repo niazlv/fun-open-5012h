@@ -34,6 +34,7 @@ LDFLAGS += -Wl,--script=$(LDSCRIPT)
 
 INCLUDES += \
   -I../include \
+  -I../doom \
   -I.. \
 
 SRCS += \
@@ -67,6 +68,15 @@ SRCS += \
   ../flappy_bird.c \
   ../snake_game.c \
   ../doom_port.c \
+  ../doom/w_assets.c \
+  ../doom/r_main.c \
+  ../doom/r_bsp.c \
+  ../doom/r_segs.c \
+  ../doom/r_plane.c \
+  ../doom/r_draw.c \
+  ../doom/p_move.c \
+  ../doom/p_player.c \
+  ../doom/p_doors.c \
   ../scope.c \
   ../syscalls.c \
   ../utils.c \
@@ -101,9 +111,25 @@ CFLAGS += $(INCLUDES) $(DEFINES)
 
 OBJS = $(addprefix $(BUILD)/, $(notdir %/$(subst .c,.o, $(SRCS))))
 
+# The DOOM asset pack is data, not code: an .S with .incbin drops it straight
+# into .rodata. It is built from a real IWAD by tools/wadpack.py and is not in
+# the repository, so an empty stand-in is created when it is absent - the
+# application detects that and explains how to build a real one.
+DOOM_ASSETS = ../doom/doom_assets.bin
+OBJS += $(BUILD)/doom_assets.o
+
 all: directory $(BUILD)/$(BIN).elf $(BUILD)/$(BIN).hex $(BUILD)/$(BIN).bin size
 
 LDSCRIPT = ../linker/gd32f407ve.ld
+
+$(DOOM_ASSETS):
+	@echo "NOTE no DOOM asset pack, linking an empty one"
+	@echo "     build one with: python3 tools/wadpack.py <iwad> -o doom/doom_assets.bin"
+	@touch $@
+
+$(BUILD)/doom_assets.o: ../doom/doom_assets.S $(DOOM_ASSETS)
+	@echo AS $@
+	@$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/$(BIN).elf: $(OBJS) $(LDSCRIPT)
 	@echo LD $@
@@ -138,5 +164,16 @@ clean:
 
 prog:
 	@edbg -b -c 3000 -t gd32f4xx -pv -f $(BUILD)/$(BIN).bin
+
+# Verify only. The DOOM asset pack sits in the second half of the image and no
+# code does, so a short write leaves a firmware that runs and reports "NO WAD
+# DATA" - this catches that without reflashing.
+verify:
+	@edbg -b -c 3000 -t gd32f4xx -v -f $(BUILD)/$(BIN).bin
+
+# Where things landed, for checking how much of the image has to reach the part
+layout: $(BUILD)/$(BIN).elf
+	@arm-none-eabi-nm $(BUILD)/$(BIN).elf | grep -E ' (T|t) doom_assets(_end)?$$' | sort
+	@echo "image size: `wc -c < $(BUILD)/$(BIN).bin` bytes"
 
 -include $(wildcard $(BUILD)/*.d)

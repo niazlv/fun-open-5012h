@@ -4,3 +4,6 @@ debug
 make/build
 .DS_Store
 .project
+# Built from a real IWAD by tools/wadpack.py - carries the WAD artwork,
+# so it stays out of the repository
+doom/doom_assets.bin

@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * A real DOOM renderer for the GD32F407VE.
  *
  * The algorithms are id's: binary space partition traversal, the solidsegs
@@ -51,12 +53,17 @@
 #define LIGHTZSHIFT         20
 
 // Sized for this screen rather than for a PC: vanilla keeps 128 visplanes and
-// 64 openings per column, which would be 124 KB of the 128 KB we have.
-#define MAXVISPLANES        48
-#define MAXDRAWSEGS         128
-#define MAXOPENINGS         (SCREENWIDTH * 16)
+// 64 openings per column, which alone would be more memory than this part has.
+// The whole block has to fit below CAPTURE_SPARE_RAM, which is 120 KB, and the
+// figures below were measured over the level rather than guessed - see
+// tests/doom_host.c, which reports the high-water mark for each of them.
+#ifndef MAXVISPLANES
+#define MAXVISPLANES        52
+#endif
+#define MAXDRAWSEGS         112
+#define MAXOPENINGS         (SCREENWIDTH * 8)
 #define MAXVISSPRITES       96
-#define MAXSEGS             48      // solidsegs, one per visible wall run
+#define MAXSEGS             24      // solidsegs, one per visible wall run
 
 // linedef flags
 #define ML_BLOCKING         1
@@ -164,15 +171,23 @@ typedef struct
     uint32_t firstcol;          // index into the column-offset table
 } texture_t;
 
+// R_DrawPlanes closes a plane off by writing a sentinel one column past each
+// end of its range, so for a plane that reaches a screen edge that write lands
+// outside the columns. The original relies on struct padding absorbing it; here
+// the guard cells are explicit and the arrays are addressed through PL_TOP and
+// PL_BOTTOM, which put column 0 at index 1.
 typedef struct
 {
     fixed_t height;
     uint16_t picnum;
     int16_t lightlevel;
     int16_t minx, maxx;
-    uint8_t top[SCREENWIDTH];
-    uint8_t bottom[SCREENWIDTH];
+    uint8_t topbuf[SCREENWIDTH + 2];
+    uint8_t bottombuf[SCREENWIDTH + 2];
 } visplane_t;
+
+#define PL_TOP(pl)          ((pl)->topbuf + 1)
+#define PL_BOTTOM(pl)       ((pl)->bottombuf + 1)
 
 typedef struct
 {
@@ -180,8 +195,8 @@ typedef struct
     fixed_t scale1, scale2, scalestep;
     int16_t silhouette;         // 0, SIL_BOTTOM, SIL_TOP, SIL_BOTH
     fixed_t bsilheight, tsilheight;
-    int16_t *sprtopclip;
-    int16_t *sprbottomclip;
+    const int16_t *sprtopclip;
+    const int16_t *sprbottomclip;
     int16_t *maskedtexturecol;
     uint16_t curline;           // seg index, for the masked pass
 } drawseg_t;
@@ -191,9 +206,10 @@ typedef struct
 #define SIL_TOP             2
 #define SIL_BOTH            3
 
+// The clip list carries sentinels well outside the screen, so it stays 32-bit
 typedef struct
 {
-    int16_t first, last;
+    int32_t first, last;
 } cliprange_t;
 
 // ---------------------------------------------------------------------------
@@ -211,11 +227,36 @@ typedef struct
     int16_t floorclip[SCREENWIDTH];
     int16_t ceilingclip[SCREENWIDTH];
 
+    // Constant clip arrays for walls that hide everything behind them
+    int16_t screenheightarray[SCREENWIDTH];
+    int16_t negonearray[SCREENWIDTH];
+
     // Per-column state handed from R_StoreWallRange to R_DrawPlanes
     int16_t spanstart[SCREENHEIGHT];
 
+    // A visplane is walked one screen row at a time, and every row of a given
+    // plane shares its distance and texture step - so they are worked out once
+    // per row and reused for the whole plane
+    fixed_t cachedheight[SCREENHEIGHT];
+    fixed_t cacheddistance[SCREENHEIGHT];
+    fixed_t cachedxstep[SCREENHEIGHT];
+    fixed_t cachedystep[SCREENHEIGHT];
+
     cliprange_t solidsegs[MAXSEGS];
+
+    // Level state that has to be writable: the sector shadow, and later the
+    // thinkers. Everything else is read in place out of flash.
+    uint8_t zone[5120];
 } doom_mem_t;
+
+// How close a frame came to the limits above, so they can be checked against
+// real views instead of assumed
+typedef struct
+{
+    int visplanes, drawsegs, openings, solidsegs, maskedcols;
+} r_stats_t;
+
+extern r_stats_t r_stats;
 
 /*- Variables ---------------------------------------------------------------*/
 extern doom_mem_t *dm;
@@ -261,12 +302,29 @@ extern int extralight;
 extern int centerx, centery;
 extern fixed_t centerxfrac, centeryfrac, projection;
 extern angle_t clipangle;
+extern int validcount;
+
+// Renderer internals, shared between the BSP walk and the wall renderer the
+// same way the original shares them
+extern const mapseg_t *curline;
+extern const mapside_t *sidedef;
+extern const maplinedef_t *linedef;
+extern const sector_t *frontsector;
+extern const sector_t *backsector;
+extern angle_t rw_angle1;
+extern fixed_t rw_distance;
+extern angle_t rw_normalangle;
+extern drawseg_t *ds_p;
+extern visplane_t *floorplane;
+extern visplane_t *ceilingplane;
 
 /*- Prototypes --------------------------------------------------------------*/
 // w_assets.c
 bool doom_assets_init(const void *blob);
+const char *doom_assets_error(void);
 const void *doom_asset_find(const char *name, int *size);
 bool doom_level_load(void);
+const char *doom_level_name(void);
 
 // r_main.c
 void R_Init(void);
@@ -285,8 +343,10 @@ void R_ClearDrawSegs(void);
 void R_RenderBSPNode(int bspnum);
 
 // r_segs.c
+void R_InitSegs(void);
 void R_StoreWallRange(int start, int stop);
 void R_RenderMaskedSegRange(drawseg_t *ds, int x1, int x2);
+void R_DrawMasked(void);
 
 // r_plane.c
 void R_ClearPlanes(void);
@@ -295,9 +355,13 @@ visplane_t *R_CheckPlane(visplane_t *pl, int start, int stop);
 void R_DrawPlanes(void);
 
 // r_draw.c
+void R_InitDrawFlats(int shift);
 void R_DrawColumn(void);
 void R_DrawMaskedColumn(const uint8_t *post);
 void R_DrawSpan(void);
+
+extern fixed_t sprtopscreen, spryscale;
+extern const int16_t *mfloorclip, *mceilingclip;
 
 extern int dc_x, dc_yl, dc_yh;
 extern fixed_t dc_iscale, dc_texturemid;
@@ -310,11 +374,63 @@ extern fixed_t ds_xfrac, ds_yfrac, ds_xstep, ds_ystep;
 extern const uint8_t *ds_source;
 extern const uint8_t *ds_colormap;
 
+// p_player.c
+#define PLAYER_RADIUS       (16 * FRACUNIT)
+#define PLAYER_HEIGHT       (56 * FRACUNIT)
+#define VIEWHEIGHT          (41 * FRACUNIT)
+#define MAXBOB              (16 * FRACUNIT)
+#define TICRATE             35
+
+typedef struct
+{
+    fixed_t x, y, z;
+    fixed_t momx, momy;
+    fixed_t bob;
+    angle_t angle;
+} player_t;
+
+// One tic of intent, so the key mapping stays in the application and the host
+// harness can drive the same simulation from a script
+typedef struct
+{
+    int8_t forward;             // -1 back, 0, 1 forward
+    int8_t side;                // -1 left, 0, 1 right
+    int8_t turn;                // -1 right, 0, 1 left
+    bool run;
+} ticcmd_t;
+
+extern player_t player;
+extern uint32_t leveltime;
+
+void P_SpawnPlayer(void);
+void P_PlayerTic(const ticcmd_t *cmd);
+fixed_t P_ViewZ(void);
+void P_RenderPlayerView(void);
+
+// p_doors.c
+void P_DoorsClear(void);
+void P_DoorsTic(fixed_t playerx, fixed_t playery, fixed_t playerz);
+bool P_UseLines(fixed_t x, fixed_t y, angle_t angle);
+
 // p_move.c
-bool P_TryMove(fixed_t *x, fixed_t *y, fixed_t dx, fixed_t dy, fixed_t *z);
+bool P_CheckPosition(fixed_t x, fixed_t y, fixed_t z, fixed_t radius, fixed_t height);
+bool P_TryMove(fixed_t *x, fixed_t *y, fixed_t *z, fixed_t nx, fixed_t ny,
+               fixed_t radius, fixed_t height);
+const sector_t *P_SectorAt(fixed_t x, fixed_t y);
+int P_PointOnLineSide(fixed_t x, fixed_t y, const maplinedef_t *ld);
 fixed_t P_FloorHeight(fixed_t x, fixed_t y);
 
 /*- Inline helpers ----------------------------------------------------------*/
+
+//-----------------------------------------------------------------------------
+// Map geometry is int16 in the WAD and 16.16 everywhere in the renderer. The
+// obvious shift is undefined for a negative value, and half the map has
+// negative coordinates, so the promotion goes through unsigned - same
+// instruction, defined result.
+static inline fixed_t mapfix(int v)
+{
+    return (fixed_t)((uint32_t)v << FRACBITS);
+}
 
 //-----------------------------------------------------------------------------
 static inline fixed_t FixedMul(fixed_t a, fixed_t b)
@@ -336,7 +452,7 @@ static inline fixed_t FixedDiv(fixed_t a, fixed_t b)
     if ((aa >> 14) >= ab)
         return (a ^ b) < 0 ? INT32_MIN : INT32_MAX;
 
-    return (fixed_t)(((int64_t)a << FRACBITS) / b);
+    return (fixed_t)(((int64_t)a * FRACUNIT) / b);
 }
 
 //-----------------------------------------------------------------------------

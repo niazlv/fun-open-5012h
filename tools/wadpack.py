@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+#
+# Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
 """
 wadpack - turn a real DOOM IWAD into a flash-resident asset pack.
 
@@ -378,7 +380,9 @@ class Blob:
         base += (-base) % 4
 
         out = bytearray()
-        out += struct.pack("<4sIII", self.MAGIC, 1, len(self.sections), base)
+        # The directory follows the header; section offsets are from the blob
+        # start, so nothing needs relocating once it is in flash
+        out += struct.pack("<4sIII", self.MAGIC, 1, len(self.sections), header_len)
 
         for name, off, size in self.sections:
             out += name.encode("ascii").ljust(self.NAME_LEN, b"\0")
@@ -649,6 +653,75 @@ def main():
     blob.add("TEXCOLS", bytes(tex_cols))
     blob.add("TEXDATA", bytes(col_pool))
 
+    # --- status bar ----------------------------------------------------------
+    # The bar is stored as a plain row-major image so the device can push it to
+    # the display in one transfer, with the face and the weapon panel already
+    # composited in - neither of them changes yet, and baking them costs
+    # nothing. The digits stay separate, with a bitmask, because they do change.
+    if wad.has("STBAR"):
+        pw, ph, _, _, columns = parse_patch(wad.get("STBAR"))
+        bar = bytearray(pw * ph)
+
+        for c in range(pw):
+            for top, data in columns[c]:
+                for k, value in enumerate(data):
+                    if 0 <= top + k < ph:
+                        bar[(top + k) * pw + c] = value
+
+        # ST_ARMSBGX/Y, ST_FACESX/Y and the two percent signs, relative to the
+        # bar's own top edge. None of them ever move, so they are baked in.
+        # A patch carries its own origin and V_DrawPatch subtracts it, which for
+        # the face is (-5, -2) - ignoring it puts the face five pixels off.
+        for name, ox, oy in (("STARMS", 104, 0), ("STFST01", 143, 0),
+                             ("STTPRCNT", 90, 3), ("STTPRCNT", 221, 3)):
+            if not wad.has(name):
+                continue
+
+            sw, sh, sxo, syo, scols = parse_patch(wad.get(name))
+            ox -= sxo
+            oy -= syo
+
+            for c in range(sw):
+                for top, data in scols[c]:
+                    for k, value in enumerate(data):
+                        x, y = ox + c, oy + top + k
+
+                        if 0 <= x < pw and 0 <= y < ph:
+                            bar[y * pw + x] = value
+
+        blob.add("STBAR", bytes(bar))
+
+        # Digits and the percent sign: pixels followed by a 1-bit-per-pixel
+        # mask, which is all the transparency a glyph needs
+        names = ["STTNUM%d" % i for i in range(10)] + ["STTPRCNT"]
+        directory = bytearray()
+        glyphs = bytearray()
+
+        for name in names:
+            if not wad.has(name):
+                directory += struct.pack("<BBHH", 0, 0, 0, 0)
+                continue
+
+            gw, gh, _, _, gcols = parse_patch(wad.get(name))
+            pixels = bytearray(gw * gh)
+            mask = bytearray((gw * gh + 7) // 8)
+
+            for c in range(gw):
+                for top, data in gcols[c]:
+                    for k, value in enumerate(data):
+                        y = top + k
+
+                        if 0 <= y < gh:
+                            i = y * gw + c
+                            pixels[i] = value
+                            mask[i >> 3] |= 1 << (i & 7)
+
+            directory += struct.pack("<BBHH", gw, gh, len(glyphs), 0)
+            glyphs += pixels + mask
+
+        blob.add("STNUMDIR", bytes(directory))
+        blob.add("STNUMS", bytes(glyphs))
+
     # --- flats ---------------------------------------------------------------
     flat_data = bytearray()
 
@@ -720,6 +793,14 @@ def main():
     print()
     blob.report()
     print("\n%s: %d bytes (%.1f KB)" % (args.output, len(data), len(data) / 1024.0))
+
+    # The firmware without a pack is about 175 KB of the 512 KB part
+    budget = 512 * 1024 - 180 * 1024
+
+    if len(data) > budget:
+        print("\nWARNING: this is %.0f KB over what is likely to fit in flash\n"
+              "         alongside the firmware. Try a smaller map." %
+              ((len(data) - budget) / 1024.0))
 
     if args.header:
         with open(args.header, "w") as f:
