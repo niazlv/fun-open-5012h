@@ -269,6 +269,12 @@ void irq_handler_reset(void)
 {
   unsigned int *src, *dst;
 
+  // Enable the FPU before anything else: the whole project is built with
+  // -mfloat-abi=hard, so even the copy loops below may legally use V regs
+  SCB->CPACR |= (0xf << 20);
+  __DSB();
+  __ISB();
+
   src = &_etext;
   dst = &_data;
   while (dst < &_edata)
@@ -277,11 +283,6 @@ void irq_handler_reset(void)
   dst = &_bss;
   while (dst < &_ebss)
     *dst++ = 0;
-
-  // Enable FPU
-  SCB->CPACR |= (0xf << 20);
-  __DSB();
-  __ISB();
 
   SCB->VTOR = (uint32_t)vectors;
 

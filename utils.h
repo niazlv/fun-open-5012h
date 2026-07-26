@@ -53,7 +53,9 @@ uint64_t round_divide(int64_t dividend, int64_t divisor);
 //-----------------------------------------------------------------------------
 static inline void delay_ms(int ms)
 {
-  uint32_t cycles = ms * F_CPU / 4 / 1000;
+  // (uint32_t)ms * (F_CPU/4000), not ms*F_CPU/4/1000: the latter overflows
+  // int for ms >= 9 and only works because -O3 reassociates the UB away
+  uint32_t cycles = (uint32_t)ms * (F_CPU / 4000);
 
   asm volatile (R"asm(
     1: subs %[cycles], %[cycles], #1

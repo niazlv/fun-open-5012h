@@ -68,11 +68,28 @@ static void sys_init(void)
   RCU->CTL_b.HXTALEN = 1;
   while (0 == RCU->CTL_b.HXTALSTB);
 
+  // The PLL below runs the core at 250 MHz, far above the rated 168 MHz.
+  // Follow the vendor procedure for >168 MHz operation: raise the LDO output
+  // and enable high-drive mode before switching SYSCLK to the PLL. The waits
+  // are bounded so a die that never reports ready still boots (without
+  // high-drive, as before this change).
+  RCU->APB1EN_b.PMUEN = 1;
+  PMU->CTL_b.LDOVS = 3;
+
   RCU->PLL = RCU_PLL_PLLSEL_Msk | (20 << RCU_PLL_PLLPSC_Pos) | (500 << RCU_PLL_PLLN_Pos) |
       (0 << RCU_PLL_PLLP_Pos) | (15 << RCU_PLL_PLLQ_Pos);
 
   RCU->CTL_b.PLLEN = 1;
   while (0 == RCU->CTL_b.PLLSTB);
+
+  PMU->CTL_b.HDEN = 1;
+  for (int i = 0; i < 1000000 && 0 == PMU->CS_b.HDRF; i++);
+
+  if (PMU->CS_b.HDRF)
+  {
+    PMU->CTL_b.HDS = 1;
+    for (int i = 0; i < 1000000 && 0 == PMU->CS_b.HDSRF; i++);
+  }
 
   RCU->CFG0 = (2/*CK_PLLP*/ << RCU_CFG0_SCS_Pos) | (0/*CK_SYS*/ << RCU_CFG0_AHBPSC_Pos) |
       (5/*DIV 4*/ << RCU_CFG0_APB1PSC_Pos) | (4/*DIV 2*/ << RCU_CFG0_APB2PSC_Pos) |
