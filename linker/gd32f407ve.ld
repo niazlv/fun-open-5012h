@@ -26,9 +26,14 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+/* The part has 512K of flash, but the last 128K sector is the configuration
+   store (see config.c), which is erased whole. The firmware must therefore stay
+   below it - a firmware that overruns runs perfectly until the first settings
+   save erases its own tail, which is not a failure anyone should have to debug
+   on the device. Keeping the region short makes it a link error instead. */
 MEMORY
 {
-  flash (rx) : ORIGIN = 0x08000000, LENGTH = 512K
+  flash (rx) : ORIGIN = 0x08000000, LENGTH = 384K
   ram (rwx)  : ORIGIN = 0x20000000, LENGTH = 128K
   tcm (rwx)  : ORIGIN = 0x10000000, LENGTH = 64K
 }

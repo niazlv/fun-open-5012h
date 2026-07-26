@@ -39,17 +39,28 @@
 #define MAGIC              0x78656c41
 #define VERSION            1
 
+/*
+ * Storage lives in the last 128 KB sector, and the firmware owns everything
+ * below it. It used to take the last 256 KB - sectors 6 and 7 - which was free
+ * when the firmware was 154 KB, but the DOOM asset pack pushed the image to
+ * 372 KB and its tail landed inside sector 6. Nothing failed at build time: the
+ * firmware ran, and then config_init erased the sector out from under the pack.
+ * The linker script now caps the flash region at 384 KB so an overlap is a
+ * build error rather than something the device discovers at runtime.
+ *
+ * The cost of a single sector is that rotating past the end has to erase the
+ * only copy, so losing power inside that window (once every ENTRIES_COUNT
+ * saves) falls back to defaults on the next boot.
+ */
 #define FLASH_START        0x08000000
 #define ENTRY_SIZE         (1024)
-#define STORAGE_SIZE       (256*1024)
-#define STORAGE_OFFSET     (256*1024)
+#define STORAGE_SIZE       (128*1024)
+#define STORAGE_OFFSET     (384*1024)
 #define STORAGE_START      (FLASH_START + STORAGE_OFFSET)
 #define ENTRIES_COUNT      (STORAGE_SIZE / ENTRY_SIZE)
 
-#define SECTOR_0_INDEX     (6)
+#define SECTOR_0_INDEX     (7)
 #define SECTOR_0_OFFSET    (0)
-#define SECTOR_1_INDEX     (7)
-#define SECTOR_1_OFFSET    (128*1024)
 
 #define TIMER_INTERVAL     1000
 
@@ -213,8 +224,6 @@ static void config_save(void)
 
   if (g_entry_offset == SECTOR_0_OFFSET)
     flash_erase(SECTOR_0_INDEX);
-  else if (g_entry_offset == SECTOR_1_OFFSET)
-    flash_erase(SECTOR_1_INDEX);
 
   config.count++;
   config.crc = crc32_calc((uint32_t *)&config, sizeof(Config) - sizeof(uint32_t));
