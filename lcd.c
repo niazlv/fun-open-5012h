@@ -264,6 +264,9 @@ void lcd_set_backlight_level(int level)
 //-----------------------------------------------------------------------------
 void lcd_draw_pixel(int x, int y, int color)
 {
+  if (x < 0 || x >= LCD_WIDTH || y < 0 || y >= LCD_HEIGHT)
+    return;
+
   lcd_set_rect(x, y, 1, 1);
 
   HAL_GPIO_LCD_CS_clr();
@@ -327,9 +330,36 @@ void lcd_draw_rect(int x, int y, int w, int h, int color)
 //-----------------------------------------------------------------------------
 void lcd_fill_rect(int x, int y, int w, int h, int color)
 {
-  int size = w * h;
   uint32_t bop0 = LCD_BOP_WORD((color >> 8) & 0xff);
   uint32_t bop1 = LCD_BOP_WORD(color & 0xff);
+  int size;
+
+  // Clip to the panel. A window that runs off an edge is not merely invisible:
+  // the controller wraps the address counter and the overflow is painted
+  // somewhere else on the display, so partially off-screen sprites (game
+  // objects at the edges) would corrupt the image.
+  if (x < 0)
+  {
+    w += x;
+    x = 0;
+  }
+
+  if (y < 0)
+  {
+    h += y;
+    y = 0;
+  }
+
+  if (x + w > LCD_WIDTH)
+    w = LCD_WIDTH - x;
+
+  if (y + h > LCD_HEIGHT)
+    h = LCD_HEIGHT - y;
+
+  if (w <= 0 || h <= 0)
+    return;
+
+  size = w * h;
 
   lcd_set_rect(x, y, w, h);
 
@@ -382,6 +412,12 @@ void lcd_putc(int x, int y, char ch)
   uint32_t bg0 = LCD_BOP_WORD(bg_color[0]);
   uint32_t bg1 = LCD_BOP_WORD(bg_color[1]);
   const uint8_t *bitmap;
+
+  // A glyph that does not fit is dropped rather than drawn through an
+  // off-panel window, which the controller would wrap somewhere else
+  if (x < 0 || y < 0 || x + lcd_font->width > LCD_WIDTH ||
+      y + lcd_font->height > LCD_HEIGHT)
+    return;
 
   lcd_set_rect(x, y, lcd_font->width, lcd_font->height);
 

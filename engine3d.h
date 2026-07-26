@@ -10,6 +10,7 @@
 /*- Includes ----------------------------------------------------------------*/
 #include <stdint.h>
 #include <stdbool.h>
+#include "menu_widget.h"
 
 /*- Definitions -------------------------------------------------------------*/
 #define ENGINE3D_MAX_OBJECTS    10
@@ -147,25 +148,24 @@ void engine3d_init(void);
 void engine3d_task(void);
 void engine3d_buttons_handler(int buttons);
 void engine3d_cleanup(void);
+void engine3d_redraw(void);
+
+/*- Variables ---------------------------------------------------------------*/
+extern const menu_def_t engine3d_menu;
 
 // Scene management
 void engine3d_clear_scene(void);
 int engine3d_add_object(object_type_t type, vec3_t position, vec3_t scale, uint16_t color);
 int engine3d_add_light(light_type_t type, vec3_t position, vec3_t direction, vec3_t color, float intensity);
-void engine3d_remove_object(int index);
-void engine3d_remove_light(int index);
 
 // Camera control
 void engine3d_set_camera_position(vec3_t position);
 void engine3d_set_camera_rotation(vec3_t rotation);
-void engine3d_set_camera_fov(float fov);
 void engine3d_move_camera(vec3_t delta);
 void engine3d_rotate_camera(vec3_t delta);
 
 // Rendering
 void engine3d_set_render_mode(render_mode_t mode);
-void engine3d_set_render_resolution(int width, int height, int scale);
-void engine3d_toggle_wireframe(void);
 
 // Math utilities
 vec3_t vec3_add(vec3_t a, vec3_t b);

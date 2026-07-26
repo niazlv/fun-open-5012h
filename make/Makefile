@@ -62,6 +62,7 @@ SRCS += \
   ../input.c \
   ../launcher.c \
   ../system_menu.c \
+  ../scope_menu.c \
   ../raytrace_test.c \
   ../flappy_bird.c \
   ../snake_game.c \

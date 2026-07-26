@@ -68,6 +68,8 @@ HAL_GPIO_PIN(AC_DC,    C, 15)
 _Static_assert(STORAGE_BUFFER_RATIO == 4, "buffer_decimate asm is hardcoded 4:1");
 _Static_assert(CAPTURE_BUFFER_SIZE % DMA_MAX_BUFFER_SIZE == 0, "ring must be a multiple of the DMA buffer");
 _Static_assert(CAPTURE_BUFFER_SIZE + STORAGE_BUFFER_SIZE <= 128 * 1024, "capture + storage must fit main SRAM");
+_Static_assert(CAPTURE_SPARE_RAM + CAPTURE_SPARE_RAM_SIZE + COREDUMP_RAM_SIZE ==
+    0x20000000u + 128 * 1024, "spare SRAM split must cover the block exactly");
 _Static_assert(0x20000000u + CAPTURE_BUFFER_SIZE + STORAGE_BUFFER_SIZE == CAPTURE_SPARE_RAM,
     "spare RAM must start right after the storage buffer");
 

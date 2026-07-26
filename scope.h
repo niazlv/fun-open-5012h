@@ -29,6 +29,14 @@
 #ifndef _SCOPE_H_
 #define _SCOPE_H_
 
+/*- Includes ----------------------------------------------------------------*/
+#include <stdbool.h>
+#include "menu_widget.h"
+
+/*- Variables ---------------------------------------------------------------*/
+// The scope's section of the system menu, see scope_menu.c
+extern const menu_def_t scope_menu;
+
 /*- Prototypes --------------------------------------------------------------*/
 void scope_init(bool calibration_mode);
 void scope_buttons_handler(int buttons);
@@ -40,6 +48,11 @@ void scope_redraw_all(void);
 void scope_apply_trigger_level(void);
 void scope_trigger_50_percent(void);
 int scope_get_fps(void);
+
+// Live state of the measurements panel, for the System Info page: this is
+// the path that has gone blank after an auto-setup, and the flags below say
+// which stage of it stopped (see scope_get_panel_state)
+void scope_get_panel_state(char *buf, int size);
 
 #endif // _SCOPE_H_
 

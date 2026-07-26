@@ -16,8 +16,10 @@
 #include "timer.h"
 #include "config.h"
 #include "buttons.h"
+#include "utils.h"
+#include "ui.h"
+#include "menu_widget.h"
 #include "engine3d.h"
-#include "launcher.h"
 
 /*- Definitions -------------------------------------------------------------*/
 #define PI 3.14159265359f
@@ -25,10 +27,16 @@
 #define RAD_TO_DEG (180.0f / PI)
 #define EPSILON 0.001f
 
-// Rendering settings
-#define DEFAULT_RENDER_WIDTH    160  // Better resolution
-#define DEFAULT_RENDER_HEIGHT   120  // Better resolution
-#define DEFAULT_RENDER_SCALE    2    // Normal scale
+// The bottom band is the HUD; the raster never touches it, so the text does
+// not have to fight the renderer for the same pixels
+#define HUD_HEIGHT             32
+#define VIEW_HEIGHT            (LCD_HEIGHT - HUD_HEIGHT)
+#define HUD_Y                  VIEW_HEIGHT
+
+// Rendering settings. render_height * render_scale must equal VIEW_HEIGHT.
+#define DEFAULT_RENDER_WIDTH    160
+#define DEFAULT_RENDER_HEIGHT   (VIEW_HEIGHT / 2)
+#define DEFAULT_RENDER_SCALE    2
 #define MAX_RAY_DEPTH          2     // Reduced depth for performance
 #define LINES_PER_FRAME        2     // Render only 2 lines per frame for better quality
 
@@ -44,34 +52,37 @@
 #define WIREFRAME_COLOR        LCD_COLOR(255, 255, 255)
 #define NORMAL_COLOR           LCD_COLOR(255, 255, 0)
 
+/*- Types -------------------------------------------------------------------*/
+// Camera axes for the frame being rendered
+typedef struct {
+    vec3_t right, up, forward;
+    float tan_half_fov;
+    float aspect;
+} cam_basis_t;
+
 /*- Variables ---------------------------------------------------------------*/
 static engine3d_t g_engine;
-static int g_frame_timer = TIMER_DISABLE;
-static int g_fps_timer = TIMER_DISABLE;
+static cam_basis_t g_basis;
 static uint32_t g_frame_start_time = 0;
-static bool g_scene_dirty = true;
 
 // Progressive rendering state
 static int g_current_render_line = 0;
 static bool g_rendering_in_progress = false;
-static bool g_frame_complete = false;
+static bool g_hud_dirty = true;
 
-// Rendering buffers
-static uint16_t *g_framebuffer = NULL;
-static float *g_depth_buffer = NULL;
+// Mirror of g_engine.render_mode for the menu widget, which edits ints
+static int g_menu_render_mode = RENDER_MODE_RAYCAST;
+
+// One upscaled output row, blitted with a single transfer per LCD line
+static uint16_t g_line_buf[LCD_WIDTH];
 
 /*- Forward Declarations ----------------------------------------------------*/
 static void setup_default_scene(void);
-static void update_camera(void);
 static void render_frame(void);
-static void render_raycast(void);
-static void render_raytrace(void);
 static void draw_ui(void);
-static void calculate_fps(void);
+static void update_camera_basis(void);
 
 // Math functions
-static vec3_t transform_point(vec3_t point, vec3_t position, vec3_t rotation, vec3_t scale);
-static vec3_t world_to_screen(vec3_t world_pos);
 static ray_t screen_to_ray(int x, int y);
 
 // Intersection functions
@@ -171,80 +182,47 @@ vec3_t vec3_rotate_z(vec3_t v, float angle)
     };
 }
 
-/*- Transform Functions -----------------------------------------------------*/
-
-//-----------------------------------------------------------------------------
-static vec3_t transform_point(vec3_t point, vec3_t position, vec3_t rotation, vec3_t scale)
+// The camera basis is constant for a whole frame. Rebuilding it per pixel,
+// as the first version did, meant a tanf and three sinf/cosf pairs for every
+// one of the 19200 rays.
+static void update_camera_basis(void)
 {
-    // Apply scale
-    point.x *= scale.x;
-    point.y *= scale.y;
-    point.z *= scale.z;
-    
-    // Apply rotation
-    point = vec3_rotate_x(point, rotation.x);
-    point = vec3_rotate_y(point, rotation.y);
-    point = vec3_rotate_z(point, rotation.z);
-    
-    // Apply translation
-    return vec3_add(point, position);
-}
+    vec3_t right = {1, 0, 0};
+    vec3_t up = {0, 1, 0};
+    vec3_t fwd = {0, 0, -1};
+    float rz = g_engine.camera.rotation.z;
+    float rx = g_engine.camera.rotation.x;
+    float ry = g_engine.camera.rotation.y;
 
-//-----------------------------------------------------------------------------
-static vec3_t world_to_screen(vec3_t world_pos)
-{
-    // Transform to camera space
-    vec3_t cam_pos = vec3_sub(world_pos, g_engine.camera.position);
-    
-    // Apply camera rotation (inverse)
-    cam_pos = vec3_rotate_y(cam_pos, -g_engine.camera.rotation.y);
-    cam_pos = vec3_rotate_x(cam_pos, -g_engine.camera.rotation.x);
-    cam_pos = vec3_rotate_z(cam_pos, -g_engine.camera.rotation.z);
-    
-    // Perspective projection
-    if (cam_pos.z <= g_engine.camera.near_plane) {
-        return (vec3_t){-1, -1, -1}; // Behind camera
-    }
-    
-    float aspect = (float)g_engine.render_width / g_engine.render_height;
-    float tan_half_fov = tanf(g_engine.camera.fov * 0.5f);
-    
-    float x = cam_pos.x / (cam_pos.z * tan_half_fov * aspect);
-    float y = cam_pos.y / (cam_pos.z * tan_half_fov);
-    
-    // Convert to screen coordinates
-    x = (x + 1.0f) * 0.5f * g_engine.render_width;
-    y = (1.0f - y) * 0.5f * g_engine.render_height;
-    
-    return (vec3_t){x, y, cam_pos.z};
+    right = vec3_rotate_y(vec3_rotate_x(vec3_rotate_z(right, rz), rx), ry);
+    up    = vec3_rotate_y(vec3_rotate_x(vec3_rotate_z(up,    rz), rx), ry);
+    fwd   = vec3_rotate_y(vec3_rotate_x(vec3_rotate_z(fwd,   rz), rx), ry);
+
+    g_basis.right = right;
+    g_basis.up = up;
+    g_basis.forward = fwd;
+    g_basis.tan_half_fov = tanf(g_engine.camera.fov * 0.5f);
+    g_basis.aspect = (float)g_engine.render_width / g_engine.render_height;
 }
 
 //-----------------------------------------------------------------------------
 static ray_t screen_to_ray(int x, int y)
 {
     ray_t ray;
+
     ray.origin = g_engine.camera.position;
-    
-    // Convert screen coordinates to normalized device coordinates
+
+    // Normalized device coordinates
     float ndc_x = (2.0f * x / g_engine.render_width) - 1.0f;
     float ndc_y = 1.0f - (2.0f * y / g_engine.render_height);
-    
-    // Calculate ray direction
-    float aspect = (float)g_engine.render_width / g_engine.render_height;
-    float tan_half_fov = tanf(g_engine.camera.fov * 0.5f);
-    
-    vec3_t dir = {
-        ndc_x * tan_half_fov * aspect,
-        ndc_y * tan_half_fov,
-        -1.0f
-    };
-    
-    // Apply camera rotation
-    dir = vec3_rotate_z(dir, g_engine.camera.rotation.z);
-    dir = vec3_rotate_x(dir, g_engine.camera.rotation.x);
-    dir = vec3_rotate_y(dir, g_engine.camera.rotation.y);
-    
+
+    vec3_t dir = vec3_add(vec3_add(
+        vec3_mul(g_basis.right, ndc_x * g_basis.tan_half_fov * g_basis.aspect),
+        vec3_mul(g_basis.up, ndc_y * g_basis.tan_half_fov)),
+        g_basis.forward);
+
     ray.direction = vec3_normalize(dir);
+
     return ray;
 }
 
@@ -369,7 +347,11 @@ static hit_result_t intersect_plane(ray_t ray, object_t *obj)
     float denom = vec3_dot(obj->plane.normal, ray.direction);
     
     if (fabsf(denom) > EPSILON) {
-        vec3_t p0 = vec3_mul(obj->plane.normal, obj->plane.distance);
+        // The plane passes through the object's position. Deriving the point
+        // from plane.distance instead put the ground plane at +2 while the
+        // bounds test used position (0,-2,0), so the floor rendered as a
+        // ceiling and the scene had nothing underneath it.
+        vec3_t p0 = obj->position;
         vec3_t p0l0 = vec3_sub(p0, ray.origin);
         float t = vec3_dot(p0l0, obj->plane.normal) / denom;
         
@@ -625,9 +607,15 @@ static vec3_t calculate_lighting(hit_result_t hit, vec3_t view_dir)
         // Diffuse lighting
         float diffuse = fmaxf(0.0f, vec3_dot(hit.normal, light_dir));
         
-        // Specular lighting (Blinn-Phong)
+        // Specular lighting (Blinn-Phong). x^32 by repeated squaring: powf()
+        // here cost more than the intersection test it was shading.
         vec3_t half_dir = vec3_normalize(vec3_add(light_dir, view_dir));
-        float specular = powf(fmaxf(0.0f, vec3_dot(hit.normal, half_dir)), 32.0f);
+        float spec_base = fmaxf(0.0f, vec3_dot(hit.normal, half_dir));
+        float s2 = spec_base * spec_base;
+        float s4 = s2 * s2;
+        float s8 = s4 * s4;
+        float s16 = s8 * s8;
+        float specular = s16 * s16;
         
         vec3_t light_contribution = {
             light->color.x * light->intensity * attenuation * (diffuse + specular * 0.5f),
@@ -649,33 +637,64 @@ static vec3_t calculate_lighting(hit_result_t hit, vec3_t view_dir)
 /*- Rendering Functions ----------------------------------------------------*/
 
 //-----------------------------------------------------------------------------
+// Expand one traced source line into the row buffer and push it with one
+// windowed transfer per output row. The first version issued render_scale^2
+// single-pixel transfers per sample: 76800 window setups per frame.
+static void blit_line(int y)
+{
+    int scale = g_engine.render_scale;
+    int width = g_engine.render_width * scale;
+
+    if (width > LCD_WIDTH)
+        width = LCD_WIDTH;
+
+    for (int i = 0; i < scale; i++) {
+        int lcd_y = y * scale + i;
+
+        if (lcd_y < VIEW_HEIGHT)
+            lcd_draw_buf(0, lcd_y, width, 1, g_line_buf);
+    }
+}
+
+//-----------------------------------------------------------------------------
+static void store_pixel(int x, uint16_t color)
+{
+    int scale = g_engine.render_scale;
+
+    for (int i = 0; i < scale; i++) {
+        int lcd_x = x * scale + i;
+
+        if (lcd_x < LCD_WIDTH)
+            g_line_buf[lcd_x] = color;
+    }
+}
+
+//-----------------------------------------------------------------------------
 static void render_raycast_progressive(void)
 {
-    // Progressive raycast rendering - render only a few lines per frame
-    int lines_to_render = LINES_PER_FRAME;
-    int end_line = g_current_render_line + lines_to_render;
-    if (end_line > g_engine.render_height) {
+    int end_line = g_current_render_line + LINES_PER_FRAME;
+
+    if (end_line > g_engine.render_height)
         end_line = g_engine.render_height;
-    }
-    
+
     for (int y = g_current_render_line; y < end_line; y++) {
         for (int x = 0; x < g_engine.render_width; x++) {
             ray_t ray = screen_to_ray(x, y);
             hit_result_t hit = engine3d_cast_ray(ray);
-            
             uint16_t color;
+
             if (hit.hit) {
                 vec3_t view_dir = vec3_mul(ray.direction, -1.0f);
                 vec3_t lit_color = calculate_lighting(hit, view_dir);
-                
+
                 uint8_t r = ((hit.color >> 11) & 0x1F) << 3;
                 uint8_t g = ((hit.color >> 5) & 0x3F) << 2;
                 uint8_t b = (hit.color & 0x1F) << 3;
-                
+
                 r = (uint8_t)(r * lit_color.x);
                 g = (uint8_t)(g * lit_color.y);
                 b = (uint8_t)(b * lit_color.z);
-                
+
                 color = LCD_COLOR(r, g, b);
             } else {
                 // Sky gradient
@@ -683,134 +702,108 @@ static void render_raycast_progressive(void)
                 uint8_t sky_intensity = (uint8_t)(100 + 155 * t);
                 color = LCD_COLOR(sky_intensity/4, sky_intensity/3, sky_intensity);
             }
-            
-            // Scale up to LCD resolution
-            for (int sy = 0; sy < g_engine.render_scale; sy++) {
-                for (int sx = 0; sx < g_engine.render_scale; sx++) {
-                    int lcd_x = x * g_engine.render_scale + sx;
-                    int lcd_y = y * g_engine.render_scale + sy;
-                    if (lcd_x < LCD_WIDTH && lcd_y < LCD_HEIGHT) {
-                        lcd_draw_pixel(lcd_x, lcd_y, color);
-                    }
-                }
-            }
+
+            store_pixel(x, color);
         }
+
+        blit_line(y);
     }
-    
+
     g_current_render_line = end_line;
-    if (g_current_render_line >= g_engine.render_height) {
-        g_frame_complete = true;
+
+    if (g_current_render_line >= g_engine.render_height)
         g_rendering_in_progress = false;
-        g_current_render_line = 0;
-    }
 }
 
 //-----------------------------------------------------------------------------
 static void render_raytrace_progressive(void)
 {
-    // Progressive raytracing - render only 2 lines per frame for better performance
-    int lines_to_render = (g_engine.render_mode == RENDER_MODE_RAYTRACE) ? 2 : LINES_PER_FRAME;
-    int end_line = g_current_render_line + lines_to_render;
-    if (end_line > g_engine.render_height) {
+    int end_line = g_current_render_line + LINES_PER_FRAME;
+
+    if (end_line > g_engine.render_height)
         end_line = g_engine.render_height;
-    }
-    
+
     for (int y = g_current_render_line; y < end_line; y++) {
         for (int x = 0; x < g_engine.render_width; x++) {
             ray_t ray = screen_to_ray(x, y);
             hit_result_t hit = engine3d_trace_ray(ray, MAX_RAY_DEPTH);
-            
-            uint16_t color = hit.color;
-            
-            // Scale up to LCD resolution
-            for (int sy = 0; sy < g_engine.render_scale; sy++) {
-                for (int sx = 0; sx < g_engine.render_scale; sx++) {
-                    int lcd_x = x * g_engine.render_scale + sx;
-                    int lcd_y = y * g_engine.render_scale + sy;
-                    if (lcd_x < LCD_WIDTH && lcd_y < LCD_HEIGHT) {
-                        lcd_draw_pixel(lcd_x, lcd_y, color);
-                    }
-                }
-            }
+
+            store_pixel(x, hit.color);
         }
+
+        blit_line(y);
     }
-    
+
     g_current_render_line = end_line;
-    if (g_current_render_line >= g_engine.render_height) {
-        g_frame_complete = true;
+
+    if (g_current_render_line >= g_engine.render_height)
         g_rendering_in_progress = false;
-        g_current_render_line = 0;
-    }
 }
 
 //-----------------------------------------------------------------------------
 static void render_frame(void)
 {
-    // Start new frame if not currently rendering
+    // Start a new frame, latching the camera basis it will be traced with
     if (!g_rendering_in_progress) {
         g_rendering_in_progress = true;
         g_current_render_line = 0;
-        g_frame_complete = false;
+        g_frame_start_time = timer_ms();
+
+        update_camera_basis();
     }
-    
-    // Render progressively
-    if (g_engine.render_mode == RENDER_MODE_RAYCAST) {
+
+    if (g_engine.render_mode == RENDER_MODE_RAYCAST)
         render_raycast_progressive();
-    } else {
+    else
         render_raytrace_progressive();
+
+    // Frame just finished: that is when the timings are known
+    if (!g_rendering_in_progress) {
+        uint32_t ms = timer_ms() - g_frame_start_time;
+
+        g_engine.frame_count++;
+        g_engine.current_fps = ms ? (1000 / ms) : 999;
+        g_hud_dirty = true;
     }
+}
+
+//-----------------------------------------------------------------------------
+// Abandon the frame in flight and start again from the top. Without this a
+// camera move only affected the lines below the raster, tearing the image.
+static void restart_frame(void)
+{
+    g_rendering_in_progress = false;
+    g_current_render_line = 0;
+    g_hud_dirty = true;
 }
 
 //-----------------------------------------------------------------------------
 static void draw_ui(void)
 {
+    char buf[64];
+
+    lcd_fill_rect(0, HUD_Y, LCD_WIDTH, HUD_HEIGHT, BG_COLOR);
+    lcd_fill_rect(0, HUD_Y, LCD_WIDTH, 1, LCD_COLOR(100, 100, 100));
+
     lcd_set_font(FONT_SMALL);
     lcd_set_color(BG_COLOR, LCD_WHITE_COLOR);
-    
-    // FPS counter in top-left corner
-    char fps_str[16];
-    snprintf(fps_str, sizeof(fps_str), "%lu FPS", g_engine.current_fps);
-    lcd_puts(5, 5, fps_str);
-    
-    // Render mode
-    lcd_puts(5, 15, g_engine.render_mode == RENDER_MODE_RAYCAST ? "RAYCAST" : "RAYTRACE");
-    
-    // Camera info
+
     // Formatted from integer tenths: newlib's %f goes through malloc-backed
     // _dtoa, and the heap shares the same scarce TCM as the stack
-    char cam_str[64];
     int cx = (int)(g_engine.camera.position.x * 10.0f);
     int cy = (int)(g_engine.camera.position.y * 10.0f);
     int cz = (int)(g_engine.camera.position.z * 10.0f);
-    snprintf(cam_str, sizeof(cam_str), "X:%d.%d Y:%d.%d Z:%d.%d",
-             cx / 10, cx < 0 ? -cx % 10 : cx % 10,
-             cy / 10, cy < 0 ? -cy % 10 : cy % 10,
-             cz / 10, cz < 0 ? -cz % 10 : cz % 10);
-    lcd_puts(5, LCD_HEIGHT - 25, cam_str);
-    
-    // Controls
-    lcd_puts(5, LCD_HEIGHT - 15, "F1:Mode WASD:Move QE:UpDown");
-}
 
-//-----------------------------------------------------------------------------
-static void calculate_fps(void)
-{
-    static uint32_t fps_counter = 0;
-    static uint32_t last_fps_update = 0;
-    
-    g_engine.frame_count++;
-    fps_counter++;
-    
-    // Simple FPS calculation based on frame timer
-    if (fps_counter >= 20) { // Update FPS every 20 frames
-        // Estimate FPS based on frame timer interval
-        if (g_engine.render_mode == RENDER_MODE_RAYCAST) {
-            g_engine.current_fps = 1000 / 50; // 50ms per frame = 20 FPS
-        } else {
-            g_engine.current_fps = 1000 / 200; // 200ms per frame = 5 FPS
-        }
-        fps_counter = 0;
-    }
+    snprintf(buf, sizeof(buf), "%s  %lu FPS  X%d.%d Y%d.%d Z%d.%d",
+        g_engine.render_mode == RENDER_MODE_RAYCAST ? "RAYCAST" : "RAYTRACE",
+        g_engine.current_fps,
+        cx / 10, cx < 0 ? -cx % 10 : cx % 10,
+        cy / 10, cy < 0 ? -cy % 10 : cy % 10,
+        cz / 10, cz < 0 ? -cz % 10 : cz % 10);
+    lcd_puts(5, HUD_Y + 6, buf);
+
+    lcd_puts(5, HUD_Y + 18,
+        "ARROWS move  TRIG_UP/DN up/down  SHIFT+ARROWS look");
 }
 
 /*- Scene Management Functions ---------------------------------------------*/
@@ -974,24 +967,22 @@ void engine3d_set_camera_rotation(vec3_t rotation)
 }
 
 //-----------------------------------------------------------------------------
+// delta.x = right, delta.y = world up, delta.z = along the view direction.
+// The axes come from the same basis the renderer uses, so "forward" really is
+// where the camera looks; the old version rotated its own vectors in a
+// different order and then moved backwards for a positive delta.
 void engine3d_move_camera(vec3_t delta)
 {
-    // Transform movement relative to camera orientation
-    vec3_t forward = {0, 0, -1};
-    vec3_t right = {1, 0, 0};
     vec3_t up = {0, 1, 0};
-    
-    // Apply camera rotation to movement vectors
-    forward = vec3_rotate_y(forward, g_engine.camera.rotation.y);
-    forward = vec3_rotate_x(forward, g_engine.camera.rotation.x);
-    
-    right = vec3_rotate_y(right, g_engine.camera.rotation.y);
-    
-    vec3_t movement = vec3_add(vec3_add(
-        vec3_mul(forward, delta.z),
-        vec3_mul(right, delta.x)),
+    vec3_t movement;
+
+    update_camera_basis();
+
+    movement = vec3_add(vec3_add(
+        vec3_mul(g_basis.forward, delta.z),
+        vec3_mul(g_basis.right, delta.x)),
         vec3_mul(up, delta.y));
-    
+
     g_engine.camera.position = vec3_add(g_engine.camera.position, movement);
 }
 
@@ -1031,39 +1022,39 @@ void engine3d_init(void)
     g_engine.render_scale = DEFAULT_RENDER_SCALE;
     g_engine.camera_speed = CAMERA_MOVE_SPEED;
     
-    // Initialize timers
-    timer_add(&g_frame_timer);
-    timer_add(&g_fps_timer);
-    g_frame_timer = 50; // ~20 FPS for raycast, slower for raytrace
-    g_fps_timer = 100;  // Update FPS every 100ms
-    
+    // Progressive rendering state does not survive a relaunch
+    g_current_render_line = 0;
+    g_rendering_in_progress = false;
+    g_hud_dirty = true;
+
     // Setup scene
     setup_default_scene();
-    
+
     // Clear screen
     lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, BG_COLOR);
-    
-    g_scene_dirty = true;
+
+    draw_ui();
+}
+
+//-----------------------------------------------------------------------------
+void engine3d_redraw(void)
+{
+    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, BG_COLOR);
+
+    restart_frame();
 }
 
 //-----------------------------------------------------------------------------
 void engine3d_task(void)
 {
-    if (g_frame_timer == 0) {
-        // Much faster timer for progressive rendering - allows system to breathe
-        g_frame_timer = 10; // 10ms = 100Hz, but only renders a few lines each time
-        
-        render_frame();
-        
-        // Only calculate FPS when frame is complete
-        if (g_frame_complete) {
-            calculate_fps();
-        }
-    }
-    
-    if (g_fps_timer == 0) {
-        g_fps_timer = 100;
+    // No frame timer: a slice is LINES_PER_FRAME source lines and the main
+    // loop gets control back between slices, which is what bounds the button
+    // latency here
+    render_frame();
+
+    if (g_hud_dirty) {
         draw_ui();
+        g_hud_dirty = false;
     }
 }
 
@@ -1071,72 +1062,69 @@ void engine3d_task(void)
 void engine3d_buttons_handler(int buttons)
 {
     bool repeat = (buttons & BTN_REPEAT);
-    
-    // Toggle render mode with F1
-    if (buttons & BTN_F1) {
-        if (!repeat) {
-            g_engine.render_mode = (g_engine.render_mode == RENDER_MODE_RAYCAST) ? 
-                                  RENDER_MODE_RAYTRACE : RENDER_MODE_RAYCAST;
-            
-            // Clear screen when switching modes
-            lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, BG_COLOR);
-        }
-    }
-    
-    // Camera movement (WASD-like controls)
     vec3_t move_delta = {0, 0, 0};
     vec3_t rotate_delta = {0, 0, 0};
-    
-    if (buttons & BTN_UP) {        // W - Forward
-        move_delta.z = -g_engine.camera_speed;
+    bool changed = false;
+
+    // MODE is the primary action everywhere in the system; here it switches
+    // between the two renderers
+    if ((buttons & BTN_MODE) && !repeat) {
+        g_engine.render_mode = (g_engine.render_mode == RENDER_MODE_RAYCAST) ?
+            RENDER_MODE_RAYTRACE : RENDER_MODE_RAYCAST;
+        g_menu_render_mode = (int)g_engine.render_mode;
+
+        lcd_fill_rect(0, 0, LCD_WIDTH, VIEW_HEIGHT, BG_COLOR);
+        restart_frame();
+        return;
     }
-    if (buttons & BTN_DOWN) {      // S - Backward
-        move_delta.z = g_engine.camera_speed;
-    }
-    if (buttons & BTN_LEFT) {      // A - Left
-        move_delta.x = -g_engine.camera_speed;
-    }
-    if (buttons & BTN_RIGHT) {     // D - Right
-        move_delta.x = g_engine.camera_speed;
-    }
-    if (buttons & BTN_TRIG_UP) {   // Q - Up
-        move_delta.y = g_engine.camera_speed;
-    }
-    if (buttons & BTN_TRIG_DOWN) { // E - Down
-        move_delta.y = -g_engine.camera_speed;
-    }
-    
-    // Camera rotation
+
     if (buttons & BTN_SHIFT) {
-        // Hold shift for rotation mode
-        if (buttons & BTN_UP) {
+        // SHIFT turns the arrows into a look control
+        if (buttons & BTN_UP)
             rotate_delta.x = -CAMERA_ROTATE_SPEED;
-        }
-        if (buttons & BTN_DOWN) {
+
+        if (buttons & BTN_DOWN)
             rotate_delta.x = CAMERA_ROTATE_SPEED;
-        }
-        if (buttons & BTN_LEFT) {
+
+        if (buttons & BTN_LEFT)
             rotate_delta.y = -CAMERA_ROTATE_SPEED;
-        }
-        if (buttons & BTN_RIGHT) {
+
+        if (buttons & BTN_RIGHT)
             rotate_delta.y = CAMERA_ROTATE_SPEED;
+
+        if (rotate_delta.x != 0 || rotate_delta.y != 0) {
+            engine3d_rotate_camera(rotate_delta);
+            changed = true;
         }
-        
-        engine3d_rotate_camera(rotate_delta);
-        move_delta = (vec3_t){0, 0, 0}; // Don't move when rotating
     }
-    
-    // Apply movement
+    else {
+        if (buttons & BTN_UP)
+            move_delta.z = g_engine.camera_speed;      // forward
+
+        if (buttons & BTN_DOWN)
+            move_delta.z = -g_engine.camera_speed;     // back
+
+        if (buttons & BTN_LEFT)
+            move_delta.x = -g_engine.camera_speed;     // strafe left
+
+        if (buttons & BTN_RIGHT)
+            move_delta.x = g_engine.camera_speed;      // strafe right
+    }
+
+    // TRIG_UP/DOWN move vertically in either mode
+    if (buttons & BTN_TRIG_UP)
+        move_delta.y = g_engine.camera_speed;
+
+    if (buttons & BTN_TRIG_DOWN)
+        move_delta.y = -g_engine.camera_speed;
+
     if (move_delta.x != 0 || move_delta.y != 0 || move_delta.z != 0) {
         engine3d_move_camera(move_delta);
+        changed = true;
     }
-    
-    // Return to menu
-    if (buttons & BTN_MODE) {
-        if (!repeat) {
-            launcher_exit_app();
-        }
-    }
+
+    if (changed)
+        restart_frame();
 }
 
 //-----------------------------------------------------------------------------
@@ -1148,6 +1136,75 @@ void engine3d_set_render_mode(render_mode_t mode)
 //-----------------------------------------------------------------------------
 void engine3d_cleanup(void)
 {
-    g_frame_timer = TIMER_DISABLE;
-    g_fps_timer = TIMER_DISABLE;
+    g_rendering_in_progress = false;
 }
+
+//-----------------------------------------------------------------------------
+// Application menu
+//-----------------------------------------------------------------------------
+
+//-----------------------------------------------------------------------------
+static void render_mode_changed(void)
+{
+    // No drawing here: the menu popup is on top, and the app is repainted in
+    // full when it closes
+    g_engine.render_mode = (RENDER_MODE_RAYTRACE == g_menu_render_mode) ?
+        RENDER_MODE_RAYTRACE : RENDER_MODE_RAYCAST;
+
+    restart_frame();
+}
+
+//-----------------------------------------------------------------------------
+static void action_reset_camera(const void *arg)
+{
+    (void)arg;
+
+    g_engine.camera.position = (vec3_t){0, 0, 0};
+    g_engine.camera.rotation = (vec3_t){0, 0, 0};
+
+    restart_frame();
+    menu_close_popups();
+}
+
+static const char *const g_help_lines[] =
+{
+    "UP/DOWN     - Forward / back",
+    "LEFT/RIGHT  - Strafe",
+    "TRIG_UP/DN  - Up / down",
+    "SHIFT+arrows- Look around",
+    "MODE        - Switch raycast / raytrace",
+    "MENU        - This menu",
+    "SHIFT+MENU  - Back to the launcher",
+    "",
+    "The image is traced two lines per main loop",
+    "pass and restarts from the top whenever the",
+    "camera moves, so the view is always one",
+    "consistent frame rather than a torn one.",
+};
+
+static const info_page_t g_help_page =
+{
+    .title = "3D Engine",
+    .lines = g_help_lines,
+    .count = ARRAY_SIZE(g_help_lines),
+};
+
+static const char *const g_mode_labels[] = { "Raycast", "Raytrace" };
+
+static const menu_item_t g_menu_items[] =
+{
+    { .kind = MI_CHOICE, .label = "Renderer",
+      .u.choice = { &g_menu_render_mode, g_mode_labels, 2, render_mode_changed } },
+    { .kind = MI_SEPARATOR },
+    { .kind = MI_ACTION, .label = "Reset camera",
+      .u.action = { action_reset_camera, NULL } },
+    { .kind = MI_ACTION, .label = "Help",
+      .u.action = { menu_action_info, &g_help_page } },
+};
+
+const menu_def_t engine3d_menu =
+{
+    .title = "3D Engine",
+    .items = g_menu_items,
+    .count = ARRAY_SIZE(g_menu_items),
+};

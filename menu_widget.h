@@ -5,6 +5,10 @@
  * shared widget: navigation, scrolling, separator skipping, toggles and
  * value editing are implemented once. A submenu is just another menu screen
  * pushed onto the UI stack.
+ *
+ * The same file provides the info page: a modal, fullscreen text screen used
+ * for every help and info dialog, so an application only has to supply the
+ * text.
  */
 
 #ifndef _MENU_WIDGET_H_
@@ -13,6 +17,14 @@
 /*- Includes ----------------------------------------------------------------*/
 #include <stdint.h>
 #include <stdbool.h>
+
+/*- Definitions -------------------------------------------------------------*/
+// Info page body: first line origin. Line spacing shrinks automatically when
+// a page has more lines than fit, so pages with a custom body() can place
+// their own text on the same grid.
+#define INFO_X         20
+#define INFO_Y         45
+#define INFO_LINE_H    13
 
 /*- Types -------------------------------------------------------------------*/
 typedef enum
@@ -67,13 +79,29 @@ typedef struct menu_item_s
 
 typedef struct
 {
-  const char *title; // fullscreen style header, unused for popups
+  const char *title; // fullscreen header; for an application menu, the row
+                     // label under which the system menu nests it
   const menu_item_t *items;
   int count;
 } menu_def_t;
 
+// Modal text page: a title, a list of lines, and optionally a body() callback
+// for values that have to be computed when the page is opened
+typedef struct
+{
+  const char *title;
+  const char *const *lines; // may be NULL
+  int count;
+  void (*body)(void);       // drawn after the lines, may be NULL
+} info_page_t;
+
 /*- Prototypes --------------------------------------------------------------*/
 void menu_open_fullscreen(const menu_def_t *def);
 void menu_open_popup(const menu_def_t *def, int x, int y);
+void menu_open_info(const info_page_t *page);
+void menu_close_popups(void);
+
+// MI_ACTION helper: .u.action = { menu_action_info, &some_info_page }
+void menu_action_info(const void *arg);
 
 #endif // _MENU_WIDGET_H_

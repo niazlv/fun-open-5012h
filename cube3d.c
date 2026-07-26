@@ -1,30 +1,46 @@
 /*
  * 3D Cube Renderer
- * Replaces oscilloscope functionality with 3D rotating cube
+ * Rotating, back-face culled 3D cube demo
  */
 
 /*- Includes ----------------------------------------------------------------*/
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <math.h>
 #include "gd32f4xx.h"
 #include "lcd.h"
 #include "timer.h"
 #include "config.h"
 #include "buttons.h"
+#include "utils.h"
+#include "ui.h"
+#include "menu_widget.h"
 #include "cube3d.h"
-#include "launcher.h"
 
 /*- Definitions -------------------------------------------------------------*/
 #define PI 3.14159265359f
 #define DEG_TO_RAD (PI / 180.0f)
 
-// Cube rendering area
+// Cube rendering area: everything between the title and the status line.
+// Drawing is clipped to it, so the cube can never smear over the text.
 #define RENDER_X      0
 #define RENDER_Y      30
 #define RENDER_WIDTH  LCD_WIDTH
-#define RENDER_HEIGHT (LCD_HEIGHT - 80)
+#define RENDER_HEIGHT (LCD_HEIGHT - RENDER_Y - 20)
+
+#define STATUS_Y      (LCD_HEIGHT - 14)
+
+// Rotation rate as a percentage of the nominal speed
+#define SPEED_MIN     10
+#define SPEED_MAX     300
+#define SPEED_DEFAULT 100
+
+// Draw style, index into g_style_labels
+#define STYLE_SOLID_WIRE  0
+#define STYLE_SOLID       1
+#define STYLE_WIRE        2
 
 // Cube colors
 #define CUBE_EDGE_COLOR     LCD_COLOR(255, 255, 255)  // White edges
@@ -52,12 +68,17 @@ typedef struct {
     float rotation_speed_x, rotation_speed_y, rotation_speed_z;
 } Cube3D;
 
+// Sines and cosines of the three rotation angles, computed once per frame
+typedef struct {
+    float cx, sx, cy, sy, cz, sz;
+} rot_t;
+
 /*- Variables ---------------------------------------------------------------*/
 static Cube3D g_cube;
 static bool g_auto_rotate = true;
+static int g_style = STYLE_SOLID_WIRE;
+static int g_speed = SPEED_DEFAULT;
 static int g_frame_timer = TIMER_DISABLE;
-static int g_info_timer = TIMER_DISABLE;
-static bool g_info_dirty = true;
 
 // Optimized rendering with dirty rectangles
 #define MAX_DIRTY_RECTS 4
@@ -118,12 +139,14 @@ static float fast_cos(float angle)
 }
 
 //-----------------------------------------------------------------------------
-static void rotate_point(Vector3D *point, float rx, float ry, float rz)
+// All eight vertices share the same angles, so the six trig calls are hoisted
+// out by the caller
+static void rotate_point(Vector3D *point, const rot_t *r)
 {
-    float cos_rx = fast_cos(rx), sin_rx = fast_sin(rx);
-    float cos_ry = fast_cos(ry), sin_ry = fast_sin(ry);
-    float cos_rz = fast_cos(rz), sin_rz = fast_sin(rz);
-    
+    float cos_rx = r->cx, sin_rx = r->sx;
+    float cos_ry = r->cy, sin_ry = r->sy;
+    float cos_rz = r->cz, sin_rz = r->sz;
+
     // Rotation around X axis
     float y1 = point->y * cos_rx - point->z * sin_rx;
     float z1 = point->y * sin_rx + point->z * cos_rx;
@@ -185,10 +208,12 @@ static void init_cube_vertices(void)
 static void update_cube_rotation(void)
 {
     if (g_auto_rotate) {
-        g_cube.rotation_x += g_cube.rotation_speed_x;
-        g_cube.rotation_y += g_cube.rotation_speed_y;
-        g_cube.rotation_z += g_cube.rotation_speed_z;
-        
+        float scale = g_speed / (float)SPEED_DEFAULT;
+
+        g_cube.rotation_x += g_cube.rotation_speed_x * scale;
+        g_cube.rotation_y += g_cube.rotation_speed_y * scale;
+        g_cube.rotation_z += g_cube.rotation_speed_z * scale;
+
         // Keep angles in reasonable range
         if (g_cube.rotation_x > 2 * PI) g_cube.rotation_x -= 2 * PI;
         if (g_cube.rotation_y > 2 * PI) g_cube.rotation_y -= 2 * PI;
@@ -199,9 +224,15 @@ static void update_cube_rotation(void)
 //-----------------------------------------------------------------------------
 static void project_cube_vertices(void)
 {
+    rot_t r;
+
+    r.cx = fast_cos(g_cube.rotation_x); r.sx = fast_sin(g_cube.rotation_x);
+    r.cy = fast_cos(g_cube.rotation_y); r.sy = fast_sin(g_cube.rotation_y);
+    r.cz = fast_cos(g_cube.rotation_z); r.sz = fast_sin(g_cube.rotation_z);
+
     for (int i = 0; i < 8; i++) {
         Vector3D rotated = g_cube.vertices[i];
-        rotate_point(&rotated, g_cube.rotation_x, g_cube.rotation_y, g_cube.rotation_z);
+        rotate_point(&rotated, &r);
         g_cube.projected[i] = project_3d_to_2d(rotated);
     }
 }
@@ -294,9 +325,12 @@ static void clear_dirty_rects(void)
 }
 
 //-----------------------------------------------------------------------------
+// Clipped to the render area: the dirty rectangles are clamped to it too, so
+// anything painted outside would never be erased again
 static void fb_set_pixel(int x, int y, uint16_t color)
 {
-    if (x >= 0 && x < LCD_WIDTH && y >= 0 && y < LCD_HEIGHT) {
+    if (x >= RENDER_X && x < RENDER_X + RENDER_WIDTH &&
+        y >= RENDER_Y && y < RENDER_Y + RENDER_HEIGHT) {
         lcd_draw_pixel(x, y, color);
     }
 }
@@ -386,10 +420,20 @@ static void fb_fill_triangle(Point2D p1, Point2D p2, Point2D p3, uint16_t color)
             x_start = x_end;
             x_end = temp;
         }
-        
-        for (int x = x_start; x <= x_end; x++) {
-            fb_set_pixel(x, y, color);
-        }
+
+        // One windowed transfer per scanline instead of one per pixel: on a
+        // bit-banged panel the window setup dominates everything else
+        if (y < RENDER_Y || y >= RENDER_Y + RENDER_HEIGHT)
+            continue;
+
+        if (x_start < RENDER_X)
+            x_start = RENDER_X;
+
+        if (x_end >= RENDER_X + RENDER_WIDTH)
+            x_end = RENDER_X + RENDER_WIDTH - 1;
+
+        if (x_start <= x_end)
+            lcd_hline(x_start, x_end, y, color);
     }
 }
 
@@ -424,50 +468,59 @@ static void fb_draw_cube_edges(void)
 
 
 //-----------------------------------------------------------------------------
-static void draw_info_text(void)
+// The status line lives outside the render area, so it is only repainted when
+// something in it actually changed
+static void draw_status(void)
 {
+    char buf[24];
+
+    lcd_fill_rect(0, STATUS_Y - 2, LCD_WIDTH, LCD_HEIGHT - STATUS_Y + 2, BG_COLOR);
+
+    lcd_set_font(FONT_SMALL);
+    lcd_set_color(BG_COLOR, g_auto_rotate ? LCD_GREEN_COLOR : LCD_COLOR(255, 200, 0));
+    lcd_puts(10, STATUS_Y, g_auto_rotate ? "AUTO" : "MANUAL");
+
+    snprintf(buf, sizeof(buf), "Speed %d%%", g_speed);
+    lcd_set_color(BG_COLOR, LCD_WHITE_COLOR);
+    lcd_puts(70, STATUS_Y, buf);
+
+    lcd_puts(160, STATUS_Y, "MENU: settings / help");
+}
+
+//-----------------------------------------------------------------------------
+static void draw_static(void)
+{
+    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, BG_COLOR);
+
     lcd_set_font(FONT_LARGE);
     lcd_set_color(BG_COLOR, LCD_WHITE_COLOR);
-    
-    // Title
-    lcd_puts(10, 10, "3D CUBE DEMO");
-    
-    // Controls info
-    lcd_set_font(FONT_SMALL);
-    lcd_puts(10, LCD_HEIGHT - 60, "UP/DOWN: Rotation X");
-    lcd_puts(10, LCD_HEIGHT - 50, "LEFT/RIGHT: Rotation Y");
-    lcd_puts(10, LCD_HEIGHT - 40, "TRIG UP/DOWN: Rotation Z");
-    lcd_puts(10, LCD_HEIGHT - 30, "STOP: Toggle Auto-rotate");
-    lcd_puts(10, LCD_HEIGHT - 20, "MODE: Reset rotation");
-    
-    // Auto-rotate status
-    lcd_set_color(BG_COLOR, g_auto_rotate ? LCD_GREEN_COLOR : LCD_RED_COLOR);
-    lcd_puts(10, LCD_HEIGHT - 10, g_auto_rotate ? "AUTO" : "MANUAL");
-    
-    lcd_set_font(FONT_LARGE);
+    lcd_puts(10, 8, "3D CUBE");
+
+    draw_status();
+}
+
+//-----------------------------------------------------------------------------
+static void reset_view(void)
+{
+    g_cube.rotation_x = 0.0f;
+    g_cube.rotation_y = 0.0f;
+    g_cube.rotation_z = 0.0f;
 }
 
 //-----------------------------------------------------------------------------
 void cube3d_init(void)
 {
     init_cube_vertices();
-    
-    // Initialize timers
+
     timer_add(&g_frame_timer);
-    timer_add(&g_info_timer);
     g_frame_timer = 50; // ~20 FPS
-    g_info_timer = 500; // Update info every 500ms
-    g_info_dirty = true;
-    
-    // Clear screen
-    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, BG_COLOR);
-    
-    draw_info_text();
-    
+
+    draw_static();
+
     // Initialize dirty rectangle system
     g_dirty_count = 0;
     g_first_frame = true;
-    
+
     // Initialize previous projected vertices
     for (int i = 0; i < 8; i++) {
         g_prev_projected[i].x = 0;
@@ -476,32 +529,44 @@ void cube3d_init(void)
 }
 
 //-----------------------------------------------------------------------------
+// Called when a menu drawn on top of the cube closes. Only the dirty area
+// around the cube is repainted every frame, so everything else - title, status
+// line and the untouched background - has to be put back here.
+void cube3d_redraw(void)
+{
+    draw_static();
+
+    g_first_frame = true; // next frame repaints the whole render area
+    g_frame_timer = 0;    // ... without waiting out the frame interval
+}
+
+//-----------------------------------------------------------------------------
 void cube3d_task(void)
 {
     if (g_frame_timer == 0) {
         g_frame_timer = 50; // Reset timer for next frame
-        
+
         // Update rotation
         update_cube_rotation();
-        
+
         // Project 3D vertices to 2D screen coordinates
         project_cube_vertices();
-        
+
         // Calculate dirty rectangles based on movement
         calculate_dirty_rects();
-        
+
         // Only redraw if there are dirty areas
         if (g_dirty_count > 0) {
             // Clear only dirty areas
             clear_dirty_rects();
-            
-            // Draw cube faces first (filled)
-            fb_draw_cube_faces();
-            
-            // Draw cube edges on top (wireframe)
-            fb_draw_cube_edges();
+
+            if (g_style != STYLE_WIRE)
+                fb_draw_cube_faces();
+
+            if (g_style != STYLE_SOLID)
+                fb_draw_cube_edges();
         }
-        
+
         // Save current positions for next frame
         for (int i = 0; i < 8; i++) {
             g_prev_projected[i] = g_cube.projected[i];
@@ -513,50 +578,51 @@ void cube3d_task(void)
 void cube3d_buttons_handler(int buttons)
 {
     bool repeat = (buttons & BTN_REPEAT);
-    
+    bool status_dirty = false;
+
     float rotation_step = 0.1f;
-    
+
     if (buttons & BTN_UP) {
         g_cube.rotation_x += rotation_step;
+        status_dirty = g_auto_rotate;
         g_auto_rotate = false;
     }
     else if (buttons & BTN_DOWN) {
         g_cube.rotation_x -= rotation_step;
+        status_dirty = g_auto_rotate;
         g_auto_rotate = false;
     }
     else if (buttons & BTN_LEFT) {
         g_cube.rotation_y -= rotation_step;
+        status_dirty = g_auto_rotate;
         g_auto_rotate = false;
     }
     else if (buttons & BTN_RIGHT) {
         g_cube.rotation_y += rotation_step;
+        status_dirty = g_auto_rotate;
         g_auto_rotate = false;
     }
     else if (buttons & BTN_TRIG_UP) {
         g_cube.rotation_z += rotation_step;
+        status_dirty = g_auto_rotate;
         g_auto_rotate = false;
     }
     else if (buttons & BTN_TRIG_DOWN) {
         g_cube.rotation_z -= rotation_step;
+        status_dirty = g_auto_rotate;
         g_auto_rotate = false;
     }
     else if (buttons & BTN_STOP) {
         if (!repeat) {
             g_auto_rotate = !g_auto_rotate;
-            // Only redraw the status part to avoid flickering
-            lcd_set_color(BG_COLOR, g_auto_rotate ? LCD_GREEN_COLOR : LCD_RED_COLOR);
-            lcd_set_font(FONT_SMALL);
-            lcd_puts(10, LCD_HEIGHT - 10, g_auto_rotate ? "AUTO " : "MANUAL");
-            lcd_set_font(FONT_LARGE);
+            status_dirty = true;
         }
     }
     else if (buttons & BTN_MODE) {
-        if (!repeat) {
-            // Return to menu instead of resetting rotation
-            launcher_exit_app();
-        }
+        if (!repeat)
+            reset_view();
     }
-    
+
     // Keep angles in reasonable range
     if (g_cube.rotation_x > 2 * PI) g_cube.rotation_x -= 2 * PI;
     if (g_cube.rotation_x < 0) g_cube.rotation_x += 2 * PI;
@@ -564,11 +630,76 @@ void cube3d_buttons_handler(int buttons)
     if (g_cube.rotation_y < 0) g_cube.rotation_y += 2 * PI;
     if (g_cube.rotation_z > 2 * PI) g_cube.rotation_z -= 2 * PI;
     if (g_cube.rotation_z < 0) g_cube.rotation_z += 2 * PI;
+
+    if (status_dirty)
+        draw_status();
 }
 
 //-----------------------------------------------------------------------------
 void cube3d_cleanup(void)
 {
     g_frame_timer = TIMER_DISABLE;
-    g_info_timer = TIMER_DISABLE;
+    timer_remove(&g_frame_timer);
 }
+
+//-----------------------------------------------------------------------------
+// Application menu
+//-----------------------------------------------------------------------------
+
+//-----------------------------------------------------------------------------
+static void action_reset_view(const void *arg)
+{
+    (void)arg;
+
+    reset_view();
+    menu_close_popups(); // resume the demo so the result is visible
+}
+
+static const char *const g_help_lines[] =
+{
+    "UP/DOWN     - Rotate around X",
+    "LEFT/RIGHT  - Rotate around Y",
+    "TRIG_UP/DN  - Rotate around Z",
+    "  any of these switches to manual",
+    "STOP        - Auto-rotate on/off",
+    "MODE        - Reset the view",
+    "MENU        - This menu",
+    "SHIFT+MENU  - Back to the launcher",
+    "",
+    "Only the area the cube moved through is",
+    "repainted each frame, which is what keeps",
+    "the demo smooth on a bit-banged display.",
+};
+
+static const info_page_t g_help_page =
+{
+    .title = "3D Cube",
+    .lines = g_help_lines,
+    .count = ARRAY_SIZE(g_help_lines),
+};
+
+static const char *const g_style_labels[] = { "Solid+Wire", "Solid", "Wire" };
+
+// The screen is repainted in full when the menu closes, so none of these
+// callbacks may draw anything themselves
+static const menu_item_t g_menu_items[] =
+{
+    { .kind = MI_TOGGLE, .label = "Auto-rotate",
+      .u.toggle = { &g_auto_rotate, NULL } },
+    { .kind = MI_NUMBER, .label = "Speed",
+      .u.number = { &g_speed, SPEED_MIN, SPEED_MAX, 10, 25, "%", NULL } },
+    { .kind = MI_CHOICE, .label = "Style",
+      .u.choice = { &g_style, g_style_labels, ARRAY_SIZE(g_style_labels), NULL } },
+    { .kind = MI_SEPARATOR },
+    { .kind = MI_ACTION, .label = "Reset view",
+      .u.action = { action_reset_view, NULL } },
+    { .kind = MI_ACTION, .label = "Help",
+      .u.action = { menu_action_info, &g_help_page } },
+};
+
+const menu_def_t cube3d_menu =
+{
+    .title = "3D Cube",
+    .items = g_menu_items,
+    .count = ARRAY_SIZE(g_menu_items),
+};

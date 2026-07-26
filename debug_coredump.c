@@ -5,97 +5,177 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "gd32f4xx.h"
 #include "debug_coredump.h"
+#include "capture.h"
 #include "lcd.h"
 #include "buttons.h"
 #include "timer.h"
-#include "launcher.h"
-#include "gd32f4xx.h"
+#include "utils.h"
+#include "ui.h"
+#include "menu_widget.h"
 
 /*- Variables ---------------------------------------------------------------*/
-static coredump_entry_t g_coredump_entries[MAX_COREDUMP_ENTRIES];
-static int g_coredump_count = 0;
-static int g_coredump_write_index = 0;
-static bool g_viewer_active = false;
+// The ring lives in the retained SRAM block, addressed the same way capture.c
+// addresses its buffers. Nothing is linked there, so the startup code does
+// not touch it and the contents survive a reset - which is the whole point:
+// both capture paths stop the device, and the dump has to still be there
+// after the reboot that follows.
+static coredump_store_t *const g_store = (coredump_store_t *)COREDUMP_RAM_BASE;
+
+_Static_assert(sizeof(coredump_store_t) <= COREDUMP_RAM_SIZE,
+    "coredump ring does not fit the retained SRAM block");
+
+#define g_coredump_entries     (g_store->entries)
+#define g_coredump_count       (g_store->count)
+#define g_coredump_write_index (g_store->write_index)
+
+static bool g_ring_retained = false; // ring came from a previous boot
 static int g_viewer_current_entry = 0;
 static int g_viewer_current_page = 0;
-static int g_viewer_timer = 0;
+static bool g_viewer_dirty = false;
 
 // Stack/heap bounds provided by the linker (both in TCM)
 extern char _end;
 extern char _stack_top;
 
+// End of everything in flash, used to recognise return addresses
+extern uint32_t __etext;
+
 /*- Local Prototypes --------------------------------------------------------*/
 static void capture_stack_trace(stack_frame_t* trace, int* depth, uint32_t sp, uint32_t lr);
 static uint32_t get_stack_free_space(void);
-static uint32_t get_heap_free_space(void);
-static void draw_coredump_list(void);
-static void draw_coredump_details(int entry_index);
-static void draw_stack_trace(int entry_index);
-static void draw_registers(int entry_index);
 static const char* get_error_type_string(error_type_t type);
-static void format_hex_value(char* buffer, uint32_t value);
-
-// Flash storage functions
-static bool flash_erase_sector(uint32_t sector);
-static bool flash_write_data(uint32_t addr, const void* data, uint32_t size);
-static bool flash_read_data(uint32_t addr, void* data, uint32_t size);
-static void save_coredumps_to_flash(void);
-static void load_coredumps_from_flash(void);
-static uint32_t calculate_crc32(const void* data, uint32_t size);
 
 /*- Implementations ---------------------------------------------------------*/
 
 //-----------------------------------------------------------------------------
-void debug_coredump_init(void)
+// Plain CRC32 over the ring, excluding the crc field itself. Deliberately
+// self-contained: this runs from the fault handler, where the less machinery
+// is involved the better.
+static uint32_t store_crc(void)
 {
-    g_coredump_count = 0;
-    g_coredump_write_index = 0;
-    g_viewer_active = false;
-    g_viewer_current_entry = 0;
-    g_viewer_current_page = 0;
-    
-    memset(g_coredump_entries, 0, sizeof(g_coredump_entries));
-    
-    timer_add(&g_viewer_timer);
+    const uint8_t *data = (const uint8_t *)g_store;
+    uint32_t length = sizeof(coredump_store_t) - sizeof(g_store->crc);
+    uint32_t crc = 0xFFFFFFFF;
+
+    for (uint32_t i = 0; i < length; i++)
+    {
+        crc ^= data[i];
+
+        for (int j = 0; j < 8; j++)
+            crc = (crc & 1) ? ((crc >> 1) ^ 0xEDB88320) : (crc >> 1);
+    }
+
+    return ~crc;
 }
 
 //-----------------------------------------------------------------------------
+static void store_seal(void)
+{
+    g_store->crc = store_crc();
+}
+
+//-----------------------------------------------------------------------------
+static bool store_is_valid(void)
+{
+    if (COREDUMP_MAGIC != g_store->magic)
+        return false;
+
+    if (g_store->count < 0 || g_store->count > MAX_COREDUMP_ENTRIES)
+        return false;
+
+    if (g_store->write_index < 0 || g_store->write_index >= MAX_COREDUMP_ENTRIES)
+        return false;
+
+    return g_store->crc == store_crc();
+}
+
+//-----------------------------------------------------------------------------
+static void store_reset(uint32_t boot_id)
+{
+    memset(g_store, 0, sizeof(coredump_store_t));
+
+    g_store->magic = COREDUMP_MAGIC;
+    g_store->boot_id = boot_id;
+
+    store_seal();
+}
+
+//-----------------------------------------------------------------------------
+void debug_coredump_init(void)
+{
+    g_viewer_current_entry = 0;
+    g_viewer_current_page = 0;
+
+    if (store_is_valid())
+    {
+        // Survived the reset: keep the dumps and start a new boot id
+        g_ring_retained = (g_store->count > 0);
+        g_store->boot_id++;
+        store_seal();
+    }
+    else
+    {
+        // Cold start, corrupted ring, or a firmware with a different layout
+        g_ring_retained = false;
+        store_reset(1);
+    }
+}
+
+//-----------------------------------------------------------------------------
+uint32_t debug_coredump_boot_id(void)
+{
+    return g_store->boot_id;
+}
+
+//-----------------------------------------------------------------------------
+bool debug_coredump_ring_retained(void)
+{
+    return g_ring_retained;
+}
+
+//-----------------------------------------------------------------------------
+// There are no frame pointers in this build, so the trace is a scan: every
+// word still on the stack that looks like a Thumb return address into flash
+// is reported, newest first. It over-reports (stale slots from earlier calls
+// show up too), but it cannot miss the call chain and, unlike the previous
+// version, it cannot run off the end of memory either - that one bounded its
+// inner scan against 0x20020000, an SRAM address, while walking a stack that
+// lives in TCM, so it read past the top of TCM and risked faulting inside the
+// fault handler.
 static void capture_stack_trace(stack_frame_t* trace, int* depth, uint32_t sp, uint32_t lr)
 {
+    uint32_t stack_lo = (uint32_t)&_end;
+    uint32_t stack_hi = (uint32_t)&_stack_top;
+    uint32_t text_lo = 0x08000000;
+    uint32_t text_hi = (uint32_t)&__etext;
+
     *depth = 0;
-    
-    // Simple stack unwinding - this is basic and may need improvement
-    uint32_t* stack_ptr = (uint32_t*)sp;
-    uint32_t current_lr = lr;
-    
-    for (int i = 0; i < MAX_STACK_TRACE_DEPTH && *depth < MAX_STACK_TRACE_DEPTH; i++) {
-        // The stack lives in TCM (see linker script), not in main SRAM;
-        // checking the SRAM range made every trace come back empty
-        if ((uint32_t)stack_ptr < (uint32_t)&_end || (uint32_t)stack_ptr >= (uint32_t)&_stack_top) {
-            break;
-        }
-        
-        trace[*depth].pc = current_lr;
-        trace[*depth].lr = current_lr;
-        trace[*depth].sp = (uint32_t)stack_ptr;
-        trace[*depth].function = current_lr & 0xFFFFFFFE; // Clear thumb bit
-        
-        (*depth)++;
-        
-        // Try to find next frame (this is simplified)
-        // In a real implementation, you'd need proper frame pointer unwinding
-        stack_ptr += 4; // Move up the stack
-        
-        // Look for a potential return address
-        for (int j = 0; j < 8 && (uint32_t)stack_ptr < 0x20020000; j++) {
-            uint32_t potential_lr = *stack_ptr;
-            // Check if this looks like a valid code address
-            if (potential_lr >= 0x08000000 && potential_lr < 0x08100000) {
-                current_lr = potential_lr;
-                break;
-            }
-            stack_ptr++;
+
+    // Frame 0 is where the faulting function would have returned to
+    if ((lr & 1) && lr >= text_lo && lr < text_hi) {
+        trace[0].pc = lr & ~1u;
+        trace[0].lr = lr;
+        trace[0].sp = sp;
+        trace[0].function = lr & ~1u;
+        *depth = 1;
+    }
+
+    if (sp < stack_lo || sp >= stack_hi)
+        return; // stack pointer itself is not plausible, nothing safe to walk
+
+    for (uint32_t addr = (sp + 3) & ~3u;
+         addr + 3 < stack_hi && *depth < MAX_STACK_TRACE_DEPTH;
+         addr += 4) {
+        uint32_t v = *(volatile uint32_t *)addr;
+
+        if ((v & 1) && v >= text_lo && v < text_hi) {
+            trace[*depth].pc = v & ~1u;
+            trace[*depth].lr = v;
+            trace[*depth].sp = addr;
+            trace[*depth].function = v & ~1u;
+            (*depth)++;
         }
     }
 }
@@ -103,9 +183,10 @@ static void capture_stack_trace(stack_frame_t* trace, int* depth, uint32_t sp, u
 //-----------------------------------------------------------------------------
 static uint32_t get_stack_free_space(void)
 {
-    // Simple stack usage estimation
-    uint32_t current_sp;
-    __asm volatile ("mov %0, sp" : "=r" (current_sp));
+    // The address of a local is the current stack pointer, near enough, and
+    // unlike inline asm it also compiles for the host tests
+    uint32_t here;
+    uint32_t current_sp = (uint32_t)(uintptr_t)&here;
 
     // Free space is what is left between the top of the heap and the
     // current stack pointer (both in TCM)
@@ -113,14 +194,6 @@ static uint32_t get_stack_free_space(void)
         return 0;
 
     return current_sp - (uint32_t)&_end;
-}
-
-//-----------------------------------------------------------------------------
-static uint32_t get_heap_free_space(void)
-{
-    // This would need to be implemented based on your heap allocator
-    // For now, return a placeholder
-    return 0x8000; // 32KB placeholder
 }
 
 //-----------------------------------------------------------------------------
@@ -136,6 +209,7 @@ void debug_coredump_capture(error_type_t type, const char* message,
     entry->type = type;
     strncpy(entry->message, message, MAX_ERROR_MESSAGE_LEN - 1);
     entry->message[MAX_ERROR_MESSAGE_LEN - 1] = '\0';
+    entry->boot_id = g_store->boot_id;
     entry->timestamp = timer_ms();
     entry->error_pc = pc;
     entry->error_lr = lr;
@@ -159,48 +233,58 @@ void debug_coredump_capture(error_type_t type, const char* message,
     
     // Capture stack trace
     capture_stack_trace(entry->stack_trace, &entry->stack_depth, sp, lr);
-    
-    // System context
-    entry->heap_free = get_heap_free_space();
+
     entry->stack_free = get_stack_free_space();
-    entry->active_timers = 0; // Would need timer system integration
-    entry->system_state = 0;  // Could capture current app state, etc.
-    
+
     // Update counters
     g_coredump_write_index = (g_coredump_write_index + 1) % MAX_COREDUMP_ENTRIES;
     if (g_coredump_count < MAX_COREDUMP_ENTRIES) {
         g_coredump_count++;
     }
-    
-    // Save to flash (currently just placeholder)
-    save_coredumps_to_flash();
+
+    // Seal before the caller halts the device: the ring is only recognised
+    // after the reset if its CRC matches
+    store_seal();
+
+    g_viewer_dirty = true;
 }
 
 //-----------------------------------------------------------------------------
 void debug_coredump_capture_hard_fault(uint32_t lr, uint32_t msp, uint32_t psp)
 {
-    uint32_t *sp = (uint32_t *)((lr & 4) ? psp : msp);
+    uint32_t frame = (lr & 4) ? psp : msp;
     coredump_entry_t* entry = &g_coredump_entries[g_coredump_write_index];
-    
+
+    // A stack overflow is one of the likeliest causes of getting here, and
+    // then the frame pointer is not a valid address. Dereferencing it would
+    // fault again inside the fault handler, which escalates to lockup and
+    // loses the dump entirely - so it is checked before it is used.
+    bool frame_ok = (frame >= (uint32_t)&_end) &&
+                    (frame + 8 * sizeof(uint32_t) <= (uint32_t)&_stack_top);
+    const uint32_t *sp = (const uint32_t *)frame;
+
     // Clear the entry
     memset(entry, 0, sizeof(coredump_entry_t));
-    
+
     // Basic information
     entry->type = ERROR_TYPE_HARD_FAULT;
-    strcpy(entry->message, "Hard Fault Exception");
+    strcpy(entry->message, frame_ok ? "Hard Fault Exception"
+                                    : "Hard Fault, exception frame lost");
+    entry->boot_id = g_store->boot_id;
     entry->timestamp = timer_ms();
-    entry->error_pc = sp[6];  // PC from exception stack frame
     entry->error_lr = lr;
-    entry->error_sp = (lr & 4) ? psp : msp;
-    
-    // CPU registers from exception stack frame
-    entry->r0 = sp[0];
-    entry->r1 = sp[1];
-    entry->r2 = sp[2];
-    entry->r3 = sp[3];
-    entry->r12 = sp[4];
-    entry->psr = sp[7];
-    
+    entry->error_sp = frame;
+
+    if (frame_ok) {
+        entry->error_pc = sp[6];  // PC from exception stack frame
+        entry->r0 = sp[0];
+        entry->r1 = sp[1];
+        entry->r2 = sp[2];
+        entry->r3 = sp[3];
+        entry->r12 = sp[4];
+        entry->psr = sp[7];
+    }
+
     // Fault status registers
     entry->cfsr = SCB->CFSR;
     entry->hfsr = SCB->HFSR;
@@ -208,37 +292,22 @@ void debug_coredump_capture_hard_fault(uint32_t lr, uint32_t msp, uint32_t psp)
     entry->afsr = SCB->AFSR;
     entry->mmar = SCB->MMFAR;
     entry->bfar = SCB->BFAR;
-    
+
     // Capture stack trace
-    capture_stack_trace(entry->stack_trace, &entry->stack_depth, 
-                       (lr & 4) ? psp : msp, sp[5]);
-    
-    // System context
-    entry->heap_free = get_heap_free_space();
+    capture_stack_trace(entry->stack_trace, &entry->stack_depth,
+                       frame, frame_ok ? sp[5] : 0);
+
     entry->stack_free = get_stack_free_space();
-    entry->active_timers = 0;
-    entry->system_state = 0;
-    
+
     // Update counters
     g_coredump_write_index = (g_coredump_write_index + 1) % MAX_COREDUMP_ENTRIES;
     if (g_coredump_count < MAX_COREDUMP_ENTRIES) {
         g_coredump_count++;
     }
-    
-    // Save to flash (currently just placeholder)
-    save_coredumps_to_flash();
-}
 
-//-----------------------------------------------------------------------------
-void debug_coredump_show_viewer(void)
-{
-    g_viewer_active = true;
-    g_viewer_current_entry = 0;
-    g_viewer_current_page = 0;
-    g_viewer_timer = 100; // Refresh rate
-    
-    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, LCD_BLACK_COLOR);
-    draw_coredump_list();
+    // Seal it: main.c halts on the fault screen and the user reboots from
+    // there, so this ring has to validate on the way back up
+    store_seal();
 }
 
 //-----------------------------------------------------------------------------
@@ -255,318 +324,386 @@ static const char* get_error_type_string(error_type_t type)
 }
 
 //-----------------------------------------------------------------------------
-static void format_hex_value(char* buffer, uint32_t value)
+// Viewer
+//
+// Pages: the list, and three detail pages for the selected dump. Only what
+// changed is repainted - moving the selection touches two rows, not the whole
+// 320x240 panel.
+//-----------------------------------------------------------------------------
+#define PAGE_LIST       0
+#define PAGE_DETAILS    1
+#define PAGE_REGS       2
+#define PAGE_STACK      3
+#define PAGE_COUNT      4
+
+#define HEADER_H        26
+#define FOOTER_H        22
+#define BODY_Y          HEADER_H
+#define ROW_H           22
+#define LINE_H          10
+
+#define CD_BG           LCD_BLACK_COLOR
+#define CD_FG           LCD_COLOR(220, 220, 220)
+#define CD_PANEL        LCD_COLOR(20, 20, 40)
+#define CD_ACCENT       LCD_COLOR(255, 200, 0)
+#define CD_SEL          LCD_COLOR(0, 120, 215)
+
+/*- Implementations ---------------------------------------------------------*/
+
+//-----------------------------------------------------------------------------
+// Entries are shown oldest first; the ring's newest entry sits at
+// write_index - 1
+static coredump_entry_t *entry_at(int index)
 {
-    sprintf(buffer, "0x%08lX", value);
+    int idx = (g_coredump_write_index - g_coredump_count + index +
+        2 * MAX_COREDUMP_ENTRIES) % MAX_COREDUMP_ENTRIES;
+
+    return &g_coredump_entries[idx];
+}
+
+//-----------------------------------------------------------------------------
+static void draw_header(const char *title)
+{
+    lcd_fill_rect(0, 0, LCD_WIDTH, HEADER_H, CD_PANEL);
+    lcd_fill_rect(0, HEADER_H - 1, LCD_WIDTH, 1, CD_FG);
+
+    lcd_set_font(FONT_LARGE);
+    lcd_set_color(CD_PANEL, CD_ACCENT);
+    lcd_puts(8, 5, title);
+}
+
+//-----------------------------------------------------------------------------
+static void draw_footer(const char *l1, const char *l2)
+{
+    lcd_fill_rect(0, LCD_HEIGHT - FOOTER_H, LCD_WIDTH, FOOTER_H, CD_PANEL);
+    lcd_fill_rect(0, LCD_HEIGHT - FOOTER_H, LCD_WIDTH, 1, CD_FG);
+
+    lcd_set_font(FONT_SMALL);
+    lcd_set_color(CD_PANEL, CD_FG);
+    lcd_puts(8, LCD_HEIGHT - FOOTER_H + 4, l1);
+    lcd_puts(8, LCD_HEIGHT - FOOTER_H + 13, l2);
+}
+
+//-----------------------------------------------------------------------------
+static void draw_list_row(int index)
+{
+    coredump_entry_t *entry = entry_at(index);
+    int y = BODY_Y + 4 + index * ROW_H;
+    bool selected = (index == g_viewer_current_entry);
+    uint16_t bg = selected ? CD_SEL : CD_BG;
+    char line[64];
+
+    lcd_fill_rect(0, y - 2, LCD_WIDTH, ROW_H, bg);
+
+    lcd_set_font(FONT_SMALL);
+    lcd_set_color(bg, CD_FG);
+
+    snprintf(line, sizeof(line), "%d. %s%s", index + 1,
+        get_error_type_string(entry->type),
+        (entry->boot_id == g_store->boot_id) ? "" : "  (before reset)");
+    lcd_puts(8, y, line);
+
+    snprintf(line, sizeof(line), "   PC 0x%08lX  t=%lu ms  boot %lu",
+        (unsigned long)entry->error_pc, (unsigned long)entry->timestamp,
+        (unsigned long)entry->boot_id);
+    lcd_puts(8, y + LINE_H, line);
 }
 
 //-----------------------------------------------------------------------------
 static void draw_coredump_list(void)
 {
-    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, LCD_BLACK_COLOR);
-    lcd_set_color(LCD_BLACK_COLOR, LCD_WHITE_COLOR);
-    lcd_set_font(FONT_LARGE);
-    
     char title[32];
-    sprintf(title, "CoreDump (%d entries)", g_coredump_count);
-    lcd_puts(10, 5, title);
-    
-    if (g_coredump_count == 0) {
-        lcd_puts(10, 30, "No crash dumps available");
-        lcd_puts(10, 50, "F1: Exit");
+
+    snprintf(title, sizeof(title), "CRASH DUMPS (%d)", (int)g_coredump_count);
+    draw_header(title);
+
+    lcd_fill_rect(0, BODY_Y, LCD_WIDTH, LCD_HEIGHT - BODY_Y - FOOTER_H, CD_BG);
+
+    if (0 == g_coredump_count) {
+        char buf[64];
+
+        lcd_set_font(FONT_SMALL);
+        lcd_set_color(CD_BG, CD_FG);
+        lcd_puts(8, BODY_Y + 20, "No crash dumps recorded.");
+        lcd_puts(8, BODY_Y + 38, "Dumps are written by the hard fault handler");
+        lcd_puts(8, BODY_Y + 50, "and by error(). They live in retained SRAM,");
+        lcd_puts(8, BODY_Y + 62, "so after a crash you reboot from the fault");
+        lcd_puts(8, BODY_Y + 74, "screen and the dump is waiting here.");
+        lcd_puts(8, BODY_Y + 92, "Cutting the power clears them.");
+
+        snprintf(buf, sizeof(buf), "This is boot %lu.",
+            (unsigned long)g_store->boot_id);
+        lcd_puts(8, BODY_Y + 110, buf);
+
+        lcd_puts(8, BODY_Y + 128, "MENU > Add test dump records a synthetic one.");
+
+        draw_footer("MENU: settings and help",
+            "SHIFT+MENU: back to the launcher");
         return;
     }
-    
+
+    for (int i = 0; i < g_coredump_count; i++)
+        draw_list_row(i);
+
+    draw_footer("UP/DOWN: select   MODE or RIGHT: open",
+        "MENU: settings and help");
+}
+
+//-----------------------------------------------------------------------------
+static void draw_detail_header(const char *what)
+{
+    char title[32];
+
+    snprintf(title, sizeof(title), "DUMP %d - %s",
+        g_viewer_current_entry + 1, what);
+    draw_header(title);
+
+    lcd_fill_rect(0, BODY_Y, LCD_WIDTH, LCD_HEIGHT - BODY_Y - FOOTER_H, CD_BG);
+
     lcd_set_font(FONT_SMALL);
-    
-    int y = 25;
-    for (int i = 0; i < g_coredump_count && y < LCD_HEIGHT - 20; i++) {
-        int entry_idx = (g_coredump_write_index - g_coredump_count + i + MAX_COREDUMP_ENTRIES) % MAX_COREDUMP_ENTRIES;
-        coredump_entry_t* entry = &g_coredump_entries[entry_idx];
-        
-        if (i == g_viewer_current_entry) {
-            lcd_set_color(LCD_WHITE_COLOR, LCD_BLUE_COLOR);
-        } else {
-            lcd_set_color(LCD_BLACK_COLOR, LCD_WHITE_COLOR);
-        }
-        
-        char line[64];
-        sprintf(line, "%d. %s", i + 1, get_error_type_string(entry->type));
-        lcd_puts(10, y, line);
-        
-        sprintf(line, "   PC:0x%08lX T:%lu", entry->error_pc, entry->timestamp);
-        lcd_puts(10, y + 10, line);
-        
-        y += 25;
+    lcd_set_color(CD_BG, CD_FG);
+}
+
+//-----------------------------------------------------------------------------
+static void draw_detail_footer(void)
+{
+    draw_footer("LEFT: back to the list   UP/DOWN: page",
+        "MENU: settings and help");
+}
+
+//-----------------------------------------------------------------------------
+static void draw_coredump_details(void)
+{
+    coredump_entry_t *entry = entry_at(g_viewer_current_entry);
+    char buf[64];
+    int y = BODY_Y + 8;
+
+    draw_detail_header("Overview");
+
+    lcd_set_color(CD_BG, CD_ACCENT);
+    lcd_puts(8, y, get_error_type_string(entry->type));
+    lcd_set_color(CD_BG, CD_FG);
+    y += 14;
+
+    // The message can be longer than the panel: cut it into 52 char rows
+    for (int i = 0; entry->message[i] && i < MAX_ERROR_MESSAGE_LEN; i += 52) {
+        strncpy(buf, &entry->message[i], 52);
+        buf[52] = 0;
+        lcd_puts(8, y, buf);
+        y += LINE_H;
     }
-    
-    lcd_set_color(LCD_BLACK_COLOR, LCD_WHITE_COLOR);
-    lcd_puts(10, LCD_HEIGHT - 25, "UP/DOWN: Select  RIGHT: Details");
-    lcd_puts(10, LCD_HEIGHT - 15, "F1: Exit  F2: Add Test Dump");
+
+    y += 6;
+
+    snprintf(buf, sizeof(buf), "Boot  %lu%s", (unsigned long)entry->boot_id,
+        (entry->boot_id == g_store->boot_id) ? " (this session)"
+                                             : " (before the last reset)");
+    lcd_puts(8, y, buf); y += LINE_H;
+
+    snprintf(buf, sizeof(buf), "Time  %lu ms after that boot",
+        (unsigned long)entry->timestamp);
+    lcd_puts(8, y, buf); y += LINE_H;
+
+    snprintf(buf, sizeof(buf), "PC    0x%08lX", (unsigned long)entry->error_pc);
+    lcd_puts(8, y, buf); y += LINE_H;
+
+    snprintf(buf, sizeof(buf), "LR    0x%08lX", (unsigned long)entry->error_lr);
+    lcd_puts(8, y, buf); y += LINE_H;
+
+    snprintf(buf, sizeof(buf), "SP    0x%08lX", (unsigned long)entry->error_sp);
+    lcd_puts(8, y, buf); y += LINE_H + 6;
+
+    snprintf(buf, sizeof(buf), "Stack headroom  %lu bytes",
+        (unsigned long)entry->stack_free);
+    lcd_puts(8, y, buf); y += LINE_H;
+
+    snprintf(buf, sizeof(buf), "Stack frames    %d", entry->stack_depth);
+    lcd_puts(8, y, buf);
+
+    draw_detail_footer();
 }
 
 //-----------------------------------------------------------------------------
-static void draw_coredump_details(int entry_index)
+static void draw_registers(void)
 {
-    if (entry_index >= g_coredump_count) return;
-    
-    int entry_idx = (g_coredump_write_index - g_coredump_count + entry_index + MAX_COREDUMP_ENTRIES) % MAX_COREDUMP_ENTRIES;
-    coredump_entry_t* entry = &g_coredump_entries[entry_idx];
-    
-    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, LCD_BLACK_COLOR);
-    lcd_set_color(LCD_BLACK_COLOR, LCD_WHITE_COLOR);
-    lcd_set_font(FONT_LARGE);
-    
-    char title[32];
-    sprintf(title, "Crash #%d Details", entry_index + 1);
-    lcd_puts(10, 5, title);
-    
-    lcd_set_font(FONT_SMALL);
-    
-    int y = 25;
-    
-    // Error type and message
-    lcd_puts(10, y, "Type:"); y += 10;
-    lcd_puts(20, y, get_error_type_string(entry->type)); y += 15;
-    
-    lcd_puts(10, y, "Message:"); y += 10;
-    lcd_puts(20, y, entry->message); y += 15;
-    
-    // Timing and location
-    char buffer[64];
-    sprintf(buffer, "Time: %lu ms", entry->timestamp);
-    lcd_puts(10, y, buffer); y += 10;
-    
-    sprintf(buffer, "PC:   0x%08lX", entry->error_pc);
-    lcd_puts(10, y, buffer); y += 10;
-    
-    sprintf(buffer, "LR:   0x%08lX", entry->error_lr);
-    lcd_puts(10, y, buffer); y += 10;
-    
-    sprintf(buffer, "SP:   0x%08lX", entry->error_sp);
-    lcd_puts(10, y, buffer); y += 15;
-    
-    // System state
-    sprintf(buffer, "Stack Free: %lu bytes", entry->stack_free);
-    lcd_puts(10, y, buffer); y += 10;
-    
-    sprintf(buffer, "Heap Free:  %lu bytes", entry->heap_free);
-    lcd_puts(10, y, buffer); y += 15;
-    
-    lcd_puts(10, LCD_HEIGHT - 25, "LEFT: Back  UP/DOWN: Regs/Stack");
-    lcd_puts(10, LCD_HEIGHT - 15, "F1: Exit");
-}
+    coredump_entry_t *entry = entry_at(g_viewer_current_entry);
+    char buf[48];
+    int y = BODY_Y + 8;
 
-//-----------------------------------------------------------------------------
-static void draw_registers(int entry_index)
-{
-    if (entry_index >= g_coredump_count) return;
-    
-    int entry_idx = (g_coredump_write_index - g_coredump_count + entry_index + MAX_COREDUMP_ENTRIES) % MAX_COREDUMP_ENTRIES;
-    coredump_entry_t* entry = &g_coredump_entries[entry_idx];
-    
-    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, LCD_BLACK_COLOR);
-    lcd_set_color(LCD_BLACK_COLOR, LCD_WHITE_COLOR);
-    lcd_set_font(FONT_LARGE);
-    
-    char title[32];
-    sprintf(title, "Crash #%d Registers", entry_index + 1);
-    lcd_puts(10, 5, title);
-    
-    lcd_set_font(FONT_SMALL);
-    
-    int y = 25;
-    char buffer[32];
-    
-    // CPU Registers
-    sprintf(buffer, "R0:  0x%08lX", entry->r0);
-    lcd_puts(10, y, buffer); y += 10;
-    
-    sprintf(buffer, "R1:  0x%08lX", entry->r1);
-    lcd_puts(10, y, buffer); y += 10;
-    
-    sprintf(buffer, "R2:  0x%08lX", entry->r2);
-    lcd_puts(10, y, buffer); y += 10;
-    
-    sprintf(buffer, "R3:  0x%08lX", entry->r3);
-    lcd_puts(10, y, buffer); y += 10;
-    
-    sprintf(buffer, "R12: 0x%08lX", entry->r12);
-    lcd_puts(10, y, buffer); y += 10;
-    
-    sprintf(buffer, "PSR: 0x%08lX", entry->psr);
-    lcd_puts(10, y, buffer); y += 15;
-    
-    // Fault Status Registers
-    lcd_puts(10, y, "Fault Status:"); y += 10;
-    
-    sprintf(buffer, "CFSR: 0x%08lX", entry->cfsr);
-    lcd_puts(20, y, buffer); y += 10;
-    
-    sprintf(buffer, "HFSR: 0x%08lX", entry->hfsr);
-    lcd_puts(20, y, buffer); y += 10;
-    
-    sprintf(buffer, "MMAR: 0x%08lX", entry->mmar);
-    lcd_puts(20, y, buffer); y += 10;
-    
-    sprintf(buffer, "BFAR: 0x%08lX", entry->bfar);
-    lcd_puts(20, y, buffer); y += 10;
-    
-    lcd_puts(10, LCD_HEIGHT - 25, "LEFT: Back  UP/DOWN: Details/Stack");
-    lcd_puts(10, LCD_HEIGHT - 15, "F1: Exit");
-}
+    draw_detail_header("Registers");
 
-//-----------------------------------------------------------------------------
-static void draw_stack_trace(int entry_index)
-{
-    if (entry_index >= g_coredump_count) return;
-    
-    int entry_idx = (g_coredump_write_index - g_coredump_count + entry_index + MAX_COREDUMP_ENTRIES) % MAX_COREDUMP_ENTRIES;
-    coredump_entry_t* entry = &g_coredump_entries[entry_idx];
-    
-    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, LCD_BLACK_COLOR);
-    lcd_set_color(LCD_BLACK_COLOR, LCD_WHITE_COLOR);
-    lcd_set_font(FONT_LARGE);
-    
-    char title[32];
-    sprintf(title, "Crash #%d Stack", entry_index + 1);
-    lcd_puts(10, 5, title);
-    
-    lcd_set_font(FONT_SMALL);
-    
-    int y = 25;
-    char buffer[64];
-    
-    sprintf(buffer, "Stack Depth: %d frames", entry->stack_depth);
-    lcd_puts(10, y, buffer); y += 15;
-    
-    for (int i = 0; i < entry->stack_depth && y < LCD_HEIGHT - 30; i++) {
-        sprintf(buffer, "#%d PC: 0x%08lX", i, entry->stack_trace[i].pc);
-        lcd_puts(10, y, buffer); y += 10;
-        
-        sprintf(buffer, "   SP: 0x%08lX", entry->stack_trace[i].sp);
-        lcd_puts(10, y, buffer); y += 12;
+    static const char *const names[] = { "R0", "R1", "R2", "R3", "R12", "PSR" };
+    uint32_t values[6];
+
+    values[0] = entry->r0;
+    values[1] = entry->r1;
+    values[2] = entry->r2;
+    values[3] = entry->r3;
+    values[4] = entry->r12;
+    values[5] = entry->psr;
+
+    // Two columns of three
+    for (int i = 0; i < 6; i++) {
+        snprintf(buf, sizeof(buf), "%-4s 0x%08lX", names[i],
+            (unsigned long)values[i]);
+        lcd_puts((i < 3) ? 8 : 168, y + (i % 3) * LINE_H, buf);
     }
-    
-    lcd_puts(10, LCD_HEIGHT - 25, "LEFT: Back  UP/DOWN: Details/Regs");
-    lcd_puts(10, LCD_HEIGHT - 15, "F1: Exit");
+
+    y += 3 * LINE_H + 8;
+
+    lcd_set_color(CD_BG, CD_ACCENT);
+    lcd_puts(8, y, "Fault status");
+    lcd_set_color(CD_BG, CD_FG);
+    y += 14;
+
+    static const char *const fnames[] = { "CFSR", "HFSR", "DFSR", "AFSR", "MMAR", "BFAR" };
+    uint32_t fvalues[6];
+
+    fvalues[0] = entry->cfsr;
+    fvalues[1] = entry->hfsr;
+    fvalues[2] = entry->dfsr;
+    fvalues[3] = entry->afsr;
+    fvalues[4] = entry->mmar;
+    fvalues[5] = entry->bfar;
+
+    for (int i = 0; i < 6; i++) {
+        snprintf(buf, sizeof(buf), "%-4s 0x%08lX", fnames[i],
+            (unsigned long)fvalues[i]);
+        lcd_puts((i < 3) ? 8 : 168, y + (i % 3) * LINE_H, buf);
+    }
+
+    draw_detail_footer();
 }
 
 //-----------------------------------------------------------------------------
-void debug_coredump_viewer_buttons_handler(int buttons)
+static void draw_stack_trace(void)
 {
-    if (!g_viewer_active) return;
-    
+    coredump_entry_t *entry = entry_at(g_viewer_current_entry);
+    char buf[48];
+    int y = BODY_Y + 8;
+
+    draw_detail_header("Stack");
+
+    snprintf(buf, sizeof(buf), "%d frames recovered", entry->stack_depth);
+    lcd_puts(8, y, buf);
+    y += 16;
+
+    if (0 == entry->stack_depth) {
+        lcd_puts(8, y, "The unwinder found no return addresses.");
+        draw_detail_footer();
+        return;
+    }
+
+    // Two columns of eight, two lines each: all MAX_STACK_TRACE_DEPTH frames
+    // fit on one page, so there is nothing left to scroll to
+    for (int i = 0; i < entry->stack_depth && i < MAX_STACK_TRACE_DEPTH; i++) {
+        int col = (i < 8) ? 8 : 168;
+        int ry = y + (i % 8) * 2 * LINE_H;
+
+        snprintf(buf, sizeof(buf), "%2d LR 0x%08lX", i,
+            (unsigned long)entry->stack_trace[i].lr);
+        lcd_puts(col, ry, buf);
+
+        snprintf(buf, sizeof(buf), "   SP 0x%08lX",
+            (unsigned long)entry->stack_trace[i].sp);
+        lcd_puts(col, ry + LINE_H, buf);
+    }
+
+    draw_detail_footer();
+}
+
+//-----------------------------------------------------------------------------
+static void draw_page(void)
+{
+    switch (g_viewer_current_page) {
+        case PAGE_DETAILS: draw_coredump_details(); break;
+        case PAGE_REGS:    draw_registers(); break;
+        case PAGE_STACK:   draw_stack_trace(); break;
+        default:           draw_coredump_list(); break;
+    }
+}
+
+//-----------------------------------------------------------------------------
+void coredump_app_init(void)
+{
+    g_viewer_current_entry = 0;
+    g_viewer_current_page = PAGE_LIST;
+
+    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, CD_BG);
+    draw_page();
+}
+
+//-----------------------------------------------------------------------------
+void coredump_app_redraw(void)
+{
+    g_viewer_dirty = true;
+}
+
+//-----------------------------------------------------------------------------
+void coredump_app_task(void)
+{
+    if (!g_viewer_dirty)
+        return;
+
+    g_viewer_dirty = false;
+    draw_page();
+}
+
+//-----------------------------------------------------------------------------
+void coredump_app_buttons_handler(int buttons)
+{
     bool repeat = (buttons & BTN_REPEAT);
-    
-    if (buttons & BTN_F1) {
-        if (!repeat) {
-            g_viewer_active = false;
+
+    if (PAGE_LIST == g_viewer_current_page) {
+        if (0 == g_coredump_count)
             return;
+
+        if ((buttons & BTN_UP) && g_viewer_current_entry > 0) {
+            int prev = g_viewer_current_entry--;
+
+            draw_list_row(prev);            // repaint the two rows that
+            draw_list_row(g_viewer_current_entry); // changed, not the screen
         }
+
+        if ((buttons & BTN_DOWN) && g_viewer_current_entry < g_coredump_count - 1) {
+            int prev = g_viewer_current_entry++;
+
+            draw_list_row(prev);
+            draw_list_row(g_viewer_current_entry);
+        }
+
+        if ((buttons & (BTN_RIGHT | BTN_MODE)) && !repeat) {
+            g_viewer_current_page = PAGE_DETAILS;
+            g_viewer_dirty = true;
+        }
+
+        return;
     }
-    
-    // F2 to create a test coredump
-    if (buttons & BTN_F2) {
-        if (!repeat) {
-            uint32_t pc, lr, sp;
-            __asm volatile ("mov %0, pc" : "=r" (pc));
-            __asm volatile ("mov %0, lr" : "=r" (lr));
-            __asm volatile ("mov %0, sp" : "=r" (sp));
-            
-            // Create different types of test errors
-            static int test_type = 0;
-            switch (test_type % 4) {
-                case 0:
-                    debug_coredump_capture(ERROR_TYPE_TIMER_OVERFLOW, "Test timer overflow", pc, lr, sp);
-                    break;
-                case 1:
-                    debug_coredump_capture(ERROR_TYPE_MEMORY_ERROR, "Test memory error", pc, lr, sp);
-                    break;
-                case 2:
-                    debug_coredump_capture(ERROR_TYPE_ASSERTION_FAILED, "Test assertion failed", pc, lr, sp);
-                    break;
-                case 3:
-                    debug_coredump_capture(ERROR_TYPE_GENERAL_ERROR, "Test general error", pc, lr, sp);
-                    break;
-            }
-            test_type++;
-            
-            // Refresh the list view
-            if (g_viewer_current_page == 0) {
-                draw_coredump_list();
-            }
-        }
+
+    if ((buttons & BTN_LEFT) && !repeat) {
+        g_viewer_current_page = PAGE_LIST;
+        g_viewer_dirty = true;
+        return;
     }
-    
-    if (g_viewer_current_page == 0) { // List view
-        if (buttons & BTN_UP) {
-            if (!repeat || g_viewer_timer <= 0) {
-                if (g_viewer_current_entry > 0) {
-                    g_viewer_current_entry--;
-                    draw_coredump_list();
-                }
-                g_viewer_timer = repeat ? 5 : 20;
-            }
-        }
-        
-        if (buttons & BTN_DOWN) {
-            if (!repeat || g_viewer_timer <= 0) {
-                if (g_viewer_current_entry < g_coredump_count - 1) {
-                    g_viewer_current_entry++;
-                    draw_coredump_list();
-                }
-                g_viewer_timer = repeat ? 5 : 20;
-            }
-        }
-        
-        if (buttons & BTN_RIGHT) {
-            if (!repeat && g_coredump_count > 0) {
-                g_viewer_current_page = 1; // Details view
-                draw_coredump_details(g_viewer_current_entry);
-            }
-        }
-    } else { // Detail views
-        if (buttons & BTN_LEFT) {
-            if (!repeat) {
-                g_viewer_current_page = 0; // Back to list
-                draw_coredump_list();
-            }
-        }
-        
-        if (buttons & BTN_UP) {
-            if (!repeat) {
-                g_viewer_current_page = (g_viewer_current_page == 1) ? 3 : g_viewer_current_page - 1;
-                if (g_viewer_current_page == 1) draw_coredump_details(g_viewer_current_entry);
-                else if (g_viewer_current_page == 2) draw_registers(g_viewer_current_entry);
-                else if (g_viewer_current_page == 3) draw_stack_trace(g_viewer_current_entry);
-            }
-        }
-        
-        if (buttons & BTN_DOWN) {
-            if (!repeat) {
-                g_viewer_current_page = (g_viewer_current_page == 3) ? 1 : g_viewer_current_page + 1;
-                if (g_viewer_current_page == 1) draw_coredump_details(g_viewer_current_entry);
-                else if (g_viewer_current_page == 2) draw_registers(g_viewer_current_entry);
-                else if (g_viewer_current_page == 3) draw_stack_trace(g_viewer_current_entry);
-            }
-        }
+
+    if ((buttons & BTN_UP) && !repeat) {
+        g_viewer_current_page = (PAGE_DETAILS == g_viewer_current_page)
+            ? PAGE_COUNT - 1 : g_viewer_current_page - 1;
+        g_viewer_dirty = true;
+    }
+
+    if ((buttons & BTN_DOWN) && !repeat) {
+        g_viewer_current_page = (PAGE_COUNT - 1 == g_viewer_current_page)
+            ? PAGE_DETAILS : g_viewer_current_page + 1;
+        g_viewer_dirty = true;
     }
 }
 
 //-----------------------------------------------------------------------------
-bool debug_coredump_viewer_is_active(void)
+void coredump_app_cleanup(void)
 {
-    return g_viewer_active;
-}
-
-//-----------------------------------------------------------------------------
-void debug_coredump_viewer_task(void)
-{
-    // g_viewer_timer is registered with timer_add() and already counts down
-    // in milliseconds; decrementing it once per loop pass here made the
-    // repeat throttle expire in microseconds
-    (void)g_viewer_active;
+    // Nothing to release: the ring belongs to the coredump system, not to the
+    // viewer, and outlives it
 }
 
 //-----------------------------------------------------------------------------
@@ -578,155 +715,87 @@ int debug_coredump_get_count(void)
 //-----------------------------------------------------------------------------
 void debug_coredump_clear_all(void)
 {
-    g_coredump_count = 0;
-    g_coredump_write_index = 0;
-    memset(g_coredump_entries, 0, sizeof(g_coredump_entries));
+    uint32_t boot_id = g_store->boot_id;
+
+    store_reset(boot_id);
+    g_ring_retained = false;
 }
 
 //-----------------------------------------------------------------------------
-// Application wrapper functions for menu system
+// Application menu
 //-----------------------------------------------------------------------------
 
-void coredump_app_init(void)
+//-----------------------------------------------------------------------------
+static void action_add_test_dump(const void *arg)
 {
-    // If no coredumps exist, create a sample one for demonstration
-    if (g_coredump_count == 0) {
-        // Create a sample coredump entry
-        uint32_t pc, lr, sp;
-        __asm volatile ("mov %0, pc" : "=r" (pc));
-        __asm volatile ("mov %0, lr" : "=r" (lr));
-        __asm volatile ("mov %0, sp" : "=r" (sp));
-        
-        debug_coredump_capture(ERROR_TYPE_GENERAL_ERROR, "Sample error for demo", pc, lr, sp);
-    }
-    
-    debug_coredump_show_viewer();
+    uint32_t here; // its address is the current stack pointer
+
+    (void)arg;
+
+    debug_coredump_capture(ERROR_TYPE_GENERAL_ERROR,
+        "Synthetic dump from the viewer menu",
+        (uint32_t)(uintptr_t)&action_add_test_dump,
+        (uint32_t)(uintptr_t)&action_add_test_dump,
+        (uint32_t)(uintptr_t)&here);
+
+    g_viewer_current_page = PAGE_LIST;
+    g_viewer_current_entry = g_coredump_count - 1;
+
+    menu_close_popups();
 }
 
 //-----------------------------------------------------------------------------
-void coredump_app_task(void)
+static void action_clear_all(const void *arg)
 {
-    debug_coredump_viewer_task();
+    (void)arg;
+
+    debug_coredump_clear_all();
+
+    g_viewer_current_page = PAGE_LIST;
+    g_viewer_current_entry = 0;
+
+    menu_close_popups();
 }
 
-//-----------------------------------------------------------------------------
-void coredump_app_buttons_handler(int buttons)
+static const char *const g_help_lines[] =
 {
-    debug_coredump_viewer_buttons_handler(buttons);
-    
-    // If viewer is no longer active, return to menu
-    if (!debug_coredump_viewer_is_active()) {
-        launcher_exit_app();
-    }
-}
+    "UP/DOWN        - Select dump / change page",
+    "MODE or RIGHT  - Open the selected dump",
+    "LEFT           - Back to the list",
+    "MENU           - This menu",
+    "SHIFT+MENU     - Back to the launcher",
+    "",
+    "Dumps are written by the hard fault handler",
+    "and by error(), then the device stops on its",
+    "error screen. Rebooting from there brings you",
+    "back here with the dump intact: the ring sits",
+    "in a part of SRAM that nothing is linked into,",
+    "so reset does not clear it. Only cutting the",
+    "power does. Each entry records which boot it",
+    "came from.",
+};
 
-//-----------------------------------------------------------------------------
-void coredump_app_cleanup(void)
+static const info_page_t g_help_page =
 {
-    // Cleanup is handled by the viewer itself
-    g_viewer_active = false;
-}
+    .title = "CoreDump Viewer",
+    .lines = g_help_lines,
+    .count = ARRAY_SIZE(g_help_lines),
+};
 
-//-----------------------------------------------------------------------------
-// Flash storage functions
-//-----------------------------------------------------------------------------
-
-static uint32_t calculate_crc32(const void* data, uint32_t size)
+static const menu_item_t g_menu_items[] =
 {
-    // Simple checksum instead of CRC32 for now
-    const uint8_t* bytes = (const uint8_t*)data;
-    uint32_t checksum = 0;
-    
-    for (uint32_t i = 0; i < size; i++) {
-        checksum += bytes[i];
-        checksum = (checksum << 1) | (checksum >> 31); // Rotate left
-    }
-    
-    return checksum;
-}
+    { .kind = MI_ACTION, .label = "Add test dump",
+      .u.action = { action_add_test_dump, NULL } },
+    { .kind = MI_ACTION, .label = "Clear all dumps",
+      .u.action = { action_clear_all, NULL } },
+    { .kind = MI_SEPARATOR },
+    { .kind = MI_ACTION, .label = "Help",
+      .u.action = { menu_action_info, &g_help_page } },
+};
 
-//-----------------------------------------------------------------------------
-static bool flash_erase_sector(uint32_t sector)
+const menu_def_t coredump_menu =
 {
-    // For now, just return true - flash operations would need proper implementation
-    // with correct GD32F4xx flash controller registers
-    (void)sector;
-    return true;
-}
-
-//-----------------------------------------------------------------------------
-static bool flash_write_data(uint32_t addr, const void* data, uint32_t size)
-{
-    // For now, just return true - flash operations would need proper implementation
-    // with correct GD32F4xx flash controller registers
-    (void)addr;
-    (void)data;
-    (void)size;
-    return true;
-}
-
-//-----------------------------------------------------------------------------
-static bool flash_read_data(uint32_t addr, void* data, uint32_t size)
-{
-    memcpy(data, (const void*)addr, size);
-    return true;
-}
-
-//-----------------------------------------------------------------------------
-static void save_coredumps_to_flash(void)
-{
-    // static, not on the stack: this runs during fault handling, where the
-    // remaining stack headroom is exactly what cannot be trusted
-    static coredump_flash_storage_t storage;
-
-    // Prepare storage structure
-    storage.magic = COREDUMP_MAGIC;
-    storage.count = g_coredump_count;
-    storage.write_index = g_coredump_write_index;
-    
-    // Copy entries
-    memcpy(storage.entries, g_coredump_entries, sizeof(g_coredump_entries));
-    
-    // Calculate CRC32 (excluding the CRC field itself)
-    storage.crc32 = calculate_crc32(&storage, sizeof(storage) - sizeof(storage.crc32));
-    
-    // Erase flash sector
-    if (!flash_erase_sector(COREDUMP_FLASH_SECTOR)) {
-        return; // Failed to erase
-    }
-    
-    // Write to flash
-    flash_write_data(COREDUMP_FLASH_ADDR, &storage, sizeof(storage));
-}
-
-//-----------------------------------------------------------------------------
-static void load_coredumps_from_flash(void)
-{
-    coredump_flash_storage_t storage;
-    
-    // Read from flash
-    if (!flash_read_data(COREDUMP_FLASH_ADDR, &storage, sizeof(storage))) {
-        return; // Failed to read
-    }
-    
-    // Check magic number
-    if (storage.magic != COREDUMP_MAGIC) {
-        return; // Invalid data
-    }
-    
-    // Verify CRC32
-    uint32_t calculated_crc = calculate_crc32(&storage, sizeof(storage) - sizeof(storage.crc32));
-    if (calculated_crc != storage.crc32) {
-        return; // Corrupted data
-    }
-    
-    // Validate counts
-    if (storage.count > MAX_COREDUMP_ENTRIES || storage.write_index >= MAX_COREDUMP_ENTRIES) {
-        return; // Invalid data
-    }
-    
-    // Load data
-    g_coredump_count = storage.count;
-    g_coredump_write_index = storage.write_index;
-    memcpy(g_coredump_entries, storage.entries, sizeof(g_coredump_entries));
-}
+    .title = "CoreDump Viewer",
+    .items = g_menu_items,
+    .count = ARRAY_SIZE(g_menu_items),
+};

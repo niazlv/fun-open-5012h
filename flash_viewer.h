@@ -8,19 +8,21 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "menu_widget.h"
 
 /*- Definitions -------------------------------------------------------------*/
 #define FLASH_START_ADDR        0x08000000
-#define FLASH_SIZE              (512 * 1024)   // GD32F407VE ("VE" = 512KB); reads past this bus-fault
-#define FLASH_PAGE_SIZE         16              // 16 bytes per line
-#define FLASH_LINES_PER_PAGE    15              // Lines visible on screen
-#define FLASH_BYTES_PER_PAGE    (FLASH_PAGE_SIZE * FLASH_LINES_PER_PAGE)
+// Fallback only: the real size comes from the device's flash size register,
+// and reads past the end of the array bus-fault
+#define FLASH_SIZE              (512 * 1024)
+
+#define FLASH_MAX_SECTIONS      12
 
 typedef enum {
     FLASH_VIEW_HEX = 0,
     FLASH_VIEW_ASCII,
     FLASH_VIEW_STRUCTURE,
-    FLASH_VIEW_DISASM,
+    FLASH_VIEW_THUMB,
     FLASH_VIEW_COUNT
 } flash_view_mode_t;
 
@@ -31,17 +33,16 @@ typedef struct {
     const char* description;
 } flash_section_t;
 
+/*- Variables ---------------------------------------------------------------*/
+extern const menu_def_t flash_viewer_menu;
+
 /*- Prototypes --------------------------------------------------------------*/
 void flash_viewer_init(void);
 void flash_viewer_task(void);
 void flash_viewer_buttons_handler(int buttons);
 void flash_viewer_cleanup(void);
-bool flash_viewer_is_active(void);
+void flash_viewer_redraw(void);
 
-// Memory analysis functions
-void flash_analyze_structure(void);
 const flash_section_t* flash_get_sections(int* count);
-bool flash_is_valid_instruction(uint32_t addr);
-bool flash_is_ascii_printable(uint8_t byte);
 
 #endif // _FLASH_VIEWER_H_

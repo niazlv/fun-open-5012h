@@ -353,6 +353,8 @@ static SignalClass g_signal_class = { SIG_UNKNOWN, -1 };
 // Measurements panel state: 1bpp text mask, one bit per trace-area pixel
 static bool g_mpanel_active = false;
 static bool g_mpanel_force = false;   // rebuild the panel text on the next tick
+static uint32_t g_mpanel_builds = 0;  // texts built / bands repainted, for
+static uint32_t g_mpanel_paints = 0;  // the System Info diagnostic
 static uint8_t g_mpanel_mask[MPANEL_H][(GRID_WIDTH + 7) / 8];
 static char g_mpanel_line[2][MPANEL_TEXT_MAX + 2];
 
@@ -1025,6 +1027,13 @@ static void mpanel_update(void)
           g_signal_class.thd_x10 / 10, g_signal_class.thd_x10 % 10);
   }
 
+  // Never end up with nothing to draw: an empty mask paints an empty band
+  // that no repaint can heal, because the text it is compared against is
+  // empty too. Reachable with only THD selected and no spectrum to take it
+  // from, and it is what a blank panel would look like for any other reason.
+  if (n == 0)
+    snprintf(items[n++], 22, "Vpp%s", format_voltage(sm.vpp_mv, false));
+
   // Flow the items across the two lines
   line[0][0] = 0;
   line[1][0] = 0;
@@ -1055,11 +1064,13 @@ static void mpanel_update(void)
       return;
 
     heartbeat = 0;
+    g_mpanel_paints++;
     overlay_repaint_region(MPANEL_ROW0, MPANEL_H);
     return;
   }
 
   heartbeat = 0;
+  g_mpanel_builds++;
   strcpy(g_mpanel_line[0], line[0]);
   strcpy(g_mpanel_line[1], line[1]);
 
@@ -1067,6 +1078,7 @@ static void mpanel_update(void)
   mpanel_render_text(0, line[0]);
   mpanel_render_text(1, line[1]);
 
+  g_mpanel_paints++;
   overlay_repaint_region(MPANEL_ROW0, MPANEL_H);
 }
 
@@ -2619,6 +2631,14 @@ static void autoset_finish(int freq)
   update_display();
   autoset_end();
 
+  // A toast owns the whole status line and every element on it returns early
+  // while one is up — including the measurements. Announcing a frequency the
+  // measurements are about to show anyway is not worth blanking them for a
+  // second and a half, so the result is only announced when there is nothing
+  // else down there.
+  if (config.measure_display)
+    return;
+
   toast_show();
 
   if (freq >= 1000000)
@@ -3316,6 +3336,20 @@ void scope_redraw_all(void)
 int scope_get_fps(void)
 {
   return g_fps_value;
+}
+
+//-----------------------------------------------------------------------------
+// Why the measurements panel is (or is not) on screen. Read this straight
+// after the panel goes blank: `act` says whether the sweep composites it at
+// all, `bld`/`pnt` say whether it is still being rebuilt and repainted, and
+// `len` is the length of the text it last rendered.
+void scope_get_panel_state(char *buf, int size)
+{
+  snprintf(buf, (size_t)size, "d%d m%d act%d fft%d t%d bld%u pnt%u len%d",
+      config.measure_display ? 1 : 0, config.measure_panel_mode,
+      g_mpanel_active ? 1 : 0, g_fft_mode ? 1 : 0, g_measure_timer,
+      (unsigned)g_mpanel_builds, (unsigned)g_mpanel_paints,
+      (int)strlen(g_mpanel_line[0]));
 }
 
 //-----------------------------------------------------------------------------

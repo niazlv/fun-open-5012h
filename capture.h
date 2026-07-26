@@ -41,10 +41,15 @@
 // and keep a 4:1 ratio to the storage buffer (buffer_decimate asm is 4:1).
 #define CAPTURE_BUFFER_SIZE    (96 * 1024)
 
-// The 8 KB of main SRAM left after capture + storage, free for app scratch
-// (currently the UART decoder's run tables)
+// The 8 KB of main SRAM left after capture + storage. Nothing is linked into
+// this region, so the startup code neither loads nor zeroes it: the low 5 KB
+// is app scratch (currently the logic decoder's run tables) and the top 3 KB
+// holds the coredump ring, which has to survive a reset to be of any use.
 #define CAPTURE_SPARE_RAM       0x2001E000u
-#define CAPTURE_SPARE_RAM_SIZE  (8 * 1024)
+#define CAPTURE_SPARE_RAM_SIZE  (5 * 1024)
+
+#define COREDUMP_RAM_BASE       (CAPTURE_SPARE_RAM + CAPTURE_SPARE_RAM_SIZE)
+#define COREDUMP_RAM_SIZE       (3 * 1024)
 #define TRIGGER_MARGIN_SAMPLES 1024
 #define DATA_BUFFER_SIZE       300
 

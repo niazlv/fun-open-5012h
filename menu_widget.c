@@ -29,6 +29,13 @@
 #define POPUP_SEPARATOR       LCD_COLOR(160, 160, 160)
 #define POPUP_SHADOW          LCD_COLOR(64, 64, 64)
 
+// Info page style (help and info dialogs)
+#define INFO_BG               LCD_COLOR(240, 240, 240)
+#define INFO_FG               LCD_COLOR(0, 0, 0)
+#define INFO_TITLE            LCD_COLOR(0, 70, 150)
+#define INFO_FOOTER_Y         (LCD_HEIGHT - 25)
+#define INFO_BODY_BOTTOM      (INFO_FOOTER_Y - 6)
+
 // Fullscreen style (launcher)
 #define FS_TITLE_H            40
 #define FS_FOOTER_H           30
@@ -154,6 +161,9 @@ static void popup_draw_row(const menu_inst_t *m, int index)
   int w = m->w - 2 * POPUP_MARGIN;
   bool selected = (index == m->sel);
   char buf[16];
+
+  if (y < 0 || y + POPUP_ITEM_H > LCD_HEIGHT)
+    return;
 
   if (MI_SEPARATOR == it->kind)
   {
@@ -373,6 +383,15 @@ static void popup_open_common(const menu_item_t *items, int count, int x, int y,
   if (m->y + m->h > LCD_HEIGHT)
     m->y = LCD_HEIGHT - m->h;
 
+  // Popups do not scroll. A table too tall for the screen would be drawn at a
+  // negative offset, so clamp it: the rows that fall off the bottom are
+  // skipped by popup_draw_row instead of corrupting the frame buffer window.
+  if (m->y < 0)
+  {
+    m->y = 0;
+    m->h = LCD_HEIGHT;
+  }
+
   m->sel = first_selectable(m);
 
   ui_push(&menu_screen_popup, m);
@@ -419,6 +438,97 @@ void menu_open_fullscreen(const menu_def_t *def)
 void menu_open_popup(const menu_def_t *def, int x, int y)
 {
   popup_open_common(def->items, def->count, x, y, POPUP_WIDTH, false);
+}
+
+//-----------------------------------------------------------------------------
+// Info page: modal fullscreen text, any button closes it
+//-----------------------------------------------------------------------------
+static void info_draw(void *ctx, bool full)
+{
+  const info_page_t *p = (const info_page_t *)ctx;
+
+  (void)full;
+
+  lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, INFO_BG);
+  lcd_draw_rect(10, 10, LCD_WIDTH - 21, LCD_HEIGHT - 21, INFO_FG);
+
+  lcd_set_font(FONT_LARGE);
+  lcd_set_color(INFO_BG, INFO_TITLE);
+  lcd_puts(INFO_X, 20, p->title ? p->title : "");
+
+  lcd_set_font(FONT_SMALL);
+  lcd_set_color(INFO_BG, INFO_FG);
+
+  if (p->lines && p->count > 0)
+  {
+    int line_h = INFO_LINE_H;
+    int avail = INFO_BODY_BOTTOM - INFO_Y;
+
+    // Squeeze the spacing rather than truncate a page that is a few lines
+    // too long; below 9 px the 6x8 font starts to touch
+    if (p->count > 1 && avail / p->count < line_h)
+      line_h = avail / p->count;
+
+    if (line_h < 9)
+      line_h = 9;
+
+    for (int i = 0; i < p->count; i++)
+    {
+      int y = INFO_Y + i * line_h;
+
+      if (y > INFO_BODY_BOTTOM)
+        break;
+
+      if (p->lines[i])
+        lcd_puts(INFO_X, y, p->lines[i]);
+    }
+  }
+
+  if (p->body)
+    p->body();
+
+  lcd_set_font(FONT_SMALL);
+  lcd_set_color(INFO_BG, INFO_FG);
+  lcd_puts(INFO_X, INFO_FOOTER_Y, "Press any button to close");
+}
+
+//-----------------------------------------------------------------------------
+static bool info_input(void *ctx, int buttons)
+{
+  (void)ctx;
+
+  if (buttons && !(buttons & BTN_REPEAT))
+    ui_pop();
+
+  return true;
+}
+
+static const ui_screen_t info_screen =
+{
+  .draw   = info_draw,
+  .input  = info_input,
+  .opaque = true,
+};
+
+//-----------------------------------------------------------------------------
+void menu_open_info(const info_page_t *page)
+{
+  ui_push(&info_screen, (void *)(uintptr_t)page);
+}
+
+//-----------------------------------------------------------------------------
+void menu_action_info(const void *arg)
+{
+  menu_open_info((const info_page_t *)arg);
+}
+
+//-----------------------------------------------------------------------------
+// Close the whole popup chain, e.g. after an action that resumes the
+// application underneath
+void menu_close_popups(void)
+{
+  while (ui_top_screen() == &menu_screen_popup)
+    ui_pop();
 }
 
 //-----------------------------------------------------------------------------
@@ -521,11 +631,7 @@ static bool menu_input(void *ctx, int buttons)
       return false; // root menu: let the caller open the system menu
 
     if (!repeat)
-    {
-      // Close the whole popup chain
-      while (ui_top_screen() == &menu_screen_popup)
-        ui_pop();
-    }
+      menu_close_popups();
 
     return true;
   }
