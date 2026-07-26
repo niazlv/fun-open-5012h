@@ -1,0 +1,535 @@
+/*
+ * Generic menu widget
+ */
+
+/*- Includes ----------------------------------------------------------------*/
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#include "lcd.h"
+#include "buttons.h"
+#include "ui.h"
+#include "menu_widget.h"
+
+/*- Definitions -------------------------------------------------------------*/
+#define MENU_MAX_OPEN         6
+
+// Popup style (context/system menu)
+#define POPUP_WIDTH           180
+#define POPUP_SUBMENU_WIDTH   160
+#define POPUP_ITEM_H          20
+#define POPUP_MARGIN          2
+#define POPUP_BG              LCD_COLOR(240, 240, 240)
+#define POPUP_BORDER          LCD_COLOR(128, 128, 128)
+#define POPUP_TEXT            LCD_COLOR(0, 0, 0)
+#define POPUP_SEL_BG          LCD_COLOR(0, 120, 215)
+#define POPUP_SEL_TEXT        LCD_COLOR(255, 255, 255)
+#define POPUP_SEPARATOR       LCD_COLOR(160, 160, 160)
+#define POPUP_SHADOW          LCD_COLOR(64, 64, 64)
+
+// Fullscreen style (launcher)
+#define FS_TITLE_H            40
+#define FS_FOOTER_H           30
+#define FS_ITEM_H             30
+#define FS_MARGIN             10
+#define FS_CONTENT_Y          FS_TITLE_H
+#define FS_CONTENT_H          (LCD_HEIGHT - FS_TITLE_H - FS_FOOTER_H)
+#define FS_VISIBLE_ITEMS      (FS_CONTENT_H / FS_ITEM_H)
+#define FS_BG                 LCD_COLOR(20, 20, 40)
+#define FS_TEXT               LCD_COLOR(255, 255, 255)
+#define FS_SEL_BG             LCD_COLOR(0, 120, 215)
+#define FS_SEL_TEXT           LCD_COLOR(255, 255, 255)
+#define FS_BORDER             LCD_COLOR(100, 100, 100)
+#define FS_TITLE_COLOR        LCD_COLOR(255, 200, 0)
+
+#define FW_SMALL              6 // font_6x8 glyph width
+#define FW_LARGE              8 // terminus_8x16 glyph width
+
+/*- Types -------------------------------------------------------------------*/
+typedef struct
+{
+  bool used;
+  bool fullscreen;
+  bool is_submenu;
+  const char *title;
+  const menu_item_t *items;
+  int count;
+  int sel;
+  int scroll;
+  int x, y, w, h;
+} menu_inst_t;
+
+/*- Variables ---------------------------------------------------------------*/
+static menu_inst_t g_inst[MENU_MAX_OPEN];
+
+/*- Forward Declarations ----------------------------------------------------*/
+static void menu_leave(void *ctx);
+static void menu_draw(void *ctx, bool full);
+static bool menu_input(void *ctx, int buttons);
+
+static const ui_screen_t menu_screen_popup =
+{
+  .leave  = menu_leave,
+  .draw   = menu_draw,
+  .input  = menu_input,
+  .opaque = false,
+};
+
+static const ui_screen_t menu_screen_fs =
+{
+  .leave  = menu_leave,
+  .draw   = menu_draw,
+  .input  = menu_input,
+  .opaque = true,
+};
+
+/*- Implementations ---------------------------------------------------------*/
+
+//-----------------------------------------------------------------------------
+static menu_inst_t *alloc_inst(void)
+{
+  for (int i = 0; i < MENU_MAX_OPEN; i++)
+  {
+    if (!g_inst[i].used)
+    {
+      memset(&g_inst[i], 0, sizeof(menu_inst_t));
+      g_inst[i].used = true;
+      return &g_inst[i];
+    }
+  }
+
+  return NULL;
+}
+
+//-----------------------------------------------------------------------------
+static int first_selectable(const menu_inst_t *m)
+{
+  for (int i = 0; i < m->count; i++)
+  {
+    if (m->items[i].kind != MI_SEPARATOR)
+      return i;
+  }
+
+  return 0;
+}
+
+//-----------------------------------------------------------------------------
+// The text shown on the right edge of an item row, "" if none
+static const char *item_value_str(const menu_item_t *it, char *buf, int size)
+{
+  if (MI_TOGGLE == it->kind)
+    return *it->u.toggle.value ? "ON" : "OFF";
+
+  if (MI_NUMBER == it->kind)
+  {
+    snprintf(buf, size, "%d%s", *it->u.number.value,
+        it->u.number.suffix ? it->u.number.suffix : "");
+    return buf;
+  }
+
+  if (MI_CHOICE == it->kind)
+  {
+    int v = *it->u.choice.value;
+
+    if (v < 0 || v >= it->u.choice.count)
+      return "?";
+
+    return it->u.choice.labels[v];
+  }
+
+  if (MI_SUBMENU == it->kind)
+    return ">";
+
+  return "";
+}
+
+//-----------------------------------------------------------------------------
+static void popup_draw_row(const menu_inst_t *m, int index)
+{
+  const menu_item_t *it = &m->items[index];
+  int x = m->x + POPUP_MARGIN;
+  int y = m->y + POPUP_MARGIN + index * POPUP_ITEM_H;
+  int w = m->w - 2 * POPUP_MARGIN;
+  bool selected = (index == m->sel);
+  char buf[16];
+
+  if (MI_SEPARATOR == it->kind)
+  {
+    lcd_fill_rect(x, y, w, POPUP_ITEM_H, POPUP_BG);
+    lcd_fill_rect(x + 5, y + POPUP_ITEM_H / 2 - 1, w - 10, 1, POPUP_SEPARATOR);
+    return;
+  }
+
+  uint16_t bg = selected ? POPUP_SEL_BG : POPUP_BG;
+  uint16_t fg = selected ? POPUP_SEL_TEXT : POPUP_TEXT;
+
+  lcd_fill_rect(x, y, w, POPUP_ITEM_H, bg);
+  lcd_set_font(FONT_SMALL);
+  lcd_set_color(bg, fg);
+  lcd_puts(x + 8, y + 6, it->label);
+
+  const char *value = item_value_str(it, buf, sizeof(buf));
+
+  if (value[0])
+    lcd_puts(x + w - 8 - strlen(value) * FW_SMALL, y + 6, value);
+}
+
+//-----------------------------------------------------------------------------
+static void popup_draw(const menu_inst_t *m, bool full)
+{
+  if (full)
+    lcd_fill_rect(m->x + 2, m->y + 2, m->w, m->h, POPUP_SHADOW);
+
+  lcd_fill_rect(m->x, m->y, m->w, m->h, POPUP_BG);
+  lcd_draw_rect(m->x, m->y, m->w - 1, m->h - 1, POPUP_BORDER);
+
+  for (int i = 0; i < m->count; i++)
+    popup_draw_row(m, i);
+}
+
+//-----------------------------------------------------------------------------
+static void fs_draw_item(const menu_inst_t *m, int index)
+{
+  const menu_item_t *it = &m->items[index];
+  int item_y = FS_CONTENT_Y + (index - m->scroll) * FS_ITEM_H;
+  bool selected = (index == m->sel);
+  char buf[16];
+
+  if (item_y < FS_CONTENT_Y || item_y >= FS_CONTENT_Y + FS_CONTENT_H)
+    return;
+
+  if (MI_SEPARATOR == it->kind)
+  {
+    lcd_fill_rect(FS_MARGIN + 5, item_y + FS_ITEM_H / 2 - 1,
+        LCD_WIDTH - 2 * FS_MARGIN - 10, 2, FS_BORDER);
+    return;
+  }
+
+  uint16_t bg = selected ? FS_SEL_BG : FS_BG;
+  uint16_t fg = selected ? FS_SEL_TEXT : FS_TEXT;
+
+  lcd_fill_rect(FS_MARGIN, item_y, LCD_WIDTH - 2 * FS_MARGIN, FS_ITEM_H, bg);
+
+  if (selected)
+    lcd_draw_rect(FS_MARGIN, item_y, LCD_WIDTH - 2 * FS_MARGIN - 1, FS_ITEM_H - 1, fg);
+
+  lcd_set_font(FONT_LARGE);
+  lcd_set_color(bg, fg);
+  lcd_puts(FS_MARGIN + 5, item_y + 2, it->label);
+
+  const char *value = item_value_str(it, buf, sizeof(buf));
+
+  if (value[0])
+    lcd_puts(LCD_WIDTH - FS_MARGIN - 5 - strlen(value) * FW_LARGE, item_y + 7, value);
+
+  if (it->desc && it->desc[0])
+  {
+    lcd_set_font(FONT_SMALL);
+    lcd_set_color(bg, fg);
+    lcd_puts(FS_MARGIN + 5, item_y + 18, it->desc);
+  }
+}
+
+//-----------------------------------------------------------------------------
+static void fs_draw(const menu_inst_t *m, bool full)
+{
+  if (full)
+  {
+    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, FS_BG);
+    lcd_draw_rect(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1, FS_BORDER);
+    lcd_draw_rect(1, 1, LCD_WIDTH - 3, LCD_HEIGHT - 3, FS_BORDER);
+
+    if (m->title)
+    {
+      lcd_set_font(FONT_LARGE);
+      lcd_set_color(FS_BG, FS_TITLE_COLOR);
+      lcd_puts((LCD_WIDTH - strlen(m->title) * FW_LARGE) / 2, 10, m->title);
+    }
+
+    lcd_fill_rect(FS_MARGIN, FS_TITLE_H - 2, LCD_WIDTH - 2 * FS_MARGIN, 2, FS_BORDER);
+
+    int footer_y = LCD_HEIGHT - FS_FOOTER_H;
+    lcd_fill_rect(FS_MARGIN, footer_y, LCD_WIDTH - 2 * FS_MARGIN, 2, FS_BORDER);
+    lcd_set_font(FONT_SMALL);
+    lcd_set_color(FS_BG, FS_TEXT);
+    lcd_puts(FS_MARGIN, footer_y + 5, "UP/DOWN: Navigate  MODE: Select");
+    lcd_puts(FS_MARGIN, footer_y + 15, "MENU: System menu");
+  }
+
+  lcd_fill_rect(FS_MARGIN, FS_CONTENT_Y, LCD_WIDTH - 2 * FS_MARGIN, FS_CONTENT_H, FS_BG);
+
+  int end = m->scroll + FS_VISIBLE_ITEMS;
+
+  if (end > m->count)
+    end = m->count;
+
+  for (int i = m->scroll; i < end; i++)
+    fs_draw_item(m, i);
+
+  if (m->count > FS_VISIBLE_ITEMS)
+  {
+    lcd_set_font(FONT_SMALL);
+    lcd_set_color(FS_BG, FS_TEXT);
+
+    if (m->scroll > 0)
+      lcd_puts(LCD_WIDTH - 20, FS_CONTENT_Y + 5, "^");
+
+    if (m->scroll + FS_VISIBLE_ITEMS < m->count)
+      lcd_puts(LCD_WIDTH - 20, FS_CONTENT_Y + FS_CONTENT_H - 15, "v");
+  }
+}
+
+//-----------------------------------------------------------------------------
+static void ensure_visible(menu_inst_t *m)
+{
+  if (!m->fullscreen)
+    return;
+
+  if (m->sel < m->scroll)
+    m->scroll = m->sel;
+  else if (m->sel >= m->scroll + FS_VISIBLE_ITEMS)
+    m->scroll = m->sel - FS_VISIBLE_ITEMS + 1;
+}
+
+//-----------------------------------------------------------------------------
+static void move_sel(menu_inst_t *m, int dir)
+{
+  int i = m->sel;
+
+  do
+  {
+    i += dir;
+  } while (i >= 0 && i < m->count && MI_SEPARATOR == m->items[i].kind);
+
+  if (i < 0 || i >= m->count)
+    return;
+
+  m->sel = i;
+  ensure_visible(m);
+  ui_request_redraw();
+}
+
+//-----------------------------------------------------------------------------
+static void number_adjust(const menu_item_t *it, int delta)
+{
+  int v = *it->u.number.value + delta;
+
+  if (v < it->u.number.min)
+    v = it->u.number.min;
+  if (v > it->u.number.max)
+    v = it->u.number.max;
+
+  if (v == *it->u.number.value)
+    return;
+
+  *it->u.number.value = v;
+
+  if (it->u.number.apply)
+    it->u.number.apply(v);
+
+  ui_request_redraw();
+}
+
+//-----------------------------------------------------------------------------
+static void choice_adjust(const menu_item_t *it, int dir)
+{
+  int count = it->u.choice.count;
+  int v = *it->u.choice.value + dir;
+
+  // Wrap, and recover from an out-of-range value (e.g. stale config)
+  v = ((v % count) + count) % count;
+
+  *it->u.choice.value = v;
+
+  if (it->u.choice.on_change)
+    it->u.choice.on_change();
+
+  ui_request_redraw();
+}
+
+//-----------------------------------------------------------------------------
+static void popup_open_common(const menu_item_t *items, int count, int x, int y,
+    int w, bool is_submenu)
+{
+  menu_inst_t *m = alloc_inst();
+
+  if (NULL == m)
+    return;
+
+  m->fullscreen = false;
+  m->is_submenu = is_submenu;
+  m->items = items;
+  m->count = count;
+  m->x = x;
+  m->y = y;
+  m->w = w;
+  m->h = count * POPUP_ITEM_H + 2 * POPUP_MARGIN;
+  m->sel = 0;
+
+  if (m->x + m->w > LCD_WIDTH)
+    m->x = LCD_WIDTH - m->w;
+  if (m->y + m->h > LCD_HEIGHT)
+    m->y = LCD_HEIGHT - m->h;
+
+  m->sel = first_selectable(m);
+
+  ui_push(&menu_screen_popup, m);
+}
+
+//-----------------------------------------------------------------------------
+static void open_submenu(const menu_inst_t *parent, const menu_item_t *it)
+{
+  int x, y;
+
+  if (parent->fullscreen)
+  {
+    x = 60;
+    y = 60;
+  }
+  else
+  {
+    x = parent->x + parent->w - 5;
+    y = parent->y + POPUP_MARGIN + parent->sel * POPUP_ITEM_H;
+  }
+
+  popup_open_common(it->u.submenu.items, it->u.submenu.count, x, y,
+      POPUP_SUBMENU_WIDTH, true);
+}
+
+//-----------------------------------------------------------------------------
+void menu_open_fullscreen(const menu_def_t *def)
+{
+  menu_inst_t *m = alloc_inst();
+
+  if (NULL == m)
+    return;
+
+  m->fullscreen = true;
+  m->title = def->title;
+  m->items = def->items;
+  m->count = def->count;
+  m->sel = first_selectable(m);
+
+  ui_push(&menu_screen_fs, m);
+}
+
+//-----------------------------------------------------------------------------
+void menu_open_popup(const menu_def_t *def, int x, int y)
+{
+  popup_open_common(def->items, def->count, x, y, POPUP_WIDTH, false);
+}
+
+//-----------------------------------------------------------------------------
+static void menu_leave(void *ctx)
+{
+  ((menu_inst_t *)ctx)->used = false;
+}
+
+//-----------------------------------------------------------------------------
+static void menu_draw(void *ctx, bool full)
+{
+  menu_inst_t *m = (menu_inst_t *)ctx;
+
+  if (m->fullscreen)
+    fs_draw(m, full);
+  else
+    popup_draw(m, full);
+}
+
+//-----------------------------------------------------------------------------
+static bool menu_input(void *ctx, int buttons)
+{
+  menu_inst_t *m = (menu_inst_t *)ctx;
+  bool repeat = (buttons & BTN_REPEAT);
+  const menu_item_t *it = &m->items[m->sel];
+
+  if (buttons & BTN_UP)
+  {
+    move_sel(m, -1);
+    return true;
+  }
+
+  if (buttons & BTN_DOWN)
+  {
+    move_sel(m, 1);
+    return true;
+  }
+
+  if (buttons & BTN_LEFT)
+  {
+    if (MI_NUMBER == it->kind)
+      number_adjust(it, -(repeat ? it->u.number.step_repeat : it->u.number.step));
+    else if (MI_CHOICE == it->kind && !repeat)
+      choice_adjust(it, -1);
+    else if (m->is_submenu && !repeat)
+      ui_pop();
+
+    return true;
+  }
+
+  if (buttons & BTN_RIGHT)
+  {
+    if (MI_NUMBER == it->kind)
+      number_adjust(it, repeat ? it->u.number.step_repeat : it->u.number.step);
+    else if (MI_CHOICE == it->kind && !repeat)
+      choice_adjust(it, 1);
+    else if (MI_SUBMENU == it->kind && !repeat)
+      open_submenu(m, it);
+
+    return true;
+  }
+
+  if (buttons & BTN_MODE)
+  {
+    if (repeat)
+      return true;
+
+    switch (it->kind)
+    {
+      case MI_SUBMENU:
+        open_submenu(m, it);
+        break;
+
+      case MI_TOGGLE:
+        *it->u.toggle.value = !*it->u.toggle.value;
+        if (it->u.toggle.on_change)
+          it->u.toggle.on_change();
+        ui_request_redraw();
+        break;
+
+      case MI_CHOICE:
+        choice_adjust(it, 1);
+        break;
+
+      case MI_ACTION:
+        // May push a dialog or pop this very menu — no instance access after
+        it->u.action.fn(it->u.action.arg);
+        break;
+
+      default:
+        break;
+    }
+
+    return true;
+  }
+
+  if (buttons & BTN_MENU)
+  {
+    if (m->fullscreen)
+      return false; // root menu: let the caller open the system menu
+
+    if (!repeat)
+    {
+      // Close the whole popup chain
+      while (ui_top_screen() == &menu_screen_popup)
+        ui_pop();
+    }
+
+    return true;
+  }
+
+  // Popups swallow everything else so stray keys don't reach the app below
+  return true;
+}
