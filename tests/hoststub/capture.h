@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ */
+
 /* Host test stub: the coredump ring is placed in a plain array instead of
    the retained SRAM block, so the ring logic can be exercised on the host. */
 #ifndef _HOSTSTUB_CAPTURE_H_

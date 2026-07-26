@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Context Menu System
  * Windows-style context menu with system information and settings
  */

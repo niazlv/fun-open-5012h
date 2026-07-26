@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Radix-2 FFT spectrum for the oscilloscope, sized for the Cortex-M4 FPU.
  *
  * Pure C (float + libm), no hardware dependencies: this module is also

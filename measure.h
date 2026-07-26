@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Waveform measurements over a ring buffer of 8-bit samples.
  *
  * Pure C, no hardware dependencies: this module is also compiled and tested

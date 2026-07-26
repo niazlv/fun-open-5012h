@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * UI screen stack
  *
  * Every full-screen or overlay UI element (launcher, running app, popup menu,

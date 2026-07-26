@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Oscilloscope application menu
  *
  * The scope's section of the system menu plus its help pages. Everything in

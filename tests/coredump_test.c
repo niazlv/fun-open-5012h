@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Host-side tests for the coredump ring in debug_coredump.c.
  *
  * The point of these tests is the one property the feature stands or falls

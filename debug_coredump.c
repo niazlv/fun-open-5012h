@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Debug Coredump System Implementation
  * Provides stack trace and error analysis functionality
  */

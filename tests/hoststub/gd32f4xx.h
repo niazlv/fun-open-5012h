@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ */
+
 /* Host test stub: just enough of the CMSIS device header for debug_coredump.c */
 #ifndef _HOSTSTUB_GD32F4XX_H_
 #define _HOSTSTUB_GD32F4XX_H_

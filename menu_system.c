@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Menu System for Multiple Applications
  * Scalable menu system for selecting different sub-applications
  */

@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * 1-Wire (Dallas/Maxim) decoder, standard speed.
  *
  * Bus idles high. A reset is a >=400 us low pulse; the slave answers with a

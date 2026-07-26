@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Test file to demonstrate coredump functionality
  * This file contains functions to trigger different types of errors for testing
  */

@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Complete DOOM Port for GD32F407VE
  * Full implementation based on linuxdoom-1.10 source code
  * This is a REAL DOOM port, not a simplified version

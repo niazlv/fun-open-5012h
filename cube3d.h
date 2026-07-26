@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * 3D Cube Renderer
  * Rotating, back-face culled 3D cube demo
  */

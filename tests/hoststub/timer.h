@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ */
+
 /* Host test stub */
 #ifndef _HOSTSTUB_TIMER_H_
 #define _HOSTSTUB_TIMER_H_

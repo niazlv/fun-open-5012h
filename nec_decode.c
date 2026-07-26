@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * NEC infrared remote protocol decoder (as seen after a TSOP-style
  * demodulator: idle high, marks are low).
  *

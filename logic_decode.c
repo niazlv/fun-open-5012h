@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Single-wire protocol decoding: shared run-length helper, the raw-bitstream
  * fallback and the auto-detecting dispatcher.
  *

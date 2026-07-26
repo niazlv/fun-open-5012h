@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * WS2812/WS2812B (NeoPixel) decoder.
  *
  * A bit is a high pulse followed by a low: ~0.4 us high = '0', ~0.8 us

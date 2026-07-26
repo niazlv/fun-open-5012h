@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Advanced 3D Engine
  * Full-featured 3D graphics engine with camera control, scene management,
  * RayCast and RayTrace rendering modes

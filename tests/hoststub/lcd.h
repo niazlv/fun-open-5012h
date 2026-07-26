@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ */
+
 /* Host test stub: drawing is a no-op, the tests are about the ring */
 #ifndef _HOSTSTUB_LCD_H_
 #define _HOSTSTUB_LCD_H_

@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Generic menu widget
  *
  * Menus are described by const tables of menu_item_t and rendered by one

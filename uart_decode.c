@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * UART auto-decoder: detects polarity and baud rate from the captured
  * waveform, then decodes 8N1 frames. Pure C, host-testable.
  */

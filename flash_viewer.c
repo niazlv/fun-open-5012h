@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Flash Memory Viewer
  *
  * Hex, ASCII, layout and Thumb views over the internal flash. The screen is

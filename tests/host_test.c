@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Host-side tests for measure.c and fft.c: generate synthetic waveforms with
  * known parameters and check the measured values against ground truth.
  *

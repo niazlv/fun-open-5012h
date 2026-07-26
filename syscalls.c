@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * System call stubs for embedded systems
  * Provides minimal implementations for newlib system calls
  */

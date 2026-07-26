@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Full DOOM Port for GD32F407VE
  * Complete DOOM engine using original architecture
  * Based on linuxdoom-1.10 source code

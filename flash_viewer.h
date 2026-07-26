@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Flash Memory Viewer
  * Interactive viewer for flash memory contents with structure analysis
  */

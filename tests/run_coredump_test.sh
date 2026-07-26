@@ -1,5 +1,7 @@
 #!/bin/sh
 #
+# Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+#
 # Build and run the coredump ring tests on the host.
 #
 # debug_coredump.c is copied, unmodified, into a staging directory next to the

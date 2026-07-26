@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Simple Ray Tracing Test
  *
  * Renders three shaded spheres one scanline per tick so the main loop keeps

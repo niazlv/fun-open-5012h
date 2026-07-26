@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Simple Flappy Bird Game
  *
  * Only what moved is repainted: the strip each pipe vacated, the pipe bodies

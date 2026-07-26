@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * System menu: the popup opened with the MENU key over whatever is running.
  *
  * The menu is assembled when it opens: the running application's own settings

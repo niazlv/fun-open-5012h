@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Simple Snake Game
  *
  * The playfield is drawn incrementally: on every step only the new head, the

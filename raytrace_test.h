@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Simple Ray Tracing Test
  * Basic ray tracing demonstration with spheres
  */

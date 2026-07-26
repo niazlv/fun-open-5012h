@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Application launcher: the root screen of the UI stack.
  * Applications are described by a const table and run as screens on top.
  */

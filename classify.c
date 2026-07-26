@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Signal type classification from measurement statistics and (optionally)
  * an FFT magnitude spectrum.
  *

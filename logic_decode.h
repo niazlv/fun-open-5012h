@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Single-wire protocol decoders: shared result/scratch types and the
  * auto-detecting dispatcher. Pure C, host-testable.
  *

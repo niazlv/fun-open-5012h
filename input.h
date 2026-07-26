@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * Input translation layer: key remapping and sticky shift mode.
  * Sits between the raw button events and the UI stack.
  */

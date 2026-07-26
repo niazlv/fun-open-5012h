@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ *
  * DOOM Embedded Port for GD32F407VE
  * Full DOOM engine implementation for embedded systems
  */
