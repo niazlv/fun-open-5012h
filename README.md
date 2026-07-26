@@ -1,162 +1,154 @@
-# Open-5012h - Open Source Firmware for the FNIRSI-5012H Oscilloscope
+# Multi-Application Platform for GD32F407VE
 
-This is an open source firmware for the FNIRSI-5012H oscilloscope.
+Это масштабируемая платформа для встраиваемых систем на базе микроконтроллера GD32F407VE с LCD дисплеем, которая поддерживает множество подприложений через удобную систему меню.
 
-The project is in the Alpha stage. The firmware is usable, but was not well tested.
-Use at your own risk.
+## Особенности
 
-There are two models of the FNIRSI-5012H PCB. The first revision has 4 mechanical
-relays. The second revision has only one mechanical relay. This project is created
-for the more recent board with a single relay. I'm not sure how different the boards
-actually are, I don't have the old hardware.
+- **Масштабируемая система меню** - легко добавлять новые приложения
+- **Множественные подприложения** в одной прошивке
+- **Оптимизированная графика** для встраиваемых систем
+- **Интуитивное управление** кнопками
 
-FNIRSI-5012H hardware is described in details [here](doc/Hardware.md).
+## Доступные приложения
 
-## Installation
+### 1. 3D Graphics
+- Демонстрация вращающегося 3D куба
+- Поддержка ручного и автоматического вращения
+- Заливка граней с отсечением невидимых поверхностей
+- Управление: UP/DOWN (вращение по X), LEFT/RIGHT (вращение по Y), TRIG UP/DOWN (вращение по Z)
 
-The MCU (GigaDevice GD32F407VET6) is locked and can't be erased or reused.
-Swapping the chip is the only way to run this firmware.
+### 2. 3D Engine
+- **Полноценный 3D движок** с поддержкой RayCast и RayTrace режимов
+- **Управление камерой**: перемещение в 3D пространстве и поворот
+- **Сцена с объектами**: кубы, сферы, треугольники, плоскости
+- **Система освещения**: направленные и точечные источники света
+- **Отражения**: поддержка отражающих поверхностей в RayTrace режиме
+- **FPS счетчик**: отображение производительности в левом верхнем углу
+- Управление: 
+  - UP/DOWN/LEFT/RIGHT (движение WASD)
+  - TRIG_UP/TRIG_DOWN (вверх/вниз)
+  - SHIFT + стрелки (поворот камеры)
+  - **F1 (переключение RayCast ↔ RayTrace)**
 
-New GD32F407VET6 are available for $5 from LCSC.
+### 3. Ray Trace Test
+- Простая демонстрация трассировки лучей
+- Рендеринг сферических объектов с освещением
+- Вращение камеры вокруг сцены
+- Управление: LEFT/RIGHT (поворот камеры), UP (запуск рендеринга)
 
-## Programming
+### 4. Flappy Bird
+- Классическая игра с боковой прокруткой
+- Физика гравитации и столкновений
+- Система подсчета очков
+- Управление: UP (прыжок)
 
-Programming pins are available on the USB connector. There are no other dedicated
-test points or connectors on the board, so making an adapter is the best way to go.
+### 5. Snake Game
+- Классическая игра "Змейка"
+- Растущая змея при поедании пищи
+- Обнаружение столкновений со стенами и собой
+- Управление: UP/DOWN/LEFT/RIGHT (направление движения)
 
-Details of the programmer connections are [here](doc/Programming.md).
+### 6. DOOM Port
+- **Портированная версия классической игры DOOM**
+- **Raycasting рендеринг**: 3D вид от первого лица с использованием техники raycasting
+- **Лабиринт**: процедурно сгенерированная карта с различными типами стен
+- **Физика движения**: реалистичное перемещение и столкновения
+- **Система освещения**: затенение стен в зависимости от расстояния
+- **FPS счетчик**: отображение производительности
+- Управление:
+  - UP/DOWN (движение вперед/назад)
+  - LEFT/RIGHT (поворот влево/вправо)
+  - SHIFT + LEFT/RIGHT (движение влево/вправо боком)
+  - MODE (пауза)
+  - STOP (выход в меню)
 
-## Keyboard
+### 7. DOOM Full
+- **Полноценный порт DOOM с оригинальной архитектурой**
+- **Основан на linuxdoom-1.10**: использует оригинальную кодовую базу DOOM
+- **Полная архитектура DOOM**: все основные подсистемы (рендеринг, игровая логика, меню)
+- **Оригинальная математика**: fixed-point арифметика, таблицы синусов/косинусов
+- **Система событий**: полная система обработки событий как в оригинальном DOOM
+- **Автокарта**: встроенная автокарта с отображением позиции игрока (F1)
+- **Меню DOOM**: оригинальное меню с выбором новой игры и настроек
+- **Процедурная карта**: генерируемая карта с комнатами и коридорами
+- **Память**: 512KB пул памяти для игровых объектов
+- Управление:
+  - UP/DOWN (движение вперед/назад)
+  - LEFT/RIGHT (поворот влево/вправо)
+  - MODE (выбор в меню)
+  - SHIFT (ESC - меню/выход)
+  - F1 (автокарта)
 
-Some buttons have multiple functions assigned to them. **1X10X** button is used
-as a **SHIFT** and marked as such in the text below. 1X/10X state can be selected
-through the menu.
+## Навигация по меню
 
-In the oscilloscope mode the buttons have the following functions:
+- **UP/DOWN** - навигация по пунктам меню
+- **MODE** - выбор приложения / возврат в меню
+- **STOP** - выход из приложения (в некоторых играх - пауза/старт)
 
-| Button | Function |
-|:---:|:---|
-| **AC/DC** | Select AC or DC Coupling |
-| **MODE** | Select Measurement or Trigger Parameters Display Mode |
-| **STOP** | Start, Stop or Retrigger Capture |
-| **EDGE** | Select Trigger Edge |
-| **TRIG** | Select Trigger Mode (Normal, Auto, Single) |
-| **TRIG UP** / **TRIG DOWN** | Change Trigger Level |
-| **SHIFT** + **TRIG UP** / **TRIG DOWN** | Change Sample Rate Limit |
-| **UP** / **DOWN** | Change Vertical Position |
-| **SHIFT** + **UP** / **DOWN** | Change Vertical Scale |
-| **UP** + **DOWN** | Set Vertical Position to 0 |
-| **LEFT** / **RIGHT** | Change Horizontal Position |
-| **SHIFT** + **LEFT** / **RIGHT** | Change Horizontal Scale |
-| **LEFT** + **RIGHT** | Set Horizontal Position to 0 |
+## Архитектура
 
-## Calibration
+### Система меню (`menu_system.c/h`)
+- Централизованное управление приложениями
+- Регистрация приложений через callback-функции
+- Автоматическая маршрутизация событий кнопок
+- Поддержка прокрутки для большого количества приложений
 
-Your hardware will require calibration. The default calibration values are
-the values from my development device, so they will definitely not work for
-any other device.
+### Структура приложения
+Каждое приложение должно предоставить:
+- `init()` - инициализация
+- `task()` - основной цикл обработки
+- `buttons_handler()` - обработка кнопок
+- `cleanup()` - очистка ресурсов
 
-The calibration mode is entered by holding **SHIFT** + **MODE** while powering on
-the device,
+### Добавление нового приложения
 
-The calibration should be performed with a fully charged battery and
-the charger disconnected. It is better to have LCD backlight level set to 100%.
+1. Создайте файлы `new_app.h` и `new_app.c`
+2. Реализуйте требуемые функции
+3. Добавьте новый `APP_ID` в `menu_system.h`
+4. Зарегистрируйте приложение в `main.c`:
+```c
+menu_system_register_app(APP_NEW_APP, "App Name", "Description",
+                         new_app_init, new_app_task, 
+                         new_app_buttons_handler, new_app_cleanup);
+```
+5. Добавьте файлы в `Makefile`
 
-The calibration should be performed with a direct connection to the device or
-a probe in 1X mode.
+## Сборка
 
-In the calibration mode trigger controls are fixed to the auto mode with
-the rising edge and the level set to 0.
+```bash
+cd make
+make clean
+make
+```
 
-The trigger control buttons change their functions:
+## Программирование
 
-| Button | Function |
-|:---:|:---|
-| **TRIG UP** / **TRIG DOWN** | Change Calibration Value |
-| **SHIFT** + **TRIG UP** / **TRIG DOWN** | Change Calibration Parameter |
+```bash
+make prog
+```
 
-In the calibration mode trigger parameters in the status line are replaced
-with the calibration data.
+## Технические характеристики
 
-There are 4 calibration parameters:
-1. Zero -- Zero offset
-2. Delta -- Delta between the channels in a dual channel mode
-3. Scale -- Voltage Scale
-4. Offset -- Voltage Offset
+- **Микроконтроллер**: GD32F407VE (ARM Cortex-M4, 250 MHz)
+- **Память**: Flash + RAM оптимизация
+- **Дисплей**: LCD с поддержкой 16-bit цвета
+- **Управление**: Кнопочная панель
+- **Частота обновления**: Настраивается для каждого приложения
 
-Zero and Delta are common to all vertical scales, but Scale and Offset
-have to be adjusted for each vertical scale individually.
+## Оптимизации
 
-In the Zero and Delta modes status line shows raw ADC readings and
-the screen is split into two halves. On the left trace shows raw ADC
-readings and the right side shows magnified view of the same trace.
+- Прямая отрисовка на LCD без буферизации (экономия RAM)
+- Масштабирование разрешения для сложных алгоритмов
+- Эффективные алгоритмы растеризации
+- Минимальное использование математических библиотек
 
-In the Scale and Offset modes status line shows minimum and maximum voltage
-values. All the calibration procedures are performed with the constant (DC)
-voltages, so the minimum and maximum voltages will be close, but they will
-be slightly different due to noise.
+## Расширяемость
 
-The calibration procedure consists of a few steps.
+Система спроектирована для легкого добавления новых приложений:
+- Осциллограф (оригинальная функциональность)
+- Калькулятор
+- Простые игры (Tetris, Pong, и т.д.)
+- Утилиты (часы, таймер, и т.д.)
+- Демонстрации алгоритмов
 
-### Zero
-
-This step must be performed in a single channel mode (sample rate is 62 MSPS or below).
-
-For this test the input must be shorted (or at least disconnected).
-
-The goal is to adjust the trace positions so it is exactly in the middle of the screen.
-
-Middle of the screen corresponds to 0 V, which is the raw ADC reading of 0x80.
-
-### Delta
-
-This step must be performed in a dual channel mode (sample rate is 125 MSPS).
-
-For this test the input must be shorted (or at least disconnected).
-
-The goal is to adjust the trace so that even and odd samples (coming from the ADC
-channels A and B) have the same value.
-
-### Scale
-
-This must be performed in a single channel mode (sample rate is 62 MSPS or below).
-The vertical offset must be set to 0 V.
-
-The input must be connected to the source of the variable voltage.
-
-The voltage must be set so that ADC readings are close to the full scale,
-but not clipping.
-
-Zero or Delta mode raw readings can be used to select appropriate voltage.
-Ideally the raw ADC data should be in the range 0xd0 - 0xf0.
-
-The exact voltage does not matter as long as it can be measured independently
-(for example using multimeter).
-
-The calibration value must be adjusted until the minimum and maximum values
-in the status bar match the measured value.
-
-The calibration value for the negative voltage may be slightly different.
-It is recommended to perform this procedure for the negative voltage as well
-and adjust the calibration until symmetrical results are reached.
-
-This step must be performed for all vertical scale settings separately.
-
-### Offset
-
-This must be performed in a single channel mode (sample rate is 62 MSPS or below).
-
-The input must be connected to the source of the variable voltage.
-
-Set the vertical offset close to the edge of the grid (+4 or -4 divisions).
-
-Adjust calibration value until the displayed minimum and maximum voltages
-match the actually measures voltage.
-
-Perform this procedure for both positive and negative vertical position settings.
-
-This step must be performed for all vertical scale settings separately.
-
-### TODOLIST
-
-[here](doc/TODOLIST.md)
+Каждое приложение изолировано и может использовать собственные ресурсы и настройки.
