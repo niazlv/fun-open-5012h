@@ -72,7 +72,37 @@ typedef struct
 
   bool     measure_display;
 
-  uint32_t padding[31];
+  // General settings
+  int      screen_brightness;
+  bool     shift_mode_enabled;
+  bool     shift_mode_active;
+  
+  // Key remapping (store original button codes)
+  uint32_t key_mapping[32];  // Map for button remapping
+  bool     key_remapping_enabled;
+
+  // Measurements display: 0 = translucent panel over the trace (default),
+  // 1 = rotating status-line pages. Zero-is-default is deliberate: configs
+  // saved before this field existed read as 0 and get the panel. The show_*
+  // flags pick the panel metrics; all-false means the default set. Carved
+  // out of padding so sizeof(Config) and stored configs (including
+  // calibration) stay valid.
+  int      measure_panel_mode;
+  bool     show_vpp;
+  bool     show_freq;
+  bool     show_duty;
+  bool     show_vrms;
+  bool     show_vavg;
+  bool     show_type;
+  bool     show_thd;
+  bool     measure_reserved;
+
+  // Logic decoder: forced protocol (proto_t; 0 = auto) and stop-on-decode
+  int      decoder_proto;
+  bool     decoder_stop;
+  bool     decoder_reserved[3];
+
+  uint32_t padding[20];  // Reduced padding to accommodate new fields
 
   int      calib_channel_delta;
   int      calib_dac_zero;
@@ -91,4 +121,3 @@ void config_reset(void);
 void config_task(void);
 
 #endif // _CONFIG_H_
-

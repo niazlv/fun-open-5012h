@@ -289,7 +289,33 @@ void config_reset(void)
 
   config.sample_rate_limit      = 0;
 
-  config.measure_display        = false;
+  config.measure_display        = true;
+
+  config.measure_panel_mode     = 0; // panel view
+  config.show_vpp               = true;
+  config.show_freq              = true;
+  config.show_duty              = true;
+  config.show_vrms              = true;
+  config.show_vavg              = false;
+  config.show_type              = false;
+  config.show_thd               = false;
+  config.measure_reserved       = false;
+
+  config.decoder_proto          = 0; // auto
+  config.decoder_stop           = false;
+  config.decoder_reserved[0]    = false;
+  config.decoder_reserved[1]    = false;
+  config.decoder_reserved[2]    = false;
+
+  // General settings defaults
+  config.screen_brightness      = 80;  // 80% default brightness
+  config.shift_mode_enabled     = false;
+  config.shift_mode_active      = false;
+  config.key_remapping_enabled  = false;
+  
+  // Initialize key mapping with default values
+  for (int i = 0; i < 32; i++)
+    config.key_mapping[i] = 0;
 
   for (int i = 0; i < ARRAY_SIZE(config.padding); i++)
     config.padding[i] = 0;
@@ -333,5 +359,3 @@ void config_task(void)
     g_config_timer = TIMER_INTERVAL;
   }
 }
-
-
