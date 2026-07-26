@@ -13,6 +13,10 @@
             "preLaunchTask": "Build embedded project",
             "servertype": "openocd",
             "interface": "swd",
+            "liveWatch": {
+                "enabled": true,
+                "samplesPerSecond": 4
+            },
             "device": "GD32F407VET",
             "runToEntryPoint": "main",
             "svdFile": "${workspaceRoot}/resources/STM32F40x.svd",

@@ -12,5 +12,6 @@
     },
     "search.exclude": {
         "**/make/build": true
-    }
+    },
+    "cortex-debug.variableUseNaturalFormat": true
 }
