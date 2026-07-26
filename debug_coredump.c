@@ -107,12 +107,23 @@ void debug_coredump_init(void)
 {
     g_viewer_current_entry = 0;
     g_viewer_current_page = 0;
+    g_ring_retained = false;
 
     if (store_is_valid())
     {
         // Survived the reset: keep the dumps and start a new boot id
-        g_ring_retained = (g_store->count > 0);
         g_store->boot_id++;
+
+        // "Retained" means specifically that the boot which just ended
+        // recorded a dump, i.e. this boot is the one following a crash. Any
+        // older dump left in the ring does not count, or the viewer would
+        // open itself on every boot until the ring is cleared by hand.
+        for (int i = 0; i < g_store->count; i++)
+        {
+            if (g_store->entries[i].boot_id + 1 == g_store->boot_id)
+                g_ring_retained = true;
+        }
+
         store_seal();
     }
     else
@@ -486,7 +497,7 @@ static void draw_coredump_details(void)
     y += 14;
 
     // The message can be longer than the panel: cut it into 52 char rows
-    for (int i = 0; entry->message[i] && i < MAX_ERROR_MESSAGE_LEN; i += 52) {
+    for (int i = 0; i < MAX_ERROR_MESSAGE_LEN && entry->message[i]; i += 52) {
         strncpy(buf, &entry->message[i], 52);
         buf[52] = 0;
         lcd_puts(8, y, buf);
@@ -634,9 +645,13 @@ void coredump_app_init(void)
 }
 
 //-----------------------------------------------------------------------------
+// Paints straight away rather than raising the dirty flag: an overlay can
+// close while another one is still open, and only the top screen is ticked,
+// so a deferred repaint would not happen until the whole stack unwound
 void coredump_app_redraw(void)
 {
-    g_viewer_dirty = true;
+    g_viewer_dirty = false;
+    draw_page();
 }
 
 //-----------------------------------------------------------------------------

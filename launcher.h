@@ -13,6 +13,10 @@
 /*- Prototypes --------------------------------------------------------------*/
 void launcher_start(void);
 
+// Open an application by name, bypassing the list. Returns false if there is
+// no such application.
+bool launcher_start_app(const char *name);
+
 // Exit the running application back to the launcher (callable from apps)
 void launcher_exit_app(void);
 

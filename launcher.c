@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 #include "gd32f4xx.h"
 #include "lcd.h"
 #include "buttons.h"
@@ -200,6 +201,23 @@ void launcher_start(void)
   };
 
   menu_open_fullscreen(&g_launcher_def);
+}
+
+//-----------------------------------------------------------------------------
+// Open an application without going through the list, for the boot that
+// follows a crash
+bool launcher_start_app(const char *name)
+{
+  for (int i = 0; i < ARRAY_SIZE(g_apps); i++)
+  {
+    if (0 == strcmp(g_apps[i].name, name))
+    {
+      ui_push(&app_screen, (void *)&g_apps[i]);
+      return true;
+    }
+  }
+
+  return false;
 }
 
 //-----------------------------------------------------------------------------

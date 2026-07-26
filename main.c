@@ -169,9 +169,11 @@ void irq_handler_hard_fault_c(uint32_t lr, uint32_t msp, uint32_t psp)
   print_value(20, 6, "BFAR", r_BFAR);
   print_value(20, 7, "AFSR", r_AFSR);
 
+  // 52 glyphs is all that fits at x=8 in the 6 px font; anything longer is
+  // dropped by lcd_putc, and this is the only instruction on the screen
   lcd_set_font(FONT_SMALL);
   lcd_puts(8, LCD_HEIGHT - 14,
-      "Dump saved. Press any button to reboot and open CoreDump Viewer.");
+      "Dump saved. Press any button to reboot.");
 
   // The dump is in retained SRAM and survives the reset, so rebooting from
   // here is what makes it readable. Halting forever, as this used to do, meant
@@ -219,8 +221,7 @@ void error(char *text)
   lcd_puts(LCD_WIDTH/2 - len*4, 112, text);
 
   lcd_set_font(FONT_SMALL);
-  lcd_puts(8, LCD_HEIGHT - 14,
-      "Dump saved. SHIFT+MENU: reboot and open CoreDump Viewer.");
+  lcd_puts(8, LCD_HEIGHT - 14, "Dump saved. SHIFT+MENU: reboot to view it.");
 
   // A deliberate two-key combination rather than "any button": the most
   // common caller is battery_low_handler, and rebooting on a stray press
@@ -289,6 +290,11 @@ int main(void)
 
   // The launcher menu becomes the root of the UI stack
   launcher_start();
+
+  // A dump left over from before the reset is the reason this boot happened,
+  // so go straight to it instead of making the user find the viewer
+  if (debug_coredump_ring_retained())
+    launcher_start_app("CoreDump Viewer");
 
   while (1)
   {

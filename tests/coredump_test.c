@@ -151,15 +151,23 @@ int main(void)
   check("ring survives", store_is_valid());
   check_int("dumps still there", g_store->count, 2);
   check_int("boot id advanced", g_store->boot_id, 2);
-  check("reported as retained", debug_coredump_ring_retained());
+  check("reported as retained: this boot follows the crash",
+      debug_coredump_ring_retained());
   check("older dump still readable",
       0 == strcmp(entry_at(0)->message, "first failure"));
   check_int("older dump remembers its boot", entry_at(0)->boot_id, 1);
 
+  printf("\na quiet boot does not re-open the viewer\n");
+  debug_coredump_init();
+  check_int("dumps still kept", g_store->count, 2);
+  check_int("boot id", g_store->boot_id, 3);
+  check("older dumps alone do not count as retained",
+      !debug_coredump_ring_retained());
+
   printf("\na dump from the new boot is tagged with the new boot id\n");
   capture("after the reset", 0x08003000u);
   check_int("count", g_store->count, 3);
-  check_int("new entry boot id", entry_at(2)->boot_id, 2);
+  check_int("new entry boot id", entry_at(2)->boot_id, 3);
   check("previous boot still distinguishable",
       entry_at(0)->boot_id != g_store->boot_id);
 
