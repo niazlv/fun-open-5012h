@@ -415,8 +415,10 @@ void flappy_bird_task(void)
     draw_bird();
     g_game.bird.drawn_y = (int)g_game.bird.y;
 
-    if (g_game.score != g_game.drawn_score)
-        draw_score();
+    // Unconditionally, not only when the score changed: the panel sits inside
+    // the play area, so every pipe that scrolls past it and the bird itself
+    // punch holes through the text
+    draw_score();
 
     if (g_game.game_over)
         draw_overlay();
@@ -496,13 +498,33 @@ static const info_page_t g_help_page =
     .count = ARRAY_SIZE(g_help_lines),
 };
 
+//-----------------------------------------------------------------------------
+// The gap size changes with the difficulty, so a gap chosen for the old one
+// can push the bottom pipe past the ground once the new one is applied
+static void difficulty_changed(void)
+{
+    int span = SKY_HEIGHT - pipe_gap() - 2 * GAP_MARGIN;
+    int max_y = GAP_MARGIN + (span > 0 ? span : 0);
+
+    for (int i = 0; i < MAX_PIPES; i++) {
+        if (g_game.pipes[i].gap_y < GAP_MARGIN)
+            g_game.pipes[i].gap_y = GAP_MARGIN;
+
+        if (g_game.pipes[i].gap_y > max_y)
+            g_game.pipes[i].gap_y = max_y;
+
+        // Force a full repaint of the pipe: its outline changed shape
+        g_game.pipes[i].drawn_x = OFFSCREEN;
+    }
+}
+
 static const char *const g_difficulty_labels[] = { "Easy", "Normal", "Hard" };
 
 static const menu_item_t g_menu_items[] =
 {
     { .kind = MI_CHOICE, .label = "Difficulty",
       .u.choice = { &g_difficulty, g_difficulty_labels,
-                    ARRAY_SIZE(g_difficulty_labels), NULL } },
+                    ARRAY_SIZE(g_difficulty_labels), difficulty_changed } },
     { .kind = MI_SEPARATOR },
     { .kind = MI_ACTION, .label = "Restart",
       .u.action = { action_restart, NULL } },

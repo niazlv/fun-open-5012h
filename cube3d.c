@@ -80,6 +80,15 @@ static int g_style = STYLE_SOLID_WIRE;
 static int g_speed = SPEED_DEFAULT;
 static int g_frame_timer = TIMER_DISABLE;
 
+// Frame accounting. paint_ms is how long the cube itself takes; fps is how
+// often it actually gets to run. If paint_ms is small but fps is far below
+// 1000/paint_ms, the time is going somewhere outside this application.
+static uint32_t g_fps_last = 0;
+static int g_fps_frames = 0;
+static int g_fps = 0;
+static uint32_t g_paint_ms = 0;
+static int g_loop_max_ms = 0;
+
 // Optimized rendering with dirty rectangles
 #define MAX_DIRTY_RECTS 4
 typedef struct {
@@ -470,9 +479,13 @@ static void fb_draw_cube_edges(void)
 //-----------------------------------------------------------------------------
 // The status line lives outside the render area, so it is only repainted when
 // something in it actually changed
+// paint = how long this application takes to draw one frame.
+// loop  = the longest gap between two main loop passes in the last second.
+// If paint is small and loop is large, the time is going somewhere outside
+// this application - that is the whole point of showing both.
 static void draw_status(void)
 {
-    char buf[24];
+    char buf[64];
 
     lcd_fill_rect(0, STATUS_Y - 2, LCD_WIDTH, LCD_HEIGHT - STATUS_Y + 2, BG_COLOR);
 
@@ -480,11 +493,11 @@ static void draw_status(void)
     lcd_set_color(BG_COLOR, g_auto_rotate ? LCD_GREEN_COLOR : LCD_COLOR(255, 200, 0));
     lcd_puts(10, STATUS_Y, g_auto_rotate ? "AUTO" : "MANUAL");
 
-    snprintf(buf, sizeof(buf), "Speed %d%%", g_speed);
     lcd_set_color(BG_COLOR, LCD_WHITE_COLOR);
-    lcd_puts(70, STATUS_Y, buf);
 
-    lcd_puts(160, STATUS_Y, "MENU: settings / help");
+    snprintf(buf, sizeof(buf), "%d%%  %d fps  paint %lu ms  loop %d ms",
+        g_speed, g_fps, (unsigned long)g_paint_ms, g_loop_max_ms);
+    lcd_puts(64, STATUS_Y, buf);
 }
 
 //-----------------------------------------------------------------------------
@@ -515,6 +528,11 @@ void cube3d_init(void)
     timer_add(&g_frame_timer);
     g_frame_timer = 50; // ~20 FPS
 
+    g_fps = 0;
+    g_fps_frames = 0;
+    g_fps_last = timer_ms();
+    g_paint_ms = 0;
+
     draw_static();
 
     // Initialize dirty rectangle system
@@ -529,47 +547,62 @@ void cube3d_init(void)
 }
 
 //-----------------------------------------------------------------------------
+// Project and paint at the current angles, without advancing them
+static void paint_cube(void)
+{
+    project_cube_vertices();
+    calculate_dirty_rects();
+
+    if (g_dirty_count > 0) {
+        clear_dirty_rects();
+
+        if (g_style != STYLE_WIRE)
+            fb_draw_cube_faces();
+
+        if (g_style != STYLE_SOLID)
+            fb_draw_cube_edges();
+    }
+
+    for (int i = 0; i < 8; i++)
+        g_prev_projected[i] = g_cube.projected[i];
+}
+
+//-----------------------------------------------------------------------------
 // Called when a menu drawn on top of the cube closes. Only the dirty area
 // around the cube is repainted every frame, so everything else - title, status
-// line and the untouched background - has to be put back here.
+// line and the untouched background - has to be put back here. It paints
+// immediately rather than deferring to the next tick: an overlay can close
+// while another one is still open, and only the top screen is ticked.
 void cube3d_redraw(void)
 {
     draw_static();
 
-    g_first_frame = true; // next frame repaints the whole render area
-    g_frame_timer = 0;    // ... without waiting out the frame interval
+    g_first_frame = true; // repaint the whole render area
+    paint_cube();
 }
 
 //-----------------------------------------------------------------------------
 void cube3d_task(void)
 {
     if (g_frame_timer == 0) {
+        uint32_t t0;
+
         g_frame_timer = 50; // Reset timer for next frame
 
-        // Update rotation
         update_cube_rotation();
 
-        // Project 3D vertices to 2D screen coordinates
-        project_cube_vertices();
+        t0 = timer_ms();
+        paint_cube();
+        g_paint_ms = timer_ms() - t0;
 
-        // Calculate dirty rectangles based on movement
-        calculate_dirty_rects();
+        g_fps_frames++;
 
-        // Only redraw if there are dirty areas
-        if (g_dirty_count > 0) {
-            // Clear only dirty areas
-            clear_dirty_rects();
-
-            if (g_style != STYLE_WIRE)
-                fb_draw_cube_faces();
-
-            if (g_style != STYLE_SOLID)
-                fb_draw_cube_edges();
-        }
-
-        // Save current positions for next frame
-        for (int i = 0; i < 8; i++) {
-            g_prev_projected[i] = g_cube.projected[i];
+        if (timer_ms() - g_fps_last >= 1000) {
+            g_fps = g_fps_frames;
+            g_fps_frames = 0;
+            g_fps_last = timer_ms();
+            g_loop_max_ms = timer_get_max_delta(); // reads and clears
+            draw_status();
         }
     }
 }

@@ -256,11 +256,13 @@ static void draw_status(void)
     lcd_set_font(FONT_SMALL);
     lcd_set_color(STATUS_BG, TEXT_COLOR);
 
+    // The left string reaches 32 characters (192 px) at four-digit scores, so
+    // the mode label starts well clear of it
     snprintf(buf, sizeof(buf), "Score %d   Best %d   Len %d",
         g_game.score, g_high_score, g_game.snake.length);
     lcd_puts(5, 6, buf);
 
-    lcd_puts(LCD_WIDTH - 130, 6, g_wrap_walls ? "WRAP  MENU: menu" : "WALLS  MENU: menu");
+    lcd_puts(LCD_WIDTH - 40, 6, g_wrap_walls ? "WRAP" : "WALLS");
 }
 
 //-----------------------------------------------------------------------------

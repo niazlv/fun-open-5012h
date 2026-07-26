@@ -307,7 +307,7 @@ static void draw_status(void)
     }
 
     lcd_puts(5, STATUS_Y, buf);
-    lcd_puts(150, STATUS_Y, "LEFT/RIGHT: orbit  MENU: menu");
+    lcd_puts(140, STATUS_Y, "LEFT/RIGHT: orbit   MENU: menu");
 }
 
 //-----------------------------------------------------------------------------
@@ -363,10 +363,14 @@ void raytrace_test_task(void)
 
         draw_status();
 
-        if (g_auto_rotate) {
+        if (g_auto_rotate)
             g_camera_angle += ROTATE_STEP;
+
+        // Orbit keys pressed mid-frame only moved g_camera_angle; the frame
+        // that was in flight kept the angle it started with. Now that it is
+        // finished, trace the position the user actually asked for.
+        if (g_auto_rotate || g_camera_angle != g_frame_angle)
             start_render();
-        }
     }
     else if (0 == (g_current_line & 15)) {
         draw_status(); // progress, cheap enough every 16 lines

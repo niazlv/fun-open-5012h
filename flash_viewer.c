@@ -277,9 +277,11 @@ static void draw_footer(const char *l1, const char *l2)
 }
 
 //-----------------------------------------------------------------------------
+// Clears from the header down, not from BODY_Y: the two rows between them
+// belong to no draw path and would keep whatever an overlay left there
 static void clear_body(void)
 {
-    lcd_fill_rect(0, BODY_Y, LCD_WIDTH, BODY_H, BG);
+    lcd_fill_rect(0, HEADER_H, LCD_WIDTH, LCD_HEIGHT - HEADER_H - FOOTER_H, BG);
     lcd_set_font(FONT_SMALL);
     lcd_set_color(BG, FG);
 }
@@ -450,7 +452,7 @@ static void draw_thumb_view(void)
         y += LINE_H;
     }
 
-    draw_footer("UP/DN: halfword   LEFT/RIGHT: page   TRIG_UP/DN: 4 KB",
+    draw_footer("UP/DN: halfword  LEFT/RIGHT: page  TRIG_UP/DN: 4K",
         "MODE: next view   MENU: settings and help");
 }
 

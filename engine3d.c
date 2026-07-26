@@ -1015,8 +1015,11 @@ void engine3d_init(void)
     g_engine.camera.near_plane = DEFAULT_NEAR_PLANE;
     g_engine.camera.far_plane = DEFAULT_FAR_PLANE;
     
-    // Set rendering settings
+    // Set rendering settings. The menu's mirror is re-synced too, or a
+    // relaunch would leave the Renderer row showing the previous session's
+    // choice while the engine actually runs in raycast.
     g_engine.render_mode = RENDER_MODE_RAYCAST;
+    g_menu_render_mode = RENDER_MODE_RAYCAST;
     g_engine.render_width = DEFAULT_RENDER_WIDTH;
     g_engine.render_height = DEFAULT_RENDER_HEIGHT;
     g_engine.render_scale = DEFAULT_RENDER_SCALE;
@@ -1123,8 +1126,13 @@ void engine3d_buttons_handler(int buttons)
         changed = true;
     }
 
+    // The frame in flight is deliberately left alone. Key auto-repeat is
+    // faster than a full frame, so restarting the raster on every event meant
+    // it never got past the first few lines while a key was held. Each frame
+    // latches the camera basis when it starts, so the image stays internally
+    // consistent and simply follows one frame behind.
     if (changed)
-        restart_frame();
+        g_hud_dirty = true;
 }
 
 //-----------------------------------------------------------------------------
