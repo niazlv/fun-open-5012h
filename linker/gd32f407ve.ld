@@ -68,6 +68,9 @@ SECTIONS
     _edata = .;
   } > tcm AT > flash
 
+  /* End of flash data (including .data section stored in flash) */
+  __etext = LOADADDR(.data) + SIZEOF(.data);
+
   .bss : ALIGN(4)
   {
     _bss = .;
@@ -79,5 +82,9 @@ SECTIONS
   } > tcm
 
   PROVIDE(_stack_top = __top_tcm);
-}
 
+  /* The 128K ram region is used as raw pointers by capture.c: 96K capture
+     ring at 0x20000000 + 24K storage buffer at 0x20018000. Nothing may be
+     linked there. Guard the TCM stack/heap headroom at build time. */
+  ASSERT(_stack_top - _end >= 16K, "TCM overflow: less than 16K left for stack+heap")
+}

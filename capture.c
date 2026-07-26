@@ -35,10 +35,12 @@
 #include "gd32f4xx.h"
 #include "hal_gpio.h"
 #include "utils.h"
+#include "timer.h"
 #include "buffer.h"
 #include "common.h"
 #include "config.h"
 #include "trigger.h"
+#include "measure.h"
 #include "capture.h"
 
 /*- Definitions -------------------------------------------------------------*/
@@ -60,12 +62,17 @@ HAL_GPIO_PIN(AC_DC,    C, 15)
 
 #define DMA_MAX_BUFFER_SIZE    (16 * 1024)
 
-#define STORAGE_BUFFER_SIZE    (32 * 1024)
+#define STORAGE_BUFFER_SIZE    (24 * 1024)
 #define STORAGE_BUFFER_RATIO   (CAPTURE_BUFFER_SIZE / STORAGE_BUFFER_SIZE)
+
+_Static_assert(STORAGE_BUFFER_RATIO == 4, "buffer_decimate asm is hardcoded 4:1");
+_Static_assert(CAPTURE_BUFFER_SIZE % DMA_MAX_BUFFER_SIZE == 0, "ring must be a multiple of the DMA buffer");
+_Static_assert(CAPTURE_BUFFER_SIZE + STORAGE_BUFFER_SIZE <= 128 * 1024, "capture + storage must fit main SRAM");
+_Static_assert(0x20000000u + CAPTURE_BUFFER_SIZE + STORAGE_BUFFER_SIZE == CAPTURE_SPARE_RAM,
+    "spare RAM must start right after the storage buffer");
 
 #define ZERO_POINT             0x80
 
-#define MEASURE_HYSTERESIS     3
 
 /*- Types -------------------------------------------------------------------*/
 typedef struct
@@ -105,9 +112,14 @@ static volatile int g_auto_mode_count;
 static volatile bool g_auto_mode_stop;
 static volatile bool g_triggered;
 static volatile bool g_stopped;
-static volatile alignas(32) uint8_t g_storage_buffer[STORAGE_BUFFER_SIZE];
+// Placed in main SRAM right after the capture ring (not in TCM: the 64 KB TCM
+// also holds all .data/.bss and the stack, and was 99.7% full with this
+// buffer there, leaving 2 KB for stack+heap)
+static volatile uint8_t * const g_storage_buffer =
+    (uint8_t *)(0x20000000 + CAPTURE_BUFFER_SIZE);
 static volatile BufferInfo g_capture_buffer_info;
 static volatile BufferInfo g_storage_buffer_info;
+static volatile uint32_t g_buffer_generation = 0;
 
 /*- Prototypes --------------------------------------------------------------*/
 static inline int dma_get_count(void);
@@ -418,6 +430,7 @@ static inline void dma_finish(void)
   dma_stop();
   update_capture_buffer();
   update_storage_buffer();
+  g_buffer_generation++;
 
   if (TRIGGER_MODE_SINGLE == g_trigger_mode)
   {
@@ -531,6 +544,15 @@ void capture_stop(void)
 
   dma_stop();
 
+  // A stopped scope reads the RAW ring instead of the decimated storage
+  // record (snapshot_active_info), and in dual-channel mode every odd byte
+  // of that ring is still wired bit-reversed: the display, the decoders and
+  // the spectrum would all analyze garbage on alternate samples. Undo the
+  // interleave once, here, exactly like the single-shot stop in dma_finish()
+  // already does.
+  if (g_dual_channel)
+    buffer_reverse((uint32_t)g_capture_buffer, CAPTURE_BUFFER_SIZE);
+
   g_stopped = true;
 }
 
@@ -593,6 +615,11 @@ void capture_set_horizontal_parameters(int sr_divider, int trigger_offset)
   dma_divider = (sr_divider < 6) ? 1 : (1 << (sr_divider - 6));
 
   g_dma_buffer_size = DMA_MAX_BUFFER_SIZE / dma_divider;
+
+  // The trigger/decimate asm loops advance 32 bytes per iteration and wrap
+  // through 2^32 if the size is not a multiple of 32 (permanent hang in IRQ)
+  if (g_dma_buffer_size < 32)
+    g_dma_buffer_size = 32;
 
   TIMER0->CTL0 = 0;
   TIMER7->CTL0 = 0;
@@ -671,6 +698,17 @@ int capture_get_state(void)
 bool capture_buffer_updated(void)
 {
   return g_storage_buffer_info.valid;
+}
+
+//-----------------------------------------------------------------------------
+// Hand the storage buffer back to the DMA IRQ without reading it through
+// capture_get_data()/capture_read_samples(): update_storage_buffer() refills
+// it only while valid is false, so a consumer that analyzes the record
+// in place (capture_get_record) must still release the frame or acquisition
+// stops at the one it is looking at.
+void capture_consume_frame(void)
+{
+  g_storage_buffer_info.valid = false;
 }
 
 //---------------------------------------------------------------------
@@ -825,7 +863,7 @@ static bool find_min_max(BufferInfo *info, int index0, int index1, int *vmin, in
   }
   else
   {
-    find_min_max_buf(&info->data[index0], info->size-1 - index0, vmin, vmax);
+    find_min_max_buf(&info->data[index0], info->size - index0, vmin, vmax);
     find_min_max_buf(&info->data[0], index1, vmin, vmax);
   }
 
@@ -833,69 +871,260 @@ static bool find_min_max(BufferInfo *info, int index0, int index1, int *vmin, in
 }
 
 //---------------------------------------------------------------------
-static int calc_frequency(BufferInfo *info)
+// Snapshot the metadata of the active buffer with the DMA IRQ masked:
+// dma_finish() rewrites these fields (and the storage buffer) from interrupt
+// context, and the consumers below also run from settings-change paths
+// while acquisition is live
+static BufferInfo snapshot_active_info(void)
 {
-  int pn, pa, pb, level, index;
-  bool low;
+  BufferInfo local;
+  uint32_t primask = __get_PRIMASK();
 
-  if (!config.measure_display)
+  __disable_irq();
+
+  if (g_stopped && g_capture_buffer_info.valid)
+    local = *(BufferInfo *)&g_capture_buffer_info;
+  else
+    local = *(BufferInfo *)&g_storage_buffer_info;
+
+  __set_PRIMASK(primask);
+
+  return local;
+}
+
+//---------------------------------------------------------------------
+// Full-record measurements (see measure.c), cached per acquisition: the
+// record only changes when a new frame lands, so pan/zoom redraws and the
+// periodic measurement display reuse the cached scan.
+static bool measure_active_buffer_ex(Measure *out, bool fresh)
+{
+  static Measure cache;
+  static uint32_t cache_gen = 0xffffffff;
+  static uint32_t cache_ms = 0;
+  static int cache_period = -1;
+  BufferInfo local;
+  uint32_t gen;
+
+  if (g_buffer_generation == 0 && !(g_stopped && g_capture_buffer_info.valid))
+    return false; // nothing has ever been captured
+
+  gen = g_buffer_generation;
+  local = snapshot_active_info();
+
+  // At fast timebases acquisitions land far more often than anyone can
+  // read numbers: cap the full-record rescan at 10 Hz — except for control
+  // loops (fresh=true), which must see the latest acquisition or they end
+  // up steering on data from before their own settings change
+  if ((gen != cache_gen && (fresh || timer_ms() - cache_ms >= 100)) ||
+      local.period != cache_period)
+  {
+    cache_ms = timer_ms();
+    measure_run(local.data, local.size, local.offset, local.period, ZERO_POINT, &cache);
+    cache_gen = gen;
+    cache_period = local.period;
+  }
+
+  *out = cache;
+
+  return true;
+}
+
+//---------------------------------------------------------------------
+static bool get_measurements_ex(ScopeMeasure *out, bool fresh)
+{
+  Measure m;
+  int64_t mult;
+
+  if (!measure_active_buffer_ex(&m, fresh))
+    return false;
+
+  mult = config.calib_vs_mult[config.vertical_scale];
+
+  out->vmin_raw  = m.vmin;
+  out->vmax_raw  = m.vmax;
+  // Spike-trimmed peaks, not percentiles: control loops must still see a
+  // short burst (a us-scale packet in a ms-scale record) that a percentile
+  // trim erases completely
+  out->base_raw  = m.pk_lo;
+  out->top_raw   = m.pk_hi;
+  out->vpp_mv    = (int)((int64_t)(m.vmax - m.vmin) * mult / CALIB_MULTIPLIER);
+  out->vamp_mv   = (int)((int64_t)(m.pk_hi - m.pk_lo) * mult / CALIB_MULTIPLIER);
+  out->vrms_mv   = (int)((int64_t)m.rms_c100 * mult / CALIB_MULTIPLIER / 100);
+  out->vavg_mv   = (int)((int64_t)m.mean_c100 * mult / CALIB_MULTIPLIER / 100);
+  // Mid level between the spike-trimmed peaks: works for continuous signals
+  // (equals the rail midpoint) and for bursts (percentiles would put the
+  // "midpoint" at the baseline)
+  out->vmid_mv   = (int)((int64_t)((m.pk_hi + m.pk_lo) / 2 - ZERO_POINT) * mult / CALIB_MULTIPLIER);
+  out->frequency = m.frequency;
+  out->duty_x10  = m.duty_x10;
+  out->periods   = m.periods;
+  out->period_good_pct = m.period_good_pct;
+  out->level_pct = m.level_pct;
+
+  return true;
+}
+
+//---------------------------------------------------------------------
+bool capture_get_measurements(ScopeMeasure *out)
+{
+  return get_measurements_ex(out, false);
+}
+
+//---------------------------------------------------------------------
+bool capture_get_measurements_fresh(ScopeMeasure *out)
+{
+  return get_measurements_ex(out, true);
+}
+
+//---------------------------------------------------------------------
+bool capture_get_raw_measure(Measure *out)
+{
+  return measure_active_buffer_ex(out, false);
+}
+
+//---------------------------------------------------------------------
+uint32_t capture_get_generation(void)
+{
+  return g_buffer_generation;
+}
+
+//---------------------------------------------------------------------
+// Direct (zero-copy) access to the active record for main-loop analyzers.
+// Does NOT consume the pending-frame handshake; like the display path, the
+// data may tear if the DMA IRQ lands a new frame mid-scan.
+// trigger_timepos receives the trigger's position in time order (samples
+// from the oldest sample), letting callers map record positions onto the
+// trigger-relative display axis.
+bool capture_get_record(const uint8_t **data, int *size, int *offset,
+    int *period_ns, int *trigger_timepos)
+{
+  BufferInfo local;
+
+  if (g_buffer_generation == 0 && !(g_stopped && g_capture_buffer_info.valid))
+    return false;
+
+  local = snapshot_active_info();
+
+  *data      = local.data;
+  *size      = local.size;
+  *offset    = local.offset;
+  *period_ns = local.period;
+
+  *trigger_timepos = local.trigger - local.offset;
+
+  if (*trigger_timepos < 0)
+    *trigger_timepos += local.size;
+
+  return true;
+}
+
+//---------------------------------------------------------------------
+// Copy up to max_count time-ordered samples of the active record (used by
+// the FFT view). With consume=true the pending-frame handshake is cleared
+// exactly like capture_get_data does, so acquisition keeps flowing when
+// this is the only consumer.
+int capture_read_samples(uint8_t *dst, int max_count, int *period_ns, bool consume)
+{
+  BufferInfo local;
+  int count, index;
+
+  if (g_buffer_generation == 0 && !(g_stopped && g_capture_buffer_info.valid))
     return 0;
 
-  index = info->offset;
-  low = (info->data[index] < g_trigger_level);
-  level = g_trigger_level + (low ? MEASURE_HYSTERESIS : -MEASURE_HYSTERESIS);
-  pn = 0;
+  local = snapshot_active_info();
 
-  for (int i = 0; i < info->size; i++)
+  count = (max_count < local.size) ? max_count : local.size;
+  index = local.offset;
+
+  for (int i = 0; i < count; i++)
   {
-    bool toggle = (low && (info->data[index] > level)) || (!low && (info->data[index] < level));
+    dst[i] = local.data[index];
 
-    if (toggle)
-    {
-      if (low)
-      {
-        if (pn == 0)
-          pa = i;
-        else
-          pb = i;
-
-        pn++;
-        low = false;
-        level = g_trigger_level - MEASURE_HYSTERESIS;
-      }
-      else
-      {
-        low = true;
-        level = g_trigger_level + MEASURE_HYSTERESIS;
-      }
-    }
-
-    index++;
-
-    if (index == info->size)
+    if (++index == local.size)
       index = 0;
   }
 
-  if (pn < 2)
+  *period_ns = local.period;
+
+  if (consume)
+    g_storage_buffer_info.valid = false;
+
+  return count;
+}
+
+//---------------------------------------------------------------------
+int capture_read_fast_samples(uint8_t *dst, int max_count, int *period_ns)
+{
+  int end, count, delta;
+  bool dual;
+  uint32_t primask;
+
+  if (g_buffer_generation == 0 && !(g_stopped && g_capture_buffer_info.valid))
     return 0;
 
-  return ((uint64_t)(pn-1) * (uint64_t)1e9) / ((pb - pa) * info->period);
+  // Freshest write position of the ring (same math as update_capture_buffer)
+  primask = __get_PRIMASK();
+  __disable_irq();
+  end = g_next_buf_ptr - dma_get_count();
+  // While stopped after a SINGLE capture the ring has already been
+  // un-reversed in place by dma_finish(); only a live ring still carries
+  // the raw interleave
+  dual = g_dual_channel && !g_stopped;
+  *period_ns = g_sample_period;
+  __set_PRIMASK(primask);
+
+  if (end < 0)
+    end += CAPTURE_BUFFER_SIZE;
+  else if (end >= CAPTURE_BUFFER_SIZE)
+    end -= CAPTURE_BUFFER_SIZE;
+
+  // In dual-channel mode the two interleaved ADCs alternate ring bytes and
+  // the odd one is wired bit-reversed with its own offset (this is what
+  // buffer_decimate_reverse undoes for the storage record). Undoing it here
+  // too keeps the full 125 MS/s stream instead of one 62.5 MS/s phase,
+  // which is the difference between a 31 MHz and a 62 MHz Nyquist limit
+  // for the spectral probe.
+  delta = config.calib_channel_delta;
+  count = max_count;
+
+  int start = end - count;
+
+  while (start < 0)
+    start += CAPTURE_BUFFER_SIZE;
+
+  for (int i = 0; i < count; i++)
+  {
+    int v = g_capture_buffer[start];
+
+    if (dual && (start & 1))
+    {
+      v = (int)(__RBIT((uint32_t)v) >> 24) + delta;
+
+      if (v < 0)
+        v = 0;
+      else if (v > 255)
+        v = 255;
+    }
+
+    dst[i] = (uint8_t)v;
+
+    if (++start >= CAPTURE_BUFFER_SIZE)
+      start -= CAPTURE_BUFFER_SIZE;
+  }
+
+  return count;
 }
 
 //---------------------------------------------------------------------
 void capture_get_data(DataBuffer *db)
 {
-  BufferInfo *capture_info = (BufferInfo *)&g_capture_buffer_info;
-  BufferInfo *storage_info = (BufferInfo *)&g_storage_buffer_info;
-  BufferInfo *info = NULL;
+  BufferInfo local;
+  BufferInfo *info = &local;
   int index_inc, error_inc, index, error, next_index, next_error;
   int istart, dx, min_value, max_value, flags;
   int64_t offs;
 
-  if (g_stopped && capture_info->valid)
-    info = capture_info;
-  else
-    info = storage_info;
+  local = snapshot_active_info();
 
   offs = config.horizontal_position - (int64_t)config.horizontal_period * (db->size/2 - 1) -
       info->period/2 - config.horizontal_period/2;
@@ -999,8 +1228,14 @@ void capture_get_data(DataBuffer *db)
     error = next_error;
   }
 
-  db->frequency = calc_frequency(info);
+  // NOTE: db->frequency is fed by capture_get_measurements() consumers now;
+  // running the full-record measure scan here put ~1 ms on EVERY displayed
+  // frame and pan tick once measurements became default-on
+  db->frequency = 0;
 
+  // Hand the storage buffer back to the DMA IRQ: update_storage_buffer()
+  // refills it only while valid is false, so this must clear
+  // unconditionally or acquisition and display deadlock on one frame
   g_storage_buffer_info.valid = false;
 }
 

@@ -29,10 +29,22 @@
 #ifndef _CAPTURE_H_
 #define _CAPTURE_H_
 
+/*- Includes ----------------------------------------------------------------*/
+#include "measure.h"
+
 /*- Definitions -------------------------------------------------------------*/
 #define BASE_SAMPLE_RATE       125e6
 #define BASE_SAMPLE_PERIOD     (1e9 / BASE_SAMPLE_RATE)
-#define CAPTURE_BUFFER_SIZE    (128 * 1024)
+// Capture ring lives at the bottom of main SRAM (0x20000000), followed by the
+// 24 KB decimated storage buffer (see capture.c). Together they must fit the
+// 128 KB SRAM, and capture size must stay a multiple of the 16 KB DMA buffer
+// and keep a 4:1 ratio to the storage buffer (buffer_decimate asm is 4:1).
+#define CAPTURE_BUFFER_SIZE    (96 * 1024)
+
+// The 8 KB of main SRAM left after capture + storage, free for app scratch
+// (currently the UART decoder's run tables)
+#define CAPTURE_SPARE_RAM       0x2001E000u
+#define CAPTURE_SPARE_RAM_SIZE  (8 * 1024)
 #define TRIGGER_MARGIN_SAMPLES 1024
 #define DATA_BUFFER_SIZE       300
 
@@ -49,6 +61,28 @@ typedef struct
   uint8_t  flags[DATA_BUFFER_SIZE];
 } DataBuffer;
 
+typedef struct
+{
+  int      vmin_raw;   // raw ADC counts, 0..255 (absolute extremes)
+  int      vmax_raw;
+  int      base_raw;   // robust levels (histogram percentiles): spikes and
+  int      top_raw;    // noise peaks excluded — use these for auto-setup
+  int      vpp_mv;
+  int      vamp_mv;    // top_raw - base_raw in mV: the swing to fit on screen
+  int      vrms_mv;
+  int      vavg_mv;
+  int      vmid_mv;    // (vmax + vmin) / 2 in mV: the 50% trigger level
+  int      frequency;  // Hz, 0 when not measurable
+  int      duty_x10;   // 0.1% units, -1 when n/a
+  // How much the frequency above can be trusted: noise crosses the mid
+  // level constantly and would otherwise read as a signal
+  int      periods;         // whole periods the record held
+  int      period_good_pct; // % of them within +-25% of the median
+  int      level_pct;       // % of samples resting at one of the two levels:
+                            // high = digital, even when the repetition is
+                            // irregular (bus traffic); a few % = noise
+} ScopeMeasure;
+
 /*- Prototypes --------------------------------------------------------------*/
 void capture_init(void);
 void capture_disable_clock(void);
@@ -61,8 +95,23 @@ void capture_set_trigger_edge(int edge);
 void capture_set_trigger_mode(int mode);
 int capture_get_state(void);
 bool capture_buffer_updated(void);
+void capture_consume_frame(void);
 void capture_get_data(DataBuffer *db);
 void capture_get_raw_data(int *raw, int size);
+bool capture_get_measurements(ScopeMeasure *out);
+// Same, but bypasses the 10 Hz recompute throttle: control loops
+// (auto-setup, 50% trigger) must see the CURRENT acquisition, not a reading
+// cached from before they changed the hardware settings
+bool capture_get_measurements_fresh(ScopeMeasure *out);
+bool capture_get_raw_measure(Measure *out);
+uint32_t capture_get_generation(void);
+int capture_read_samples(uint8_t *dst, int max_count, int *period_ns, bool consume);
+// The newest samples from the RAW full-rate capture ring (not the decimated
+// storage buffer), usable while acquisition runs. May tear mid-write — meant
+// for spectral estimation, where a seam only raises the noise floor.
+int capture_read_fast_samples(uint8_t *dst, int max_count, int *period_ns);
+bool capture_get_record(const uint8_t **data, int *size, int *offset,
+    int *period_ns, int *trigger_timepos);
 
 #endif // _CAPTURE_H_
 
