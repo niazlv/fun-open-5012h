@@ -53,6 +53,11 @@
 #define RESET_TO_DEFAULT     (BTN_SHIFT | BTN_SAVE)
 #define CALIBRATION_MODE     (BTN_SHIFT | BTN_MODE)
 
+// One flash wait state per 30 MHz of CK_SYS (2.7-3.6 V), and WSCNT is 4 bits
+#define FLASH_WS_PER_HZ      30000000ul
+#define FLASH_WS_RAW         ((F_CPU - 1) / FLASH_WS_PER_HZ)
+#define FLASH_WAIT_STATES    (FLASH_WS_RAW > 15 ? 15 : FLASH_WS_RAW)
+
 /*- Variables ---------------------------------------------------------------*/
 
 /*- Implementations ---------------------------------------------------------*/
@@ -94,6 +99,19 @@ static void sys_init(void)
     PMU->CTL_b.HDS = 1;
     for (int i = 0; i < 1000000 && 0 == PMU->CS_b.HDSRF; i++);
   }
+
+  // Flash wait states, and they have to be in place BEFORE CK_SYS speeds up.
+  // At 2.7-3.6 V the flash sustains one wait state per 30 MHz of CK_SYS, so
+  // 250 MHz needs 8. This was never programmed at all: WSCNT comes out of
+  // reset as 0, which is only good to 30 MHz, and the part then ran a 49%
+  // overclock on top of that. Code fetch mostly survived it because the
+  // prefetch buffer hides sequential reads, but a cold linear sweep of flash
+  // DATA is exactly the access pattern with nothing in front of it - and
+  // config_init()'s find_last_entry() sweeps 128 KB of it through CRC32 on
+  // every boot. One bad byte fails the CRC, the entry is rejected, and the
+  // settings silently fall back to defaults.
+  FMC->WS_b.WSCNT = FLASH_WAIT_STATES;
+  while (FMC->WS_b.WSCNT != FLASH_WAIT_STATES);
 
   RCU->CFG0 = (2/*CK_PLLP*/ << RCU_CFG0_SCS_Pos) | (0/*CK_SYS*/ << RCU_CFG0_AHBPSC_Pos) |
       (5/*DIV 4*/ << RCU_CFG0_APB1PSC_Pos) | (4/*DIV 2*/ << RCU_CFG0_APB2PSC_Pos) |

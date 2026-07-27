@@ -99,6 +99,7 @@ typedef struct
 
 /*- Prototypes --------------------------------------------------------------*/
 void menu_open_fullscreen(const menu_def_t *def);
+void menu_open_dialog(const menu_def_t *def); // fullscreen, MENU/LEFT close it
 void menu_open_popup(const menu_def_t *def, int x, int y);
 void menu_open_info(const info_page_t *page);
 void menu_close_popups(void);

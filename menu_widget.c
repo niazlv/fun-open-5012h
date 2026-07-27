@@ -437,6 +437,27 @@ void menu_open_fullscreen(const menu_def_t *def)
 }
 
 //-----------------------------------------------------------------------------
+// Fullscreen menu that closes like a dialog: MENU and LEFT pop it. The plain
+// fullscreen variant is for the launcher root, where MENU has to fall through
+// so the system menu can open on top.
+void menu_open_dialog(const menu_def_t *def)
+{
+  menu_inst_t *m = alloc_inst();
+
+  if (NULL == m)
+    return;
+
+  m->fullscreen = true;
+  m->is_submenu = true; // gives it the submenu close behavior
+  m->title = def->title;
+  m->items = def->items;
+  m->count = def->count;
+  m->sel = first_selectable(m);
+
+  ui_push(&menu_screen_fs, m);
+}
+
+//-----------------------------------------------------------------------------
 void menu_open_popup(const menu_def_t *def, int x, int y)
 {
   popup_open_common(def->items, def->count, x, y, POPUP_WIDTH, false);
@@ -630,7 +651,21 @@ static bool menu_input(void *ctx, int buttons)
   if (buttons & BTN_MENU)
   {
     if (m->fullscreen)
+    {
+      // A fullscreen DIALOG (menu_open_dialog) closes like any menu. Only
+      // the launcher's root menu passes MENU on, so the system menu can
+      // open over it - a dialog doing that had no way out at all: MENU
+      // stacked a system menu on top and LEFT ignored a non-submenu.
+      if (m->is_submenu)
+      {
+        if (!repeat)
+          ui_pop();
+
+        return true;
+      }
+
       return false; // root menu: let the caller open the system menu
+    }
 
     if (!repeat)
       menu_close_popups();

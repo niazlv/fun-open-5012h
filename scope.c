@@ -115,8 +115,14 @@
 #define MAX_VERTICAL_POSITION  ( 10 * GRID_DIV_PX)
 
 #define MEASURE_UPDATE_TIMEOUT 100
-#define MEASURE_PAGE_TICKS     20    // measure page flips every 2 s
-#define MEASURE_PAGES          3     // [M] Vpp+freq, [R] Vrms+duty, [S] type+THD
+#define MEASURE_ITEMS_MAX      (MEASURE_COUNT - 1) // every metric but NONE
+
+// Status-line layout: a one-character tag and a value per slot. Values are
+// right-aligned in a fixed width by format_*(), which comes to 76 px, so a
+// tagged slot is 84 and the two of them run 140..312.
+#define MEASURE_SLOT_0_X       140
+#define MEASURE_SLOT_1_X       228
+#define MEASURE_TAG_W          8     // one glyph of the large font
 
 // The decode panel is a hole in the trace area: columns it covers only
 // paint their part BELOW it, so neither grid nor trace ever touches the
@@ -180,6 +186,28 @@
 #define AUTOSET_MIN_SIGNAL_MV  100   // less than this at 50 mV/div is noise
 #define AUTOSET_NO_ERR         0x7fffffff
 
+// Auto-calibration against an OPEN input. Three of the four parameters are
+// derivable that way; the fourth (gain) needs a reference amplitude and stays
+// manual. See autocal_step().
+#define AUTOCAL_TIMEOUT        20000 // give up after 20 s
+#define AUTOCAL_SETTLE         6     // records to drop after a hardware change,
+                                     // enough for the 50/100 mV relay to land
+#define AUTOCAL_ZERO_TOL       25    // counts*100 we call centred (1/4 count)
+#define AUTOCAL_DAC_PX         60    // position step the DAC calibration uses:
+                                     // large enough to measure, far from clipping
+#define AUTOCAL_HS             HS_10_us // short records, maximum sample rate
+
+// Offset DAC zero: the window the hardware can actually be centred in
+#define CALIB_DAC_ZERO_MIN     1900
+#define CALIB_DAC_ZERO_MAX     2200
+
+// Gain reference: the level you apply and can measure independently
+#define CALIB_REF_MIN_MV       50
+#define CALIB_REF_MAX_MV       40000
+#define CALIB_REF_DEFAULT_MV   1000
+// Reject a reading too small to divide by, or one that has run off the ADC
+#define CALIB_REF_MIN_COUNTS   20
+
 enum
 {
   CALIB_ZERO,
@@ -195,6 +223,17 @@ typedef struct
   uint8_t  max[GRID_WIDTH];
   uint8_t  flags[GRID_WIDTH];
 } DisplayBuffer;
+
+// One selected metric, rendered for both views at once: the panel prints
+// `panel` in the small font after its own spelled-out label, the status line
+// prints `tag` and `value` in the large font, where a single character is all
+// the room there is for a name
+typedef struct
+{
+  char panel[22];
+  char tag[2];
+  char value[16];
+} MeasureItem;
 
 /*- Constants ---------------------------------------------------------------*/
 static const char *hs_str[HS_COUNT] =
@@ -280,13 +319,21 @@ static int g_toast_timer = TIMER_DISABLE;
 static int g_state = -1;
 static int g_state_timer = TIMER_DISABLE;
 
-static bool g_calibration_mode = false;
+// Not static: the scope's menu toggles it directly (see scope_menu.c). The
+// full calibration UI has been in here since the base project, but nothing
+// could ever reach it — scope_init() is only ever called with false.
+bool scope_calibration_mode = false;
 static bool g_calibration_dual_channel = false;
 static int g_calibration_parameter = CALIB_ZERO;
+// Calibration hint: on by default for every parameter, MODE hides it. It
+// comes back on the next parameter, because the point of it is saying what
+// THIS step wants - a hint dismissed once should not stay dismissed through
+// three more steps the user has not seen yet.
+static bool g_calib_hint = true;
+static int g_calib_hint_param = -1; // parameter the current text was built for
 
 static int g_measure_timer = TIMER_DISABLE;
-static int g_measure_page = 0;
-static int g_measure_page_tick = 0;
+static bool g_line_owner = false; // measurements hold the status line's end
 
 static bool g_fft_mode = false;
 static int g_fft_peak_hz = 0;
@@ -335,6 +382,33 @@ static int g_autoset_vert_tries = 0;
 static int g_autoset_refine_tries = 0;
 static int g_autoset_freq = 0;          // current estimate
 static int g_autoset_vamp_mv = 0;       // last measured swing
+
+// Auto-calibration phases, in the order autocal_step() walks them
+enum
+{
+  ACAL_ASK,    // waiting for the user to prepare the input and confirm
+  ACAL_ZERO,   // single channel: put ADC B's mean on ZERO_POINT
+  ACAL_DELTA,  // dual channel: match ADC A's mean to ADC B's
+  ACAL_DAC,    // per range: one position pixel must move the trace one pixel
+  ACAL_ASK_REF,// waiting for the reference voltage to be connected
+  ACAL_SCALE,  // gain: make the reading equal that reference
+  ACAL_DONE,
+};
+
+static bool g_autocal_active = false;
+static int g_autocal_timer = TIMER_DISABLE;
+static int g_autocal_phase = ACAL_ZERO;
+static int g_autocal_lo = 0, g_autocal_hi = 0; // ACAL_ZERO bisection bracket
+static int g_autocal_range = 0;    // vertical range ACAL_DAC is working on
+static int g_autocal_sub = 0;      // sub-step inside a phase
+static int g_autocal_ref = 0;      // reading carried between sub-steps
+static uint32_t g_autocal_gen = 0; // acquisition generation at the last change
+static int g_autocal_saved_hs = 0; // user settings, restored when it finishes
+static int g_autocal_saved_vs = 0;
+static int g_autocal_saved_vpos = 0;
+static int g_autocal_saved_srl = 0;
+static int g_autocal_saved_tmode = 0;
+static bool g_autocal_did_gain = false; // whether the gain step actually ran
 
 // Held-key coalescing: while a pan key auto-repeats, the DMA restart and
 // miniview/sample-rate redraw run only every Nth tick; this timer fires
@@ -716,11 +790,39 @@ static void draw_horizontal_scale(void)
 }
 
 //-----------------------------------------------------------------------------
+// Who owns the right-hand end of the status line (x >= 140): the measurements
+// when at least one slot asks for a metric, the trigger edge, trigger level
+// and horizontal position otherwise.
+//
+// This used to ask config.measure_display alone, which handed the slot to a
+// readout that draw_measure() never painted in panel view: whatever glyphs
+// happened to be there froze (the reading from the moment the scope was
+// entered), and anything that cleared the line — a toast, an auto-setup —
+// left it empty for good, because the only element allowed to repaint it
+// returned immediately.
+static bool measure_owns_status_line(void)
+{
+  if (g_fft_mode)
+    return true; // the spectrum readout lives there
+
+  if (!config.measure_display || scope_calibration_mode)
+    return false;
+
+  for (int i = 0; i < MEASURE_LINE_SLOTS; i++)
+  {
+    if (config.measure_line[i] != MEASURE_NONE)
+      return true;
+  }
+
+  return false;
+}
+
+//-----------------------------------------------------------------------------
 static void draw_horizontal_position(void)
 {
   char *str;
 
-  if (g_toast_active || g_calibration_mode || config.measure_display || g_fft_mode)
+  if (g_toast_active || scope_calibration_mode || measure_owns_status_line())
     return;
 
   str = format_time(config.horizontal_position, true);
@@ -795,7 +897,7 @@ static void draw_trigger_level(void)
   draw_marker_image(&g_trig_marker, GRID_RIGHT+2,
       GRID_CENTER_Y - config.trigger_level, &image_trigger_level);
 
-  if (g_toast_active || g_calibration_mode || config.measure_display || g_fft_mode)
+  if (g_toast_active || scope_calibration_mode || measure_owns_status_line())
     return;
 
   str = format_voltage(config.trigger_level_mv - config.vertical_position_mv, true);
@@ -806,7 +908,7 @@ static void draw_trigger_level(void)
 //-----------------------------------------------------------------------------
 static void draw_trigger_edge(void)
 {
-  if (g_toast_active || g_calibration_mode || config.measure_display || g_fft_mode)
+  if (g_toast_active || scope_calibration_mode || measure_owns_status_line())
     return;
 
   if (TRIGGER_EDGE_RISE == config.trigger_edge)
@@ -834,14 +936,17 @@ static void draw_trigger_mode(void)
 }
 
 //-----------------------------------------------------------------------------
+// Bare value, no name: the two views label it themselves, and both need every
+// reading to come out the same width so a shorter one erases the tail of the
+// longer one it replaces
 static char *format_duty(int duty_x10)
 {
   static char str[10];
 
   if (duty_x10 < 0)
-    return "d --.-%";
+    return " --.-%";
 
-  snprintf(str, sizeof(str), "d%3d.%d%%", duty_x10 / 10, duty_x10 % 10);
+  snprintf(str, sizeof(str), "%3d.%d%%", duty_x10 / 10, duty_x10 % 10);
 
   return str;
 }
@@ -875,6 +980,111 @@ static void signal_info_update(void)
   }
 
   cached_gen = gen;
+}
+
+//-----------------------------------------------------------------------------
+// One metric, formatted for both views at once: the panel prints `panel` in
+// the small font after its own spelled-out label, the status line prints `tag`
+// and `value` in the large one. Every metric formats to a constant width, so a
+// shorter reading always covers the longer one it replaces.
+//
+// format_*() all hand back the same static buffer, so the value is copied into
+// the item before anything else is formatted.
+static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
+{
+  const char *tag = "";
+  const char *label = "";
+  const char *value = NULL;
+  char scratch[16];
+
+  switch (metric)
+  {
+    case MEASURE_VPP:
+      tag = "V"; label = "Vpp"; value = format_voltage(sm->vpp_mv, false);
+      break;
+
+    case MEASURE_FREQ:
+      tag = "f"; label = "f "; value = format_frequency(sm->frequency);
+      break;
+
+    case MEASURE_DUTY:
+      tag = "d"; label = "d"; value = format_duty(sm->duty_x10);
+      break;
+
+    case MEASURE_VRMS:
+      tag = "R"; label = "rms"; value = format_voltage(sm->vrms_mv, false);
+      break;
+
+    case MEASURE_VAVG:
+      tag = "A"; label = "avg"; value = format_voltage(sm->vavg_mv, false);
+      break;
+
+    case MEASURE_TYPE:
+      signal_info_update();
+      tag = "S"; label = ""; value = classify_name(g_signal_class.type);
+      break;
+
+    case MEASURE_THD:
+      signal_info_update();
+      tag = "T"; label = "t";
+
+      // A spectrum is not always there to take it from, and a slot the user
+      // asked for says so rather than going blank or keeping a stale number
+      if (g_signal_class.thd_x10 < 0)
+        snprintf(scratch, sizeof(scratch), " --.-%%");
+      else
+        snprintf(scratch, sizeof(scratch), "%3d.%d%%",
+            g_signal_class.thd_x10 / 10, g_signal_class.thd_x10 % 10);
+
+      value = scratch;
+      break;
+
+    default:
+      return false;
+  }
+
+  snprintf(it->panel, sizeof(it->panel), "%s%s", label, value);
+  snprintf(it->tag, sizeof(it->tag), "%s", tag);
+  snprintf(it->value, sizeof(it->value), "%s", value);
+
+  return true;
+}
+
+//-----------------------------------------------------------------------------
+// The set of metrics the panel lists, in menu order
+static int measure_build_items(const ScopeMeasure *sm, MeasureItem *it)
+{
+  // A config saved before these flags existed reads all-false: default set
+  bool any = config.show_vpp || config.show_freq || config.show_duty ||
+      config.show_vrms || config.show_vavg || config.show_type || config.show_thd;
+
+  const bool shown[MEASURE_COUNT] =
+  {
+    [MEASURE_VPP]  = any ? config.show_vpp  : true,
+    [MEASURE_FREQ] = any ? config.show_freq : true,
+    [MEASURE_DUTY] = any ? config.show_duty : true,
+    [MEASURE_VRMS] = any ? config.show_vrms : true,
+    [MEASURE_VAVG] = any && config.show_vavg,
+    [MEASURE_TYPE] = any && config.show_type,
+    [MEASURE_THD]  = any && config.show_thd,
+  };
+
+  int n = 0;
+
+  for (int m = MEASURE_NONE + 1; m < MEASURE_COUNT; m++)
+  {
+    if (shown[m] && measure_format(m, sm, &it[n]))
+      n++;
+  }
+
+  // Never end up with nothing to draw: an empty panel text renders an empty
+  // mask, a blank band that compares equal to itself and is therefore never
+  // repainted again, and it is what a blank panel would look like for any
+  // other reason.
+  if (n == 0 && measure_format(MEASURE_VPP, sm, &it[0]))
+    n = 1;
+
+  return n;
 }
 
 //-----------------------------------------------------------------------------
@@ -952,6 +1162,25 @@ static void mpanel_invalidate(void)
 }
 
 //-----------------------------------------------------------------------------
+// Whether the translucent panel is the right place for the measurements: in
+// panel view, with the measurements on, and only where the trace area is ours
+// to composite into (the spectrum and the calibration screen draw their own)
+static bool mpanel_wanted(void)
+{
+  // The calibration screen draws its own trace but goes through the same
+  // sweep, so the band is available there too - and that is where a hint is
+  // worth more than a measurement
+  if (g_autocal_active)
+    return true; // it is talking to the user through the band
+
+  if (scope_calibration_mode)
+    return g_calib_hint;
+
+  return config.measure_display && !g_fft_mode &&
+      config.measure_panel_mode == 0;
+}
+
+//-----------------------------------------------------------------------------
 static void mpanel_set_active(bool active)
 {
   if (active == g_mpanel_active)
@@ -963,14 +1192,37 @@ static void mpanel_set_active(bool active)
 }
 
 //-----------------------------------------------------------------------------
+// Put fixed text in the panel. mpanel_update() derives its two lines from the
+// measurements; this is for text that is chosen rather than measured, like
+// the calibration hint, and it rebuilds only when the text actually changes.
+static void mpanel_set_lines(const char *l0, const char *l1)
+{
+  if (0 == strcmp(l0, g_mpanel_line[0]) && 0 == strcmp(l1, g_mpanel_line[1]))
+    return;
+
+  strncpy(g_mpanel_line[0], l0, MPANEL_TEXT_MAX);
+  strncpy(g_mpanel_line[1], l1, MPANEL_TEXT_MAX);
+  g_mpanel_line[0][MPANEL_TEXT_MAX] = 0;
+  g_mpanel_line[1][MPANEL_TEXT_MAX] = 0;
+
+  memset(g_mpanel_mask, 0, sizeof(g_mpanel_mask));
+  mpanel_render_text(0, g_mpanel_line[0]);
+  mpanel_render_text(1, g_mpanel_line[1]);
+
+  g_mpanel_builds++;
+  g_mpanel_paints++;
+  overlay_repaint_region(MPANEL_ROW0, MPANEL_H);
+}
+
+//-----------------------------------------------------------------------------
 // Rebuild the panel text from the selected metrics; on change, re-render the
 // mask and invalidate the affected columns
 static void mpanel_update(void)
 {
   ScopeMeasure sm;
-  char items[7][22];
+  MeasureItem items[MEASURE_ITEMS_MAX];
   char line[2][MPANEL_TEXT_MAX + 2];
-  int n = 0;
+  int n;
   static int throttle = 0;
   static int heartbeat = 0;
 
@@ -980,7 +1232,6 @@ static void mpanel_update(void)
   if (!g_mpanel_force && ++throttle < 5)
     return;
 
-  g_mpanel_force = false;
   throttle = 0;
 
   // Unthrottled: this runs at 2 Hz anyway, and the 10 Hz recompute throttle
@@ -988,51 +1239,13 @@ static void mpanel_update(void)
   if (!capture_get_measurements_fresh(&sm))
     return;
 
-  // A config saved before these flags existed reads all-false: default set
-  bool any = config.show_vpp || config.show_freq || config.show_duty ||
-      config.show_vrms || config.show_vavg || config.show_type || config.show_thd;
+  // Only now: nothing was rebuilt, so a request made before the first
+  // acquisition landed - which is every entry into the scope - still stands.
+  // Consuming it here used to cost the panel up to half a second of the
+  // throttle before it first appeared.
+  g_mpanel_force = false;
 
-  bool s_vpp  = any ? config.show_vpp  : true;
-  bool s_freq = any ? config.show_freq : true;
-  bool s_duty = any ? config.show_duty : true;
-  bool s_vrms = any ? config.show_vrms : true;
-  bool s_vavg = any && config.show_vavg;
-  bool s_type = any && config.show_type;
-  bool s_thd  = any && config.show_thd;
-
-  if (s_vpp)
-    snprintf(items[n++], 22, "Vpp%s", format_voltage(sm.vpp_mv, false));
-
-  if (s_freq)
-    snprintf(items[n++], 22, "f %s", format_frequency(sm.frequency));
-
-  if (s_duty)
-    snprintf(items[n++], 22, "%s", format_duty(sm.duty_x10));
-
-  if (s_vrms)
-    snprintf(items[n++], 22, "rms%s", format_voltage(sm.vrms_mv, false));
-
-  if (s_vavg)
-    snprintf(items[n++], 22, "avg%s", format_voltage(sm.vavg_mv, false));
-
-  if (s_type || s_thd)
-  {
-    signal_info_update();
-
-    if (s_type)
-      snprintf(items[n++], 22, "%s", classify_name(g_signal_class.type));
-
-    if (s_thd && g_signal_class.thd_x10 >= 0)
-      snprintf(items[n++], 22, "t%d.%d%%",
-          g_signal_class.thd_x10 / 10, g_signal_class.thd_x10 % 10);
-  }
-
-  // Never end up with nothing to draw: an empty mask paints an empty band
-  // that no repaint can heal, because the text it is compared against is
-  // empty too. Reachable with only THD selected and no spectrum to take it
-  // from, and it is what a blank panel would look like for any other reason.
-  if (n == 0)
-    snprintf(items[n++], 22, "Vpp%s", format_voltage(sm.vpp_mv, false));
+  n = measure_build_items(&sm, items);
 
   // Flow the items across the two lines
   line[0][0] = 0;
@@ -1040,7 +1253,7 @@ static void mpanel_update(void)
 
   for (int i = 0, li = 0; i < n && li < 2; i++)
   {
-    if (strlen(line[li]) + strlen(items[i]) + 2 > MPANEL_TEXT_MAX)
+    if (strlen(line[li]) + strlen(items[i].panel) + 2 > MPANEL_TEXT_MAX)
     {
       if (++li >= 2)
         break;
@@ -1049,7 +1262,7 @@ static void mpanel_update(void)
     if (line[li][0])
       strcat(line[li], "  ");
 
-    strcat(line[li], items[i]);
+    strcat(line[li], items[i].panel);
   }
 
   if (0 == strcmp(line[0], g_mpanel_line[0]) &&
@@ -1083,22 +1296,64 @@ static void mpanel_update(void)
 }
 
 //-----------------------------------------------------------------------------
+// Pixel width of a string in the current font: the half-space is half a glyph,
+// so counting characters is not the same thing
+static int text_width(const char *str)
+{
+  int glyph = (FONT_LARGE)->width; // FONT_LARGE is &font, so -> needs the parens
+  int w = 0;
+
+  for (; *str; str++)
+    w += (FONT_HALF_SPACE == *str) ? glyph / 2 : glyph;
+
+  return w;
+}
+
+//-----------------------------------------------------------------------------
+// One status-line slot: the metric's one-character tag, then its value. The
+// widths are remembered per slot so a shorter value erases the tail of the
+// longer one it replaces - the metrics on show are the user's choice now, and
+// they change under the slot without waiting for a page flip to wipe it.
+static void measure_slot(int slot, int x, const char *tag, const char *value,
+    int color)
+{
+  static int prev_w[MEASURE_LINE_SLOTS];
+  int w = text_width(value);
+
+  lcd_set_color(BG_COLOR, MEASURE_MODE_COLOR);
+  lcd_puts(x, STATUS_LINE_Y, tag);
+
+  lcd_set_color(BG_COLOR, color);
+  lcd_puts(x + MEASURE_TAG_W, STATUS_LINE_Y, value);
+
+  if (prev_w[slot] > w)
+    lcd_fill_rect(x + MEASURE_TAG_W + w, STATUS_LINE_Y, prev_w[slot] - w,
+        STATUS_LINE_HEIGHT, BG_COLOR);
+
+  prev_w[slot] = w;
+}
+
+//-----------------------------------------------------------------------------
 // Measurements come from the full capture record (measure.c): mid-level
-// crossing frequency with adaptive hysteresis, true RMS, duty cycle. Two
-// pages alternate: [M] Vpp + frequency, [R] Vrms + duty. In FFT mode the
-// slot shows [F] Vpp + spectrum peak frequency instead.
+// crossing frequency with adaptive hysteresis, true RMS, duty cycle. The
+// status line has room for two of them in the large font, and which two is
+// set per slot in the Measurements menu - nothing rotates, a slot shows the
+// metric it was given. In FFT mode the same space shows the spectrum readout.
 static void fft_format_hz(char *buf, int size, float hz);
 static void fft_format_db(char *buf, int size, float db);
 
 static void draw_measure(void)
 {
   ScopeMeasure sm;
-  char *str;
+  static const int slot_x[MEASURE_LINE_SLOTS] =
+      { MEASURE_SLOT_0_X, MEASURE_SLOT_1_X };
+  static const int slot_color[MEASURE_LINE_SLOTS] =
+      { MEASURE_VOLTAGE_COLOR, MEASURE_FREQ_COLOR };
 
-  if (g_toast_active || g_calibration_mode || g_mpanel_active)
+  if (g_toast_active || scope_calibration_mode)
     return;
 
-  if (!config.measure_display && !g_fft_mode)
+  if (!measure_owns_status_line())
     return;
 
   if (g_fft_mode)
@@ -1146,49 +1401,17 @@ static void draw_measure(void)
   if (!capture_get_measurements(&sm))
     return;
 
-  lcd_set_color(BG_COLOR, MEASURE_MODE_COLOR);
-
-  if (g_measure_page == 0)
+  for (int i = 0; i < MEASURE_LINE_SLOTS; i++)
   {
-    lcd_putc(140, STATUS_LINE_Y, 'M');
+    MeasureItem item;
 
-    str = format_voltage(sm.vpp_mv, false);
-    lcd_set_color(BG_COLOR, MEASURE_VOLTAGE_COLOR);
-    lcd_puts(148, STATUS_LINE_Y, str);
-
-    str = format_frequency(sm.frequency);
-    lcd_set_color(BG_COLOR, MEASURE_FREQ_COLOR);
-    lcd_puts(236, STATUS_LINE_Y, str);
-  }
-  else if (g_measure_page == 1)
-  {
-    lcd_putc(140, STATUS_LINE_Y, 'R');
-
-    str = format_voltage(sm.vrms_mv, false);
-    lcd_set_color(BG_COLOR, MEASURE_VOLTAGE_COLOR);
-    lcd_puts(148, STATUS_LINE_Y, str);
-
-    lcd_set_color(BG_COLOR, MEASURE_FREQ_COLOR);
-    lcd_puts(236, STATUS_LINE_Y, format_duty(sm.duty_x10));
-  }
-  else
-  {
-    char thd[10];
-
-    signal_info_update();
-
-    lcd_putc(140, STATUS_LINE_Y, 'S');
-
-    lcd_set_color(BG_COLOR, MEASURE_VOLTAGE_COLOR);
-    lcd_puts(148, STATUS_LINE_Y, classify_name(g_signal_class.type));
-
-    if (g_signal_class.thd_x10 >= 0)
-    {
-      snprintf(thd, sizeof(thd), "t%3d.%d%%",
-          g_signal_class.thd_x10 / 10, g_signal_class.thd_x10 % 10);
-      lcd_set_color(BG_COLOR, MEASURE_FREQ_COLOR);
-      lcd_puts(236, STATUS_LINE_Y, thd);
-    }
+    // A slot set to Off draws itself blank: the trigger readouts do not move
+    // in to share the space, so leaving the old glyphs there would be a
+    // reading that quietly stopped updating
+    if (measure_format(config.measure_line[i], &sm, &item))
+      measure_slot(i, slot_x[i], item.tag, item.value, slot_color[i]);
+    else
+      measure_slot(i, slot_x[i], " ", "", slot_color[i]);
   }
 }
 
@@ -1354,7 +1577,7 @@ static void update_sample_rate(void)
   int64_t window_offset;
   int64_t denom;
   int sample_rate = BASE_SAMPLE_RATE;
-  int sample_rate_limit;
+  int sample_rate_limit, record_period;
   int trigger_offset_px, window_offset_px, window_width_px;
   int sr_divider = config.sample_rate_limit;
 
@@ -1408,6 +1631,16 @@ static void update_sample_rate(void)
   g_mv_width_px = window_width_px;
 
   draw_miniview(trigger_offset_px, window_offset_px, window_width_px);
+
+  // Report the rate the record is actually captured at, not the ring's: the
+  // two differ by 4x whenever the screen needs more time than the full-rate
+  // window spans (see update_storage_window in capture.c), and that is the
+  // rate that decides whether an input aliases
+  record_period = capture_get_record_period();
+
+  if (record_period > 0)
+    sample_rate = (int)(1000000000ll / record_period);
+
   draw_sample_rates(sample_rate_limit, sample_rate);
 }
 
@@ -2022,6 +2255,38 @@ void scope_apply_trigger_level(void)
   config.trigger_level_mv = config.trigger_level * vs_px_value[config.vertical_scale];
 
   capture_set_trigger_level(config.trigger_level_mv);
+}
+
+//-----------------------------------------------------------------------------
+// The scope menu flipped scope_calibration_mode. Calibration needs a free
+// running acquisition to iterate on, so it takes the trigger over exactly
+// like scope_init() does when it starts in that mode; leaving gives it back
+// to the stored settings. The screen itself repaints when the menu closes.
+void scope_calibration_changed(void)
+{
+  g_calibration_parameter = CALIB_ZERO;
+  g_calib_hint = true;      // a fresh entry starts explained
+  g_calib_hint_param = -1;
+
+  if (scope_calibration_mode)
+  {
+    capture_set_trigger_edge(TRIGGER_EDGE_RISE);
+    capture_set_trigger_mode(TRIGGER_MODE_AUTO);
+    capture_set_trigger_level(0);
+  }
+  else
+  {
+    capture_set_trigger_edge(config.trigger_edge);
+    capture_set_trigger_mode(config.trigger_mode);
+    capture_set_trigger_level(config.trigger_level_mv);
+  }
+
+  capture_start(); // a stopped scope has nothing to calibrate against
+
+  // Both the measurements panel and the FFT view step aside in calibration
+  // mode, so their claim on the status line has to be recomputed
+  g_mpanel_active = mpanel_wanted();
+  g_line_owner = measure_owns_status_line();
 }
 
 //-----------------------------------------------------------------------------
@@ -2870,10 +3135,416 @@ static void autoset_start(void)
 }
 
 //-----------------------------------------------------------------------------
-static void change_calibration_value(int delta, bool shift)
+// Auto-calibration against an OPEN input.
+//
+// Three of the four calibration parameters are derivable with nothing
+// connected, because each one is a statement about the instrument rather than
+// about a signal:
+//
+//   Z (calib_dac_zero)     the resting level has to read ZERO_POINT
+//   D (calib_channel_delta) the two converters have to agree on that level
+//   O (calib_dac_mult)     one position pixel has to move the trace one pixel
+//
+// The fourth, S (calib_vs_mult), is a volts-per-count claim and cannot be
+// checked without a reference amplitude - there is no calibrator output on
+// this board (doc/Hardware.md), so it stays manual.
+//
+// Every phase changes hardware and then has to wait for the change to reach a
+// record: capture_get_*_fresh() bypasses the display throttle but still hands
+// back whatever acquisition last completed, which for the first frames after
+// a DAC or attenuator change is the state from before it.
+//-----------------------------------------------------------------------------
+static void autocal_mark(void)
 {
+  g_autocal_gen = capture_get_generation();
+}
+
+//-----------------------------------------------------------------------------
+// The reference level the gain step aims at. Configs saved before the field
+// existed read zero; treat that as "never set" and offer a round number
+// rather than refusing to run.
+int scope_calib_ref_mv(void)
+{
+  if (config.calib_ref_mv < CALIB_REF_MIN_MV ||
+      config.calib_ref_mv > CALIB_REF_MAX_MV)
+    return CALIB_REF_DEFAULT_MV;
+
+  return config.calib_ref_mv;
+}
+
+//-----------------------------------------------------------------------------
+// Say what is happening and what it needs. A calibration that silently
+// rearranges four numbers and then declares victory is worth nothing: the
+// user has no way to tell a good run from a broken one, or to know what it
+// did NOT do.
+static void autocal_say(const char *l0, const char *l1)
+{
+  // The panel band, not the status line: two lines of fifty characters is
+  // enough to say what to DO, and the status line is not. mpanel_wanted()
+  // hands the band over for the duration of a run.
+  mpanel_set_active(true);
+  mpanel_set_lines(l0, l1);
+}
+
+//-----------------------------------------------------------------------------
+static bool autocal_ready(void)
+{
+  return (capture_get_generation() - g_autocal_gen) >= AUTOCAL_SETTLE;
+}
+
+//-----------------------------------------------------------------------------
+static void autocal_set_position(int px)
+{
+  config.vertical_position = px;
+  config.vertical_position_mv = px * vs_px_value[config.vertical_scale];
+
+  capture_set_vertical_parameters();
+  autocal_mark();
+}
+
+//-----------------------------------------------------------------------------
+// Restore the user's settings and report. It stays "active" so the band and
+// the keyboard remain ours until the result has actually been read - a
+// message that vanishes on its own is a message nobody saw.
+static void autocal_finish(bool ok)
+{
+  g_autocal_phase = ACAL_DONE;
+  g_autocal_timer = TIMER_DISABLE;
+
+  autoset_set_horizontal(g_autocal_saved_hs);
+  autoset_set_scale(g_autocal_saved_vs);
+  autocal_set_position(g_autocal_saved_vpos);
+
+  config.sample_rate_limit = g_autocal_saved_srl;
+  config.trigger_mode = g_autocal_saved_tmode;
+
+  capture_set_trigger_mode(config.trigger_mode);
+  update_sample_rate();
+  draw_trigger_mode();
+  refresh_view();
+  mpanel_invalidate();
+
+  // Name what is still manual. "Calibrated" on its own would be a lie: the
+  // gain is untouched, and it is the one the readings actually depend on.
+  if (ok)
+    autocal_say(g_autocal_did_gain ?
+        "Done: zero, delta, DAC step and gain are set" :
+        "Done: zero, delta and DAC step are set",
+        g_autocal_did_gain ? "Gain applies to this range only.  MODE closes" :
+        "Gain (S) was skipped.  MODE closes");
+  else
+    autocal_say("Stopped. Settings put back unchanged.",
+        "MODE closes");
+}
+
+//-----------------------------------------------------------------------------
+// The result has been read: give the band and the keyboard back
+static void autocal_close(void)
+{
+  g_autocal_active = false;
+
+  mpanel_set_active(mpanel_wanted());
+  mpanel_invalidate();
+  refresh_view();
+}
+
+//-----------------------------------------------------------------------------
+static void autocal_advance(void)
+{
+  Measure m;
+
+  if (ACAL_ZERO == g_autocal_phase)
+  {
+    int err;
+
+    // Bisect the offset DAC's zero point. Raw counts rise with it, so the
+    // bracket halves cleanly, and single-channel means this is ADC B on its
+    // own - bringing ADC A to the same level is the next phase's job.
+    if (!capture_get_raw_measure_fresh(&m))
+      return;
+
+    err = (m.mean_c100 < 0) ? -m.mean_c100 : m.mean_c100;
+
+    if (err <= AUTOCAL_ZERO_TOL || (g_autocal_hi - g_autocal_lo) <= 1)
+    {
+      g_autocal_phase = ACAL_DELTA;
+      config.sample_rate_limit = 0; // dual channel: both converters visible
+      update_sample_rate();
+      autocal_mark();
+      autocal_say("Step 2 of 3: matching the two ADCs",
+          "Keep the input shorted");
+      return;
+    }
+
+    if (m.mean_c100 > 0)
+      g_autocal_hi = config.calib_dac_zero;
+    else
+      g_autocal_lo = config.calib_dac_zero;
+
+    config.calib_dac_zero = (g_autocal_lo + g_autocal_hi) / 2;
+    capture_set_vertical_parameters();
+    autocal_mark();
+    return;
+  }
+
+  if (ACAL_DELTA == g_autocal_phase)
+  {
+    int a, b;
+
+    // The means come back RAW, with no delta applied, so the correction is
+    // absolute rather than incremental. buffer_reverse adds the delta to
+    // ADC A, so it has to make up A's shortfall against B.
+    if (capture_get_channel_means(&a, &b))
+    {
+      int delta = (b - a + ((b > a) ? 50 : -50)) / 100;
+
+      if (delta < -64)
+        delta = -64;
+      else if (delta > 64)
+        delta = 64;
+
+      config.calib_channel_delta = delta;
+    }
+
+    g_autocal_phase = ACAL_DAC;
+    g_autocal_range = 0;
+    g_autocal_sub = 0;
+    autoset_set_scale(0);
+    autocal_set_position(0);
+    autocal_say("Step 3 of 3: DAC step, range 1 of 8",
+        "Keep the input shorted");
+    return;
+  }
+
+  if (ACAL_DAC == g_autocal_phase)
+  {
+    int target_x100, observed_x100;
+
+    if (!capture_get_raw_measure_fresh(&m))
+      return;
+
+    if (g_autocal_sub == 0)
+    {
+      g_autocal_ref = m.mean_c100;
+      g_autocal_sub = 1;
+      autocal_set_position(AUTOCAL_DAC_PX);
+      return;
+    }
+
+    // One position pixel must move the trace one screen pixel, and a screen
+    // pixel is vs_px_value mV, which at this range is this many ADC counts
+    target_x100 = vs_px_value[g_autocal_range] * CALIB_MULTIPLIER * 100 /
+        config.calib_vs_mult[g_autocal_range];
+    observed_x100 = (m.mean_c100 - g_autocal_ref) / AUTOCAL_DAC_PX;
+
+    // The DAC is linear, so a single proportional correction is exact
+    if (observed_x100 > 0)
+    {
+      int64_t mult = (int64_t)config.calib_dac_mult[g_autocal_range] *
+          target_x100 / observed_x100;
+
+      if (mult < 0)
+        mult = 0;
+      else if (mult > 100000)
+        mult = 100000;
+
+      config.calib_dac_mult[g_autocal_range] = (int)mult;
+    }
+
+    g_autocal_range++;
+    g_autocal_sub = 0;
+
+    if (g_autocal_range >= VS_COUNT)
+    {
+      char msg[52];
+
+      // Gain is per range, so it belongs on the range the user chose before
+      // starting - not on whichever one the sweep above ended at. Position
+      // back to zero: the reading is taken against the centre line.
+      autoset_set_scale(g_autocal_saved_vs);
+      autocal_set_position(0);
+
+      g_autocal_phase = ACAL_ASK_REF;
+      g_autocal_timer = TIMER_DISABLE; // connecting a source takes as long as it takes
+
+      snprintf(msg, sizeof(msg), "Now apply %s DC to the input",
+          format_voltage(scope_calib_ref_mv(), false));
+      autocal_say(msg, "MODE continues   STOP finishes here");
+      return;
+    }
+
+    {
+      char msg[40];
+
+      snprintf(msg, sizeof(msg), "Step 3 of 3: DAC step, range %d of 8",
+          g_autocal_range + 1);
+      autocal_say(msg, "Keep the input shorted");
+    }
+
+    autoset_set_scale(g_autocal_range);
+    autocal_set_position(0);
+    return;
+  }
+
+  if (ACAL_SCALE == g_autocal_phase)
+  {
+    int ref_mv = scope_calib_ref_mv();
+    int counts_x100, reading_mv;
+    int64_t mult;
+
+    if (!capture_get_raw_measure_fresh(&m))
+      return;
+
+    counts_x100 = m.mean_c100;
+
+    // The reference has to actually be there, and it has to fit on the ADC.
+    // Calibrating gain against a clipped or near-zero reading would scale the
+    // whole range by a made-up number and quietly ruin it.
+    if (m.vmax >= 254 || m.vmin <= 1)
+    {
+      autocal_say("Signal is clipping - pick a coarser V/div",
+          "MODE closes");
+      g_autocal_phase = ACAL_DONE;
+      return;
+    }
+
+    if (counts_x100 < CALIB_REF_MIN_COUNTS * 100)
+    {
+      autocal_say("Reading too small or wrong polarity",
+          "Check the level and the range.  MODE closes");
+      g_autocal_phase = ACAL_DONE;
+      return;
+    }
+
+    reading_mv = (int)((int64_t)counts_x100 *
+        config.calib_vs_mult[config.vertical_scale] / CALIB_MULTIPLIER / 100);
+
+    if (reading_mv <= 0)
+    {
+      autocal_say("Reading too small or wrong polarity",
+          "Check the level and the range.  MODE closes");
+      g_autocal_phase = ACAL_DONE;
+      return;
+    }
+
+    // Gain is a straight multiplier, so one proportional step lands exactly
+    mult = (int64_t)config.calib_vs_mult[config.vertical_scale] * ref_mv /
+        reading_mv;
+
+    if (mult < 1)
+      mult = 1;
+    else if (mult > 4000000)
+      mult = 4000000;
+
+    config.calib_vs_mult[config.vertical_scale] = (int)mult;
+    config.vertical_mult = (int)mult;
+    g_autocal_did_gain = true;
+
+    autocal_finish(true);
+    return;
+  }
+
+  autocal_finish(true);
+}
+
+//-----------------------------------------------------------------------------
+static void autocal_step(void)
+{
+  // Both ends of the run are conversations, not measurements
+  if (ACAL_ASK == g_autocal_phase || ACAL_ASK_REF == g_autocal_phase ||
+      ACAL_DONE == g_autocal_phase)
+  {
+    update_display(); // just keep the trace alive under the message
+    return;
+  }
+
+  if (autocal_ready())
+    autocal_advance();
+
+  // EVERY path has to release the frame. update_storage_buffer() refills the
+  // storage record only once the previous one has been consumed, so a step
+  // that merely reads a measurement and returns freezes acquisition on that
+  // one frame - and the generation counter this machine waits on stops with
+  // it, deadlocking until the timeout. autocal_finish() repaints on its own.
+  if (g_autocal_active)
+    update_display();
+}
+
+//-----------------------------------------------------------------------------
+void scope_autocal_start(void)
+{
+  g_autocal_saved_hs    = config.horizontal_scale;
+  g_autocal_saved_vs    = config.vertical_scale;
+  g_autocal_saved_vpos  = config.vertical_position;
+  g_autocal_saved_srl   = config.sample_rate_limit;
+  g_autocal_saved_tmode = config.trigger_mode;
+
+  g_autocal_active = true;
+  g_autocal_phase  = ACAL_ASK;
+  g_autocal_did_gain = false;
+
+  // Ask first, touch nothing yet. autocal_begin() sets up the run itself,
+  // once there is something worth running against. Every phase below measures the instrument
+  // against itself, and all three of them are only meaningful with a quiet
+  // input - so the one thing this cannot do without is the user shorting it.
+  // No timer while it waits: fetching a wire takes as long as it takes.
+  g_autocal_timer = TIMER_DISABLE;
+  autocal_say("Short the BNC to ground (or unplug the probe)",
+      "MODE starts   STOP cancels");
+}
+
+//-----------------------------------------------------------------------------
+// The user confirmed: from here on it drives the hardware itself
+static void autocal_begin(void)
+{
+  g_autocal_timer = AUTOCAL_TIMEOUT;
+  g_autocal_phase = ACAL_ZERO;
+  g_autocal_sub = 0;
+  g_autocal_lo = CALIB_DAC_ZERO_MIN;
+  g_autocal_hi = CALIB_DAC_ZERO_MAX;
+
+  // Free-running acquisition on a short record, trace centred, and the single
+  // converter first. AUTO trigger guarantees frames even with a flat input,
+  // which every phase here depends on.
+  config.trigger_mode = TRIGGER_MODE_AUTO;
+  config.sample_rate_limit = 1; // single channel: ADC B alone
+  config.calib_dac_zero = (g_autocal_lo + g_autocal_hi) / 2;
+
+  capture_set_trigger_mode(config.trigger_mode);
+  autoset_set_horizontal(AUTOCAL_HS);
+  autoset_set_scale(0);
+  autocal_set_position(0);
+  update_sample_rate();
+  capture_start();
+
+  draw_trigger_mode();
+  autocal_say("Step 1 of 3: zeroing the offset DAC",
+      "Keep the input shorted");
+}
+
+//-----------------------------------------------------------------------------
+static void change_calibration_value(int delta, bool shift, bool repeat)
+{
+  // Gain and DAC step live in the thousands, so a fixed step of one turns a
+  // 4% correction into two hundred keypresses. Accelerate on auto-repeat,
+  // and only there: a single press still has to be able to land on an exact
+  // value. Zero and delta have small ranges and stay fine-grained.
+  if (repeat)
+  {
+    if (CALIB_SCALE == g_calibration_parameter ||
+        CALIB_OFFSET == g_calibration_parameter)
+      delta *= 16;
+    else if (CALIB_ZERO == g_calibration_parameter)
+      delta *= 4;
+  }
+
   if (shift)
   {
+    if (repeat)
+      return; // holding SHIFT+TRIG would otherwise race through all four
+
+    g_calib_hint = true; // every step explains itself, even if the last was hidden
+
     if (g_calibration_parameter == CALIB_OFFSET)
       g_calibration_parameter = CALIB_ZERO;
     else
@@ -2888,10 +3559,10 @@ static void change_calibration_value(int delta, bool shift)
   {
     config.calib_dac_zero += delta;
 
-    if (config.calib_dac_zero < 1900)
-      config.calib_dac_zero = 1900;
-    else if (config.calib_dac_zero > 2200)
-      config.calib_dac_zero = 2200;
+    if (config.calib_dac_zero < CALIB_DAC_ZERO_MIN)
+      config.calib_dac_zero = CALIB_DAC_ZERO_MIN;
+    else if (config.calib_dac_zero > CALIB_DAC_ZERO_MAX)
+      config.calib_dac_zero = CALIB_DAC_ZERO_MAX;
   }
   else if (g_calibration_parameter == CALIB_DELTA)
   {
@@ -2921,7 +3592,67 @@ static void change_calibration_value(int delta, bool shift)
       config.calib_dac_mult[config.vertical_scale] = 100000;
   }
 
-  capture_set_vertical_parameters();
+  scope_calib_apply(CALIB_ZERO == g_calibration_parameter ||
+      CALIB_OFFSET == g_calibration_parameter);
+}
+
+//-----------------------------------------------------------------------------
+// Re-apply a changed calibration value.
+//
+// Only the two parameters that feed the offset DAC need the hardware touched,
+// and touching it means dma_stop() / dma_start(). Doing that on every
+// auto-repeat tick restarts acquisition faster than a frame can complete,
+// which is why holding a key froze the screen - including on the gain, which
+// is a pure display multiplier and needs no hardware at all.
+void scope_calib_apply(bool touch_dac)
+{
+  config.vertical_mult = config.calib_vs_mult[config.vertical_scale];
+
+  // The trigger level is stored in mV and converted through the gain, so it
+  // has to follow it. This one does not restart the DMA.
+  capture_set_trigger_level(config.trigger_level_mv);
+
+  if (touch_dac)
+    capture_set_vertical_parameters();
+}
+
+//-----------------------------------------------------------------------------
+// Set the vertical range from the menu, so calibration values can be edited
+// per range without leaving it
+void scope_set_vertical_scale(int scale)
+{
+  change_vertical_scale(scale - config.vertical_scale);
+}
+
+//-----------------------------------------------------------------------------
+// What each calibration step actually wants, in the panel band over the
+// trace. Line 0 is the parameter and its precondition, line 1 is the same key
+// legend everywhere - 50 characters at 6 px is exactly the grid width, so
+// neither line may grow.
+static void calib_hint_update(void)
+{
+  static const char *const hint[] =
+  {
+    "Z: SHORT the input, 1 channel, aim avg at 128",
+    "D: SHORT the input, 2 channels, make A = B",
+    "S: min and max to a known level, raw 0xd0-0xf0",
+    "O: 1 position px = 1 screen px, per range",
+  };
+
+  mpanel_set_active(mpanel_wanted());
+
+  if (!g_calib_hint)
+  {
+    g_calib_hint_param = -1;
+    return;
+  }
+
+  if (g_calib_hint_param == g_calibration_parameter)
+    return;
+
+  g_calib_hint_param = g_calibration_parameter;
+  mpanel_set_lines(hint[g_calibration_parameter],
+      "TRIG_U/D set  SHIFT+TRIG next  AUTO all  MODE off");
 }
 
 //-----------------------------------------------------------------------------
@@ -2929,6 +3660,8 @@ static void draw_calibration_info(void)
 {
   static const char *labels[] = { "Z", "D", "S", "O" };
   char *str;
+
+  calib_hint_update();
 
   lcd_set_color(BG_COLOR, LCD_WHITE_COLOR);
 
@@ -2950,10 +3683,36 @@ static void draw_calibration_info(void)
         g_data_buffer.max[i] = rbit8(g_data_buffer.max[i]) + config.calib_channel_delta;
     }
 
+    // Four instantaneous samples of an untriggered ring slice is the worst
+    // possible readout to aim a value with: it is raw noise, taken from a
+    // different part of the ring every frame, which is why the number used to
+    // jump about at random. The per-converter MEANS are what the procedure
+    // actually asks for - 0x80 = 128 for zero, and equal to each other for
+    // delta - and averaging thousands of samples makes them hold still.
     if (!g_toast_active)
     {
-      str = format_raw_data(g_data_buffer.max, 4);
-      lcd_puts(CALIB_AREA_LEFT + 24, STATUS_LINE_Y, str);
+      char buf[20];
+      int a, b;
+
+      buf[0] = 0;
+
+      if (capture_get_channel_means(&a, &b))
+      {
+        // Show A as the record sees it, i.e. with the delta already applied:
+        // the goal is the two reading the same
+        snprintf(buf, sizeof(buf), "A%4d B%4d",
+            (a + 50) / 100 + config.calib_channel_delta, (b + 50) / 100);
+      }
+      else
+      {
+        Measure raw;
+
+        if (capture_get_raw_measure(&raw))
+          snprintf(buf, sizeof(buf), "avg%4d", raw.mean_c100 / 100 + ZERO_POINT);
+      }
+
+      if (buf[0])
+        lcd_puts(CALIB_AREA_LEFT + 24, STATUS_LINE_Y, buf);
     }
 
     #define PIXEL_SIZE 15
@@ -2992,6 +3751,12 @@ static void draw_calibration_info(void)
     int vmax = g_data_buffer.max_value;
     int vpos = g_data_buffer.vertical_position;
 
+    // Minimum and maximum, as the original procedure documents: "adjust until
+    // the minimum and maximum values in the status bar match the measured
+    // value". They only converge on a quiet instrument, though - a single
+    // sampling glitch drags them hundreds of millivolts apart - so the mean
+    // goes in the hint band underneath, where it can be aimed when they do
+    // not agree.
     if (!g_toast_active)
     {
       str = format_voltage(vmin - vpos, true);
@@ -3023,7 +3788,42 @@ void scope_buttons_handler(int buttons)
   bool shift  = (buttons & BTN_SHIFT);
   bool repeat = (buttons & BTN_REPEAT);
 
-  if (g_fft_mode && !g_calibration_mode)
+  // While auto-calibration is up it owns the keyboard: it is rewriting the
+  // vertical settings underneath, so letting anything else change them
+  // mid-run would silently corrupt the values it is deriving.
+  if (g_autocal_active)
+  {
+    if (repeat)
+      return;
+
+    if (ACAL_DONE == g_autocal_phase)
+      autocal_close();
+    else if (buttons & BTN_STOP)
+    {
+      // Stopping at the gain prompt is not a failure: zero, delta and the DAC
+      // step are already found and worth keeping
+      if (ACAL_ASK_REF == g_autocal_phase)
+        autocal_finish(true);
+      else
+        autocal_finish(false);
+    }
+    else if (buttons & BTN_MODE)
+    {
+      if (ACAL_ASK == g_autocal_phase)
+        autocal_begin();
+      else if (ACAL_ASK_REF == g_autocal_phase)
+      {
+        g_autocal_phase = ACAL_SCALE;
+        g_autocal_timer = AUTOCAL_TIMEOUT;
+        autocal_mark();
+        autocal_say("Step 4 of 4: gain", "Hold the level steady");
+      }
+    }
+
+    return;
+  }
+
+  if (g_fft_mode && !scope_calibration_mode)
   {
     if (fft_buttons(buttons, shift, repeat))
       return;
@@ -3079,7 +3879,7 @@ void scope_buttons_handler(int buttons)
 
   else if (buttons & BTN_TRIG)
   {
-    if (repeat || g_calibration_mode)
+    if (repeat || scope_calibration_mode)
       return;
 
     if (config.trigger_mode == TRIGGER_MODE_SINGLE)
@@ -3093,7 +3893,7 @@ void scope_buttons_handler(int buttons)
   }
   else if (buttons & BTN_EDGE)
   {
-    if (repeat || g_calibration_mode)
+    if (repeat || scope_calibration_mode)
       return;
 
     if (shift)
@@ -3136,8 +3936,8 @@ void scope_buttons_handler(int buttons)
   }
   else if (buttons & BTN_TRIG_UP)
   {
-    if (g_calibration_mode)
-      change_calibration_value(1, shift);
+    if (scope_calibration_mode)
+      change_calibration_value(1, shift, repeat);
     else if (shift)
       change_sample_rate_limit(1);
     else if (g_decode_mode && g_logic_have && g_logic.count > 0)
@@ -3154,8 +3954,8 @@ void scope_buttons_handler(int buttons)
   }
   else if (buttons & BTN_TRIG_DOWN)
   {
-    if (g_calibration_mode)
-      change_calibration_value(-1, shift);
+    if (scope_calibration_mode)
+      change_calibration_value(-1, shift, repeat);
     else if (shift)
       change_sample_rate_limit(-1);
     else if (g_decode_mode && g_logic_have && g_logic.count > 0)
@@ -3186,7 +3986,19 @@ void scope_buttons_handler(int buttons)
     if (repeat)
       return;
 
-    if (shift && !g_calibration_mode)
+    if (scope_calibration_mode)
+    {
+      // MODE hides the hint band. It comes back on the next parameter -
+      // see g_calib_hint.
+      g_calib_hint = !g_calib_hint;
+      g_calib_hint_param = -1;
+      calib_hint_update();
+      g_shadow_valid = false;
+      g_sweep_force = true;
+      return;
+    }
+
+    if (shift)
     {
       // SHIFT+MODE: toggle the FFT spectrum view
       g_fft_mode = !g_fft_mode;
@@ -3221,15 +4033,24 @@ void scope_buttons_handler(int buttons)
 
   else if (buttons & BTN_AUTO)
   {
-    if (repeat || g_calibration_mode || g_fft_mode)
+    if (repeat || g_fft_mode)
       return;
+
+    // Same promise as everywhere else on this key - "work it out yourself" -
+    // and in calibration mode the thing to work out is the calibration.
+    // Gain (S) is the one parameter it cannot do; the hint says so.
+    if (scope_calibration_mode)
+    {
+      scope_autocal_start();
+      return;
+    }
 
     autoset_start();
   }
 
   else if (buttons & BTN_50P)
   {
-    if (repeat || g_calibration_mode)
+    if (repeat || scope_calibration_mode)
       return;
 
     trigger_set_50_percent();
@@ -3251,7 +4072,7 @@ void scope_buttons_handler(int buttons)
 //-----------------------------------------------------------------------------
 void scope_init(bool calibration_mode)
 {
-  g_calibration_mode = calibration_mode;
+  scope_calibration_mode = calibration_mode;
 
   config.horizontal_period = hs_px_value[config.horizontal_scale];
   config.vertical_mult = config.calib_vs_mult[config.vertical_scale];
@@ -3263,6 +4084,17 @@ void scope_init(bool calibration_mode)
   g_sweep_force = true;
   g_vpos_marker.valid = false;
   g_trig_marker.valid = false;
+
+  // Settle the panel before anything paints. It decides who owns the status
+  // line, and it is a static that outlives the application: entering the scope
+  // a second time painted that line for the panel state of the previous
+  // session. The mask goes with it - the text in it is the old session's
+  // reading, and it would be composited into the first sweep.
+  g_mpanel_active = mpanel_wanted();
+  g_line_owner = measure_owns_status_line();
+  memset(g_mpanel_mask, 0, sizeof(g_mpanel_mask));
+  mpanel_invalidate();
+
   draw_grid_frame();
   draw_vertical_position(false);
   draw_trigger_mode();
@@ -3270,7 +4102,7 @@ void scope_init(bool calibration_mode)
   draw_status_line();
   redraw_trace();
 
-  if (g_calibration_mode)
+  if (scope_calibration_mode)
   {
     capture_set_trigger_edge(TRIGGER_EDGE_RISE);
     capture_set_trigger_mode(TRIGGER_MODE_AUTO);
@@ -3287,6 +4119,7 @@ void scope_init(bool calibration_mode)
   timer_add(&g_state_timer);
   timer_add(&g_measure_timer);
   timer_add(&g_autoset_timer);
+  timer_add(&g_autocal_timer);
   timer_add(&g_pan_settle_timer);
   timer_add(&g_fps_timer);
   timer_add(&g_fft_timer);
@@ -3361,7 +4194,9 @@ void scope_task(void)
     {
       g_fps_counter++;
 
-      if (g_calibration_mode)
+      if (g_autocal_active)
+        autocal_step();
+      else if (scope_calibration_mode)
         draw_calibration_info();
       else if (g_autoset_active)
         autoset_step();
@@ -3414,6 +4249,9 @@ void scope_task(void)
 
   if (g_autoset_active && g_autoset_timer == 0)
     autoset_abort(); // ran out of time: put the user's settings back
+
+  if (g_autocal_active && g_autocal_timer == 0)
+    autocal_finish(false); // same, and say so rather than claim success
 
   if (g_fps_timer == 0)
   {
@@ -3475,8 +4313,21 @@ void scope_task(void)
     }
   }
 
-  mpanel_set_active(config.measure_display && !g_fft_mode &&
-      !g_calibration_mode && config.measure_panel_mode == 0);
+  mpanel_set_active(mpanel_wanted());
+
+  // The view, the metric selection and the spectrum key can all hand the
+  // right-hand end of the status line from the trigger readouts to the
+  // measurements and back. Neither side repaints on its own, so watch the
+  // ownership itself: whoever holds it now has to paint it, and the loser's
+  // glyphs have to go. A toast owns the whole line while it is up and
+  // rebuilds it from scratch when it expires.
+  if (measure_owns_status_line() != g_line_owner)
+  {
+    g_line_owner = measure_owns_status_line();
+
+    if (!g_toast_active)
+      draw_status_line();
+  }
 
   // measure_display can also be flipped from the system menu, which does not
   // know about our timer: keep the timer state in sync here
@@ -3485,28 +4336,23 @@ void scope_task(void)
   else if (!config.measure_display && TIMER_DISABLE != g_measure_timer)
     g_measure_timer = TIMER_DISABLE;
 
-  if (config.measure_display && !g_fft_mode)
+  // In calibration mode the panel band carries the hint instead, so the
+  // measurement builder must not overwrite it
+  if (config.measure_display && !g_fft_mode && !scope_calibration_mode &&
+      !g_autocal_active)
   {
     if (g_measure_timer == 0)
     {
       g_measure_timer = MEASURE_UPDATE_TIMEOUT;
 
+      // The two views are independent and can both be on: the panel lists a
+      // set of metrics compactly, the status line puts two of them in the
+      // large font. Repeating a value between them is the user's call.
       if (g_mpanel_active)
-      {
         mpanel_update();
-      }
-      else if (!g_toast_active)
-      {
-        if (++g_measure_page_tick >= MEASURE_PAGE_TICKS)
-        {
-          g_measure_page_tick = 0;
-          g_measure_page = (g_measure_page + 1) % MEASURE_PAGES;
-          // Page layouts differ; wipe the slot so no stale glyphs survive
-          lcd_fill_rect(140, STATUS_LINE_Y, GRID_RIGHT + 1 - 140, STATUS_LINE_HEIGHT, BG_COLOR);
-        }
 
+      if (measure_owns_status_line() && !g_toast_active)
         draw_measure();
-      }
     }
   }
 }

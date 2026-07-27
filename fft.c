@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <math.h>
 #include "fft.h"
 
@@ -352,15 +353,125 @@ static float comb_tolerance(float f, float freq, float bin_hz)
 // peak and every subharmonic of it is a candidate; on a tie the higher
 // frequency wins, or f0/2 (which explains the same peaks) would always be
 // just as good an answer.
+// Interleave-mirror veto. The record comes from two time-interleaved
+// converters, and any residual gain or timing mismatch between them puts a
+// spur at EXACTLY nyquist - f for an input at f. That spur builds perfectly
+// convincing combs: with a 50 MHz input the 12.5 MHz line "explains" 12.5
+// and 50 and outscores the real tone - and merely banning 12.5 as a
+// candidate is not enough, because the spur then boosts 6.25 (= 50/8, spur
+// = its 2nd harmonic) instead. So the artifact PEAK itself is excluded from
+// comb building altogether: a peak whose mirror partner at nyquist - f is
+// much stronger is the mismatch image of that partner, never a signal. The
+// real input survives the test, because its own mirror is the weak one.
+static void flag_interleave_mirrors(const FftPeak *peak, int count,
+    float bin_hz, bool *skip)
+{
+  float nyquist = bin_hz * FFT_BINS;
+  float tol = 3.0f * bin_hz;
+
+  for (int i = 0; i < count; i++)
+  {
+    skip[i] = false;
+
+    for (int j = 0; j < count; j++)
+    {
+      if (fabsf(peak[i].freq + peak[j].freq - nyquist) <= tol &&
+          peak[j].mag > 2.0f * peak[i].mag)
+        skip[i] = true;
+    }
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Where a harmonic at f is OBSERVED in a spectrum bounded by nyquist: content
+// above it folds back (125 MS/s puts the 2nd harmonic of 33.33 MHz at
+// |125 - 66.67| = 58.33). Mirror-fold into [0, nyquist].
+static float fold_freq(float f, float nyquist)
+{
+  float r = fmodf(f, 2.0f * nyquist);
+
+  return (r > nyquist) ? (2.0f * nyquist - r) : r;
+}
+
+//-----------------------------------------------------------------------------
+// Smallest harmonic number n (1..FFT_MAX_HARM) of fundamental f whose
+// OBSERVED position matches freq, or 0. In-band harmonics match directly;
+// harmonics beyond nyquist match at their folded position - without that, an
+// RF fundamental cannot explain its own distortion products, and the comb
+// crowns the alias lattice instead (33.33 MHz in, harmonics observed at
+// 58.33 and 8.33, everything divisible by 8.33 -> "F0 = 8.33 MHz").
+//
+// Folded matching is capped at n <= 4, and the cap is what keeps the fold
+// honest. Real distortion is strong at low orders, and an uncapped fold
+// makes "everything explain everything" on the alias lattice - measured on
+// both failure modes: 58.33 claimed 33.33 as its folded 7TH harmonic, tied
+// the true comb's score and won the higher-f tie-break; at mains rates 150
+// claimed 50 the same way. In-band matching keeps the full range: a 12th
+// harmonic you can SEE at its true position is real evidence.
+#define FOLDED_MAX_HARM 4
+
+// Comb evidence is weighted by 1/sqrt(n): energy explained at a LOW
+// harmonic order counts for more than the same energy explained at a high
+// one, because physical distortion falls with order - a comb that needs its
+// 7th harmonic to account for the dominant line is suspicious by
+// construction. One rule, and it settles both hardware-measured failures:
+//   - {25, 50}: "f0=25, in-band h2" vs "f0=50, folded h2" explain the same
+//     peaks with the same energy and used to tie (the higher-f tie-break
+//     then read a clean 25 MHz square as "F0 = 50.01, THD 999.9%"); with
+//     order weighting the true comb holds its dominant peak at n=1 and wins.
+//   - 33.33: the alias lattice pitch 8.33 explains everything IN BAND (n=1,
+//     4, 7) while the truth needs folds - a flat fold discount crowned the
+//     lattice; order weighting makes n=7 evidence cheap and 33.33 wins.
+// It also turns the f0-vs-f0/2 subharmonic tie into a strict win for f0:
+// halving the candidate doubles every n, scaling the whole score by 0.71.
+
+static int harmonic_number(float f, float freq, float nyquist, float bin_hz,
+    bool *folded)
+{
+  for (int n = 1; n <= FFT_MAX_HARM; n++)
+  {
+    float hf = (float)n * f;
+    float seen = hf;
+    bool fold = false;
+
+    if (hf > nyquist)
+    {
+      if (n > FOLDED_MAX_HARM)
+        return 0; // hf only grows: nothing below can match anymore
+
+      seen = fold_freq(hf, nyquist);
+      fold = true;
+    }
+
+    if (fabsf(freq - seen) <= comb_tolerance(f, freq, bin_hz))
+    {
+      if (folded)
+        *folded = fold;
+
+      return n;
+    }
+  }
+
+  return 0;
+}
+
+//-----------------------------------------------------------------------------
 static float find_fundamental(const FftPeak *peak, int count, float bin_hz,
     int *matched_out)
 {
+  bool skip[FFT_MAX_PEAKS];
+  float nyquist = bin_hz * FFT_BINS;
   float best_f = 0.0f;
   float best_score = 0.0f;
   int best_matched = 0;
 
+  flag_interleave_mirrors(peak, count, bin_hz, skip);
+
   for (int i = 0; i < count; i++)
   {
+    if (skip[i])
+      continue;
+
     for (int k = 1; k <= COMB_MAX_DIVISOR; k++)
     {
       float f = peak[i].freq / (float)k;
@@ -372,14 +483,18 @@ static float find_fundamental(const FftPeak *peak, int count, float bin_hz,
 
       for (int j = 0; j < count; j++)
       {
-        int n = (int)(peak[j].freq / f + 0.5f);
+        bool folded;
+        int n;
 
-        if (n < 1 || n > FFT_MAX_HARM)
-          continue;
+        if (skip[j])
+          continue; // a mirror artifact neither anchors nor scores a comb
 
-        if (fabsf(peak[j].freq - (float)n * f) <= comb_tolerance(f, peak[j].freq, bin_hz))
+        n = harmonic_number(f, peak[j].freq, nyquist, bin_hz, &folded);
+        (void)folded;
+
+        if (n > 0)
         {
-          score += peak[j].mag;
+          score += peak[j].mag / sqrtf((float)n);
           matched++;
         }
       }
@@ -449,24 +564,45 @@ void fft_analyze(const float *mag, int sample_period_ns, FftAnalysis *out)
   }
 
   for (int i = 0; i < out->count; i++)
-  {
-    int n = (int)(out->peak[i].freq / out->fundamental + 0.5f);
-    float tol = comb_tolerance(out->fundamental, out->peak[i].freq, bin_hz);
-
-    if (n >= 1 && n <= FFT_MAX_HARM &&
-        fabsf(out->peak[i].freq - (float)n * out->fundamental) <= tol)
-      out->peak[i].harmonic = n;
-  }
+    out->peak[i].harmonic = harmonic_number(out->fundamental,
+        out->peak[i].freq, out->nyquist_hz, bin_hz, NULL);
 
   // THD from the comb itself, not from the detected peaks: a harmonic that
-  // sits just under the peak-detection floor still contributes distortion
+  // sits just under the peak-detection floor still contributes distortion.
+  // Harmonics beyond nyquist are read at their FOLDED position - that is
+  // where their energy actually is - except when the fold lands back on the
+  // fundamental itself, where the two cannot be told apart.
+  // Two folds can land on the same bin (the 7th and 8th harmonic of
+  // 33.33 MHz both read 16.7 at 125 MS/s) - counting that energy twice
+  // would inflate the figure, so each bin contributes once
+  int f0_center = (int)(out->fundamental / bin_hz + 0.5f);
+  int used[FFT_MAX_HARM];
+  int used_n = 0;
+
   for (int n = 1; n <= FFT_MAX_HARM; n++)
   {
-    int center = (int)((float)n * out->fundamental / bin_hz + 0.5f);
+    int center = (int)(fold_freq((float)n * out->fundamental,
+        out->nyquist_hz) / bin_hz + 0.5f);
     float m = 0.0f;
+    bool dup = false;
+
+    if (n > 1 && abs(center - f0_center) <= 2)
+      continue;
 
     if (center < 1 || center >= FFT_BINS - 1)
-      break;
+      continue;
+
+    for (int u = 0; u < used_n; u++)
+    {
+      if (abs(center - used[u]) <= 2)
+        dup = true;
+    }
+
+    if (dup)
+      continue;
+
+    if (used_n < FFT_MAX_HARM)
+      used[used_n++] = center;
 
     for (int b = center - 2; b <= center + 2; b++)
     {

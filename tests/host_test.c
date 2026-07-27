@@ -6,8 +6,8 @@
  *
  * Build & run (no hardware needed), from the repository root:
  *   cc -O2 -I. tests/host_test.c measure.c fft.c classify.c uart_decode.c \
- *      logic_decode.c nec_decode.c onewire_decode.c ws2812_decode.c -lm \
- *      -o /tmp/scope_test && /tmp/scope_test
+ *      logic_decode.c nec_decode.c onewire_decode.c ws2812_decode.c \
+ *      record_window.c -lm -o /tmp/scope_test && /tmp/scope_test
  */
 
 #include <stdio.h>
@@ -19,6 +19,7 @@
 #include "fft.h"
 #include "classify.h"
 #include "logic_decode.h"
+#include "record_window.h"
 
 #define ZERO_POINT 128
 
@@ -712,6 +713,224 @@ int main(void)
     check_near("sine not 1-wire", onewire_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
     check_near("sine not ws2812", ws2812_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
     check_near("sine not nec", nec_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+  }
+
+  // ===== full-rate record window (record_window.c) =====
+  //
+  // The window is what makes a live record run at the ring's sample rate
+  // instead of a quarter of it. Its index arithmetic decides what every
+  // consumer is allowed to read, so sweep it rather than spot-check it.
+  {
+    enum { RING = 96 * 1024, WIN = 24 * 1024 };
+    int bad_invariant = 0, placed = 0, refused = 0;
+
+    printf("record window placement sweep:\n");
+
+    for (int trigger = 0; trigger < RING; trigger += 61)
+    {
+      // The trigger sits mid-record by construction (capture.c asks the DMA
+      // for CAPTURE_BUFFER_SIZE/2 + pan), but sweep it right around the ring
+      // anyway - a wrap must not be special
+      for (int shift = -RING/2; shift <= RING/2; shift += RING/8)
+      {
+        int offset = ((trigger + shift) % RING + RING) % RING;
+
+        for (int span = 1; span < 3 * WIN; span = span * 3 + 1)
+        {
+          RecordWindow w;
+          int lo = -span, hi = span;
+          int d, tpos;
+
+          if (!record_window_place(RING, offset, trigger, WIN, lo, hi, &w))
+          {
+            refused++;
+            continue;
+          }
+
+          placed++;
+          tpos = -w.start;
+
+          // 1. the trigger is strictly inside, so index 0 is addressable and
+          //    trigger != offset (which the ring math reads as "one past the
+          //    newest sample")
+          if (tpos < 1 || tpos > WIN - 1)
+            bad_invariant++;
+
+          // 2. the window covers everything the screen asked for
+          if (w.start > lo || w.start + WIN - 1 < hi)
+            bad_invariant++;
+
+          // 3. the source is word-aligned: the copy moves words, and a byte's
+          //    parity in the ring is the ADC it came from
+          if ((w.src & 3) || w.src < 0 || w.src >= RING)
+            bad_invariant++;
+
+          // 4. every sample of the window is inside the ring's live record -
+          //    counting forward from the oldest sample, none may run past the
+          //    newest one
+          d = ((w.src - offset) % RING + RING) % RING;
+
+          if (d + WIN > RING)
+            bad_invariant++;
+
+          // 5. ...and the trigger lands where the window says it does
+          if ((d + tpos) % RING != ((trigger - offset) % RING + RING) % RING)
+            bad_invariant++;
+        }
+      }
+    }
+
+    check_near("placements attempted", placed > 0, 1, 0);
+    check_near("wider than window refused", refused > 0, 1, 0);
+    check_near("invariant violations", bad_invariant, 0, 0);
+
+    // A range that cannot fit has to be refused, not truncated: the caller
+    // falls back to the decimated whole-ring record
+    {
+      RecordWindow w;
+      check_near("span > window refused",
+          record_window_place(RING, 0, RING/2, WIN, -WIN, WIN, &w), 0, 0);
+      check_near("trigger outside range refused",
+          record_window_place(RING, 0, RING/2, WIN, 10, 20, &w), 0, 0);
+    }
+  }
+
+  // ===== 50 MHz: full-rate window vs the 4:1 decimated record =====
+  //
+  // Both paths see the same ring; only the record built from it differs.
+  // This is the bug the window fixes: a 50 MHz input read through a 4:1
+  // decimation folds to ~11 MHz and looks entirely convincing.
+  {
+    enum { RING = 96 * 1024, WIN = 24 * 1024 };
+    static uint8_t ring[RING], rec[WIN];
+    RecordWindow w;
+    int trigger = RING / 2;
+    int offset = 0; // a full ring: oldest sample at 0
+
+    printf("50 MHz input, 8 ns ring:\n");
+
+    for (int i = 0; i < RING; i++)
+      ring[i] = (uint8_t)lround(ZERO_POINT + 100.0 * sin(2 * M_PI * 50e6 * i * 8e-9));
+
+    // Old path: every 4th sample of the whole ring, 32 ns apart
+    for (int i = 0; i < WIN; i++)
+      rec[i] = ring[i * 4];
+
+    measure_run(rec, WIN, 0, 32, ZERO_POINT, &m);
+    check_near("decimated 4:1 aliases", m.frequency < 16000000, 1, 0);
+
+    // New path: a contiguous window at the ring's own rate. lo/hi are the
+    // 50 ns/div geometry: 2 ns per pixel over 300 pixels, no pan.
+    check_near("window placed", record_window_place(RING, offset, trigger, WIN, -40, 40, &w), 1, 0);
+
+    for (int i = 0; i < WIN; i++)
+      rec[i] = ring[(w.src + i) % RING];
+
+    measure_run(rec, WIN, 0, 8, ZERO_POINT, &m);
+    check_near("full-rate reads 50 MHz", m.frequency, 50000000, 0.5);
+    check_near("full-rate periods regular", m.period_good_pct, 100, 2);
+
+    // And the trigger still maps to the sample the ring put there
+    check_near("trigger sample preserved", rec[-w.start], ring[trigger], 0);
+  }
+
+  // ===== interleave-mirror veto in the comb (fft.c) =====
+  //
+  // Two time-interleaved converters with residual gain mismatch put a spur
+  // at exactly nyquist - f. Reproduced from hardware: a 50 MHz input at
+  // 125 MS/s read "F0 = 12.5 MHz, h4 = 50 MHz" because the 12.5 spur's comb
+  // outscored the real line. The veto must hand the crown back - and must
+  // NOT break the mains case the comb exists for (weak fundamental, strong
+  // third harmonic, no mirror relationship).
+  {
+    static uint8_t r[24576];
+    static float fmag[FFT_BINS];
+    FftAnalysis an;
+
+    printf("interleave mirror veto:\n");
+
+    for (int i = 0; i < 24576; i++)
+    {
+      double v = 60.0 * sin(2 * M_PI * 50e6 * i * 8e-9);
+
+      if (i & 1)
+        v *= 0.94; // odd converter 6% low: the spur source
+
+      r[i] = (uint8_t)lround(ZERO_POINT + v);
+    }
+
+    fft_spectrum_decim(r, 24576, 0, 1, fmag);
+    fft_analyze(fmag, 8, &an);
+    check_near("50 MHz not dethroned by spur", an.fundamental, 50000000, 1);
+
+    // Mains-like: 50 Hz weak, 150 Hz dominant, 1 ms sampling
+    for (int i = 0; i < 24576; i++)
+      r[i] = (uint8_t)lround(ZERO_POINT + 20.0 * sin(2 * M_PI * 50 * i * 1e-3)
+          + 60.0 * sin(2 * M_PI * 150 * i * 1e-3));
+
+    fft_spectrum_decim(r, 24576, 0, 1, fmag);
+    fft_analyze(fmag, 1000000, &an);
+    check_near("mains comb still wins", an.fundamental, 50, 6);
+
+    // ===== folded harmonics (the 33.33 MHz case from hardware) =====
+    //
+    // An ugly divider output at 33.33 MHz carries a 2nd harmonic STRONGER
+    // than the fundamental. At 125 MS/s that harmonic (66.67) is observed
+    // folded at 58.33, the 4th at 8.33 - and every alias lands on a lattice
+    // of 8.33 MHz, so a fold-blind comb crowned "F0 = 8.33 MHz, THD 980%".
+    // The alias-aware comb must hand it back to 33.33.
+    printf("folded harmonics:\n");
+
+    for (int i = 0; i < 24576; i++)
+    {
+      double t = i * 8e-9;
+      double v = ZERO_POINT
+          + 35.0 * sin(2 * M_PI * 33.333e6 * t)
+          + 55.0 * sin(2 * M_PI * 66.667e6 * t + 0.9)   // h2, dominant
+          + 8.0  * sin(2 * M_PI * 133.333e6 * t + 0.3); // h4
+
+      r[i] = (uint8_t)lround(v < 0 ? 0 : v > 255 ? 255 : v);
+    }
+
+    fft_spectrum_decim(r, 24576, 0, 1, fmag);
+    fft_analyze(fmag, 8, &an);
+    check_near("F0 is the input, not the lattice", an.fundamental, 33333000, 1);
+
+    // The dominant folded peak must be labelled h2, not h7
+    {
+      int h_of_top = -1;
+
+      for (int i = 0; i < an.count; i++)
+      {
+        if (an.peak[i].rel_db == 0.0f)
+          h_of_top = an.peak[i].harmonic;
+      }
+
+      check_near("58.3 MHz peak labelled h2", h_of_top, 2, 0);
+    }
+
+    // ===== the {f, 2f} fold ambiguity (25 MHz case from hardware) =====
+    //
+    // A clean 25 MHz square at 125 MS/s shows 25 (dominant) and 50 (weak:
+    // h2 residue + the folded 3rd). "f0=25, in-band h2" and "f0=50, folded
+    // h2" explain the same two peaks with the same energy - and the tie
+    // went to the higher candidate: the instrument read "F0 = 50.01 MHz,
+    // THD 999.9%". The folded-match discount must break exactly this tie.
+    printf("fold ambiguity:\n");
+
+    for (int i = 0; i < 24576; i++)
+    {
+      double t = i * 8e-9;
+      double v = ZERO_POINT
+          + 60.0 * sin(2 * M_PI * 25e6 * t)
+          + 4.5  * sin(2 * M_PI * 50e6 * t + 0.4); // -22.5 dB, as measured
+
+      r[i] = (uint8_t)lround(v < 0 ? 0 : v > 255 ? 255 : v);
+    }
+
+    fft_spectrum_decim(r, 24576, 0, 1, fmag);
+    fft_analyze(fmag, 8, &an);
+    check_near("F0 is 25, not 50", an.fundamental, 25000000, 1);
   }
 
   printf("\n%s (%d failures)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);

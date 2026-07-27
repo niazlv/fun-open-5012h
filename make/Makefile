@@ -48,6 +48,7 @@ SRCS += \
   ../capture.c \
   ../trigger.c \
   ../buffer.c \
+  ../record_window.c \
   ../measure.c \
   ../fft.c \
   ../classify.c \
@@ -112,11 +113,42 @@ CFLAGS += $(INCLUDES) $(DEFINES)
 OBJS = $(addprefix $(BUILD)/, $(notdir %/$(subst .c,.o, $(SRCS))))
 
 # The DOOM asset pack is data, not code: an .S with .incbin drops it straight
-# into .rodata. It is built from a real IWAD by tools/wadpack.py and is not in
-# the repository, so an empty stand-in is created when it is absent - the
-# application detects that and explains how to build a real one.
-DOOM_ASSETS = ../doom/doom_assets.bin
+# into .rodata. It is built from a real IWAD by tools/wadpack.py.
+#
+# It is also 208 KB of the 384 KB the firmware may use - more than half the
+# image for one application, and what took the build to 99% full. So it is
+# opt-in: `make DOOM=1` links the real pack, anything else links an empty
+# stand-in and the application says how to build one. Nothing else about DOOM
+# changes; the engine is a few KB of code and stays in either way.
+DOOM ?= 0
+
+ifeq ($(DOOM),1)
+  DOOM_ASSETS = ../doom/doom_assets.bin
+else
+  DOOM_ASSETS = $(BUILD)/doom_assets_empty.bin
+endif
+
 OBJS += $(BUILD)/doom_assets.o
+
+# Which pack was linked is not recorded in any file's timestamp, so switching
+# between them would otherwise leave the previous object in place and the image
+# unchanged. The stamp remembers the setting and the stale artifacts are dropped
+# when it changes.
+#
+# At PARSE time, deliberately: make decides what is out of date before it runs
+# any recipe, so a stamp that only gets rewritten during the build is a decision
+# that arrives too late - make 3.81 does not reconsider, and the switch silently
+# did nothing. By the time the rules below are read, the files are already gone.
+DOOM_STAMP = $(BUILD)/doom_assets.stamp
+
+# The .bin and .hex go too, not just the .elf: they are what gets flashed, and
+# make 3.81 compares timestamps to the second - two builds a moment apart look
+# simultaneous to it, and it would leave yesterday's image next to today's elf.
+$(shell $(MKDIR) -p $(BUILD); \
+    echo "$(DOOM_ASSETS)" | cmp -s - $(DOOM_STAMP) || { \
+      echo "$(DOOM_ASSETS)" > $(DOOM_STAMP); \
+      rm -f $(BUILD)/doom_assets.o $(BUILD)/$(BIN).elf \
+            $(BUILD)/$(BIN).bin $(BUILD)/$(BIN).hex; })
 
 all: directory $(BUILD)/$(BIN).elf $(BUILD)/$(BIN).hex $(BUILD)/$(BIN).bin size
 
@@ -128,8 +160,8 @@ $(DOOM_ASSETS):
 	@touch $@
 
 $(BUILD)/doom_assets.o: ../doom/doom_assets.S $(DOOM_ASSETS)
-	@echo AS $@
-	@$(CC) $(CFLAGS) -c $< -o $@
+	@echo AS $@ $(if $(filter 1,$(DOOM)),,"(no DOOM assets, build with DOOM=1)")
+	@$(CC) $(CFLAGS) -DDOOM_ASSETS_FILE='"$(DOOM_ASSETS)"' -c $< -o $@
 
 $(BUILD)/$(BIN).elf: $(OBJS) $(LDSCRIPT)
 	@echo LD $@

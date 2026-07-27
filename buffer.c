@@ -329,6 +329,28 @@ void buffer_reverse(uint32_t buf, uint32_t count)
 }
 
 //-----------------------------------------------------------------------------
+// Undo buffer_reverse(): the bit reversal is its own inverse, the channel
+// delta is not, so the sign flips. Saturation makes it inexact only for
+// samples that were already pinned at a rail.
+void buffer_unreverse(uint32_t buf, uint32_t count)
+{
+  uint32_t delta;
+
+  if (config.calib_channel_delta < 0)
+  {
+    delta = -config.calib_channel_delta;
+    delta = (delta << 24) | (delta << 8);
+    buffer_reverse_add(buf, count, delta);
+  }
+  else
+  {
+    delta = config.calib_channel_delta;
+    delta = (delta << 24) | (delta << 8);
+    buffer_reverse_sub(buf, count, delta);
+  }
+}
+
+//-----------------------------------------------------------------------------
 static void buffer_decimate_reverse_add(uint32_t dst, uint32_t src, uint32_t count, uint32_t offset, uint32_t delta)
 {
   asm volatile (R"asm(

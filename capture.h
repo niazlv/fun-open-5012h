@@ -109,7 +109,16 @@ bool capture_get_measurements(ScopeMeasure *out);
 // cached from before they changed the hardware settings
 bool capture_get_measurements_fresh(ScopeMeasure *out);
 bool capture_get_raw_measure(Measure *out);
+// Same, unthrottled: control loops must see the CURRENT acquisition
+bool capture_get_raw_measure_fresh(Measure *out);
+// Mean level of each converter on its own, from the raw ring and without the
+// channel delta applied. Dual-channel acquisitions only; false otherwise.
+bool capture_get_channel_means(int *a_x100, int *b_x100);
 uint32_t capture_get_generation(void);
+// Sample period (ns) of the record everything downstream reads. Equal to the
+// ring's period while the full-rate window applies, four times it when the
+// screen needs more time than that window spans.
+int capture_get_record_period(void);
 int capture_read_samples(uint8_t *dst, int max_count, int *period_ns, bool consume);
 // The newest samples from the RAW full-rate capture ring (not the decimated
 // storage buffer), usable while acquisition runs. May tear mid-write — meant

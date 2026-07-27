@@ -41,6 +41,7 @@
 #include "config.h"
 #include "trigger.h"
 #include "measure.h"
+#include "record_window.h"
 #include "capture.h"
 
 /*- Definitions -------------------------------------------------------------*/
@@ -74,6 +75,39 @@ _Static_assert(0x20000000u + CAPTURE_BUFFER_SIZE + STORAGE_BUFFER_SIZE == CAPTUR
     "spare RAM must start right after the storage buffer");
 
 #define ZERO_POINT             0x80
+
+// TIMER0 output modes for the two AD9288 encode clocks (see adc_init).
+// 6 = PWM mode 0, 7 = PWM mode 1 (inverted). Equal modes = both converters
+// sample the same instant (the ring holds every moment twice, 62.5 MS/s of
+// unique data - measured: 50 MHz reads exactly |50-62.5| = 12.5 MHz);
+// opposite modes interleave them 8 ns apart for the real 125 MS/s.
+//
+// Interleave is how this hardware is MEANT to run. From the designer's own
+// reverse-engineering thread (eevblog, ataradov): "The ADC clocks are out of
+// phase (when both channels are used), but the ADC itself has a data align
+// setting, which makes data from both channels available on the rising edge
+// of the channel A clock." The data-align feature is the whole trick: B
+// encodes half a period away, but its OUTPUT is re-timed inside the ADC to
+// channel A's clock, so the data bus only ever transitions on A's edges and
+// one 16-bit DMA snapshot safely carries both channels.
+//
+// That sentence also dictates which channel may be inverted, and getting it
+// wrong is what the first attempt did (2026-07-27): inverting CH0 moved
+// channel A - the alignment REFERENCE - so every bus transition shifted 8 ns
+// onto the DMA snapshot instant, and with the TIMER0<->TIMER7 start skew
+// being whatever the two CEN writes make it, each dma_start() randomly gave
+// either a clean run or metastable odd bytes (needles, ~600 mV of garbage on
+// a shorted input). Channel A's clock must never move. Inverting CH1 (ADC B)
+// leaves the bus timing byte-for-byte as the always-working in-phase build
+// had it.
+//
+// Verification on hardware, 50 MHz in at 50 ns/div:
+//   ~50 MHz  - interleave works, this is the real 125 MS/s
+//   ~15 MHz  - works, but the pair lands in swapped time order (B later,
+//              not earlier); fix is software - swap pair interpretation
+//   needles  - the board does not strap data-align after all: revert to 6/6
+#define ADC_A_CLOCK_MODE       6
+#define ADC_B_CLOCK_MODE       7
 
 
 /*- Types -------------------------------------------------------------------*/
@@ -114,6 +148,9 @@ static volatile int g_auto_mode_count;
 static volatile bool g_auto_mode_stop;
 static volatile bool g_triggered;
 static volatile bool g_stopped;
+// Whether the storage record is a full-rate window of the ring rather than a
+// 4:1 decimation of all of it (see update_storage_window)
+static volatile bool g_record_full_rate;
 // Placed in main SRAM right after the capture ring (not in TCM: the 64 KB TCM
 // also holds all .data/.bss and the stack, and was 99.7% full with this
 // buffer there, leaving 2 KB for stack+heap)
@@ -139,6 +176,25 @@ static void adc_init(void)
   RCU->APB2EN_b.TIMER0EN = 1;
   RCU->APB2EN_b.TIMER7EN = 1;
 
+  // The ADC is an AD9288: TWO independent 8-bit converters in one package,
+  // each with its own encode clock (PA8 = ADC A, PA9 = ADC B, see
+  // doc/Hardware.md). Both are clocked at 62.5 MHz here, and the only way to
+  // get the 125 MS/s this firmware has always claimed is to encode them half
+  // a period apart - otherwise the two converters latch the SAME instant and
+  // every 16-bit DMA snapshot of GPIOD carries one moment twice.
+  //
+  // That is what the original setup did: identical CHxCV, identical PWM mode,
+  // untouched polarity, i.e. two clocks in phase. It cost the instrument half
+  // its designed sample rate (a 50 MHz input folded to exactly 12.5 MHz) and
+  // put a sample-to-sample ripple on the trace, since the duplicate came from
+  // the other converter with its own gain and offset.
+  //
+  // PWM mode 1 (7) on CH0 inverts ADC A's clock, so A encodes 8 ns AFTER B.
+  // The DMA reads GPIOD little-endian, so the low byte (ADC B) lands on even
+  // ring addresses and the high byte (ADC A) on odd ones - B earlier, A later,
+  // which is exactly the ring's own byte order. If the pipeline latency turns
+  // out to land the other way the record reads ~15 MHz instead of ~50 for a
+  // 50 MHz input; then invert CH1 rather than CH0.
   TIMER0->PSC    = 1;
   TIMER0->CAR    = 1;
   TIMER0->CNT    = 0;
@@ -148,8 +204,8 @@ static void adc_init(void)
   TIMER0->CTL1   = TIMER0_CTL1_ISO0_Msk | TIMER0_CTL1_ISO1_Msk;
   TIMER0->CCHP   = TIMER0_CCHP_POEN_Msk;
   TIMER0->CHCTL0_Output =
-      (6 << TIMER0_CHCTL0_Output_CH0COMCTL_Pos) |
-      (6 << TIMER0_CHCTL0_Output_CH1COMCTL_Pos);
+      (ADC_A_CLOCK_MODE << TIMER0_CHCTL0_Output_CH0COMCTL_Pos) |
+      (ADC_B_CLOCK_MODE << TIMER0_CHCTL0_Output_CH1COMCTL_Pos);
 
   TIMER7->PSC      = 1;
   TIMER7->CAR      = 1;
@@ -322,6 +378,103 @@ static void update_capture_buffer(void)
 }
 
 //-----------------------------------------------------------------------------
+static void copy_words(uint32_t dst, uint32_t src, int count)
+{
+  uint32_t *d = (uint32_t *)dst;
+  const uint32_t *s = (const uint32_t *)src;
+
+  for (int i = count / 4; i > 0; i--)
+    *d++ = *s++;
+}
+
+//-----------------------------------------------------------------------------
+// Trigger-relative sample indices, at `period` per sample, that the display
+// will ask capture_get_data() for at the current timebase and pan position.
+// A couple of samples of slack on each end covers the rounding there and the
+// interpolation between index and index+1.
+static void display_sample_range(int period, int *lo, int *hi)
+{
+  int64_t half = (int64_t)config.horizontal_period * (DATA_BUFFER_SIZE/2 + 2);
+
+  *lo = (int)((config.horizontal_position - half) / period) - 2;
+  *hi = (int)((config.horizontal_position + half) / period) + 2;
+
+  // Every consumer indexes the record relative to the trigger, so it has to
+  // be inside - and strictly, since trigger == offset reads as "one past the
+  // newest sample" to the ring arithmetic in capture_get_data()
+  if (*lo > -1)
+    *lo = -1;
+
+  if (*hi < 1)
+    *hi = 1;
+}
+
+//-----------------------------------------------------------------------------
+// Does a full-rate window cover what the screen is asking for?
+static bool record_window_fits(int period)
+{
+  int lo, hi;
+
+  display_sample_range(period, &lo, &hi);
+
+  return ((int64_t)hi - lo + 1) <= STORAGE_BUFFER_SIZE;
+}
+
+//-----------------------------------------------------------------------------
+// Full-rate record: copy a WINDOW of the ring instead of decimating all of it.
+//
+// The storage buffer exists because the ring is being overwritten by the DMA;
+// consumers need a stable snapshot. Making that snapshot a 4:1 decimation of
+// the whole 96 KB record costs a factor of four in sample rate, and that rate
+// - not the ring's - is what the display, the measurements, the FFT and the
+// decoders actually see while acquisition runs: 31.25 MS/s at the top of the
+// timebase, a 15.6 MHz Nyquist limit, and a 50 MHz input folding down to a
+// convincing ~12 MHz trace.
+//
+// At fast timebases the whole record is not needed - at 50 ns/div the visible
+// window is 600 ns, i.e. 75 samples - so 24576 consecutive samples at the RAW
+// rate cover the screen with the full 125 MS/s and a 62.5 MHz Nyquist limit.
+// Past ~16 us/div the window no longer spans the screen and the decimated
+// whole-record path below takes over again.
+static bool update_storage_window(void)
+{
+  const int size = STORAGE_BUFFER_SIZE;
+  RecordWindow w;
+  int lo, hi, first;
+
+  display_sample_range(g_sample_period, &lo, &hi);
+
+  if (!record_window_place(CAPTURE_BUFFER_SIZE, g_capture_buffer_info.offset,
+      g_capture_buffer_info.trigger, size, lo, hi, &w))
+    return false;
+
+  first = CAPTURE_BUFFER_SIZE - w.src;
+
+  if (first > size)
+    first = size;
+
+  copy_words((uint32_t)g_storage_buffer, (uint32_t)g_capture_buffer + w.src, first);
+
+  if (first < size)
+    copy_words((uint32_t)g_storage_buffer + first, (uint32_t)g_capture_buffer, size - first);
+
+  // Consecutive samples means BOTH interleaved ADCs, and the odd one is wired
+  // bit-reversed - which is exactly what the decimated path sidestepped by
+  // only ever picking even ring bytes, and exactly why it was stuck at one
+  // 62.5 MS/s phase. dma_finish() un-reverses the ring itself only after this
+  // runs, so the source here is always still raw.
+  if (g_dual_channel)
+    buffer_reverse((uint32_t)g_storage_buffer, size);
+
+  // A linear window is just a ring whose oldest sample sits at index 0
+  g_storage_buffer_info.period  = g_sample_period;
+  g_storage_buffer_info.offset  = 0;
+  g_storage_buffer_info.trigger = -w.start;
+
+  return true;
+}
+
+//-----------------------------------------------------------------------------
 static void update_storage_buffer(void)
 {
   int offset = g_capture_buffer_info.trigger % STORAGE_BUFFER_RATIO;
@@ -329,21 +482,25 @@ static void update_storage_buffer(void)
   if (g_storage_buffer_info.valid)
     return;
 
-  // NOTE: Given the way dual channel trigger event search is implemented,
-  //       the reverse version will never be called. I'm still keeping it
-  //       here just in case things change in the future.
-  if (g_dual_channel && (offset & 1) == 1)
-    buffer_decimate_reverse((uint32_t)g_storage_buffer, (uint32_t)g_capture_buffer, CAPTURE_BUFFER_SIZE, offset);
-  else
-    buffer_decimate((uint32_t)g_storage_buffer, (uint32_t)g_capture_buffer, CAPTURE_BUFFER_SIZE, offset);
+  if (!g_record_full_rate || !update_storage_window())
+  {
+    // NOTE: Given the way dual channel trigger event search is implemented,
+    //       the reverse version will never be called. I'm still keeping it
+    //       here just in case things change in the future.
+    if (g_dual_channel && (offset & 1) == 1)
+      buffer_decimate_reverse((uint32_t)g_storage_buffer, (uint32_t)g_capture_buffer, CAPTURE_BUFFER_SIZE, offset);
+    else
+      buffer_decimate((uint32_t)g_storage_buffer, (uint32_t)g_capture_buffer, CAPTURE_BUFFER_SIZE, offset);
 
-  g_storage_buffer_info.offset = g_capture_buffer_info.offset / STORAGE_BUFFER_RATIO;
+    g_storage_buffer_info.offset = g_capture_buffer_info.offset / STORAGE_BUFFER_RATIO;
 
-  if (offset < (g_capture_buffer_info.offset % STORAGE_BUFFER_RATIO))
-    g_storage_buffer_info.offset++;
+    if (offset < (g_capture_buffer_info.offset % STORAGE_BUFFER_RATIO))
+      g_storage_buffer_info.offset++;
 
-  g_storage_buffer_info.period  = g_sample_period * STORAGE_BUFFER_RATIO;
-  g_storage_buffer_info.trigger = g_capture_buffer_info.trigger / STORAGE_BUFFER_RATIO;
+    g_storage_buffer_info.period  = g_sample_period * STORAGE_BUFFER_RATIO;
+    g_storage_buffer_info.trigger = g_capture_buffer_info.trigger / STORAGE_BUFFER_RATIO;
+  }
+
   g_storage_buffer_info.vpos    = g_capture_buffer_info.vpos;
   g_storage_buffer_info.vs_mult = g_capture_buffer_info.vs_mult;
   g_storage_buffer_info.valid   = true;
@@ -533,6 +690,16 @@ void capture_start(void)
   if (!g_stopped)
     return;
 
+  // capture_stop() and dma_finish() un-reverse the ring IN PLACE so a stopped
+  // record reads straight. That used to be harmless because a running scope
+  // only ever read even ring bytes, which the reversal never touches — but
+  // update_storage_window() copies BOTH parities and reverses the odd ones,
+  // so any byte the DMA has not overwritten yet would come back
+  // double-reversed, i.e. raw garbage on every other sample. Put the wiring
+  // back before the DMA starts writing raw data over it again.
+  if (g_dual_channel)
+    buffer_unreverse((uint32_t)g_capture_buffer, CAPTURE_BUFFER_SIZE);
+
   g_stopped = false;
 
   dma_start();
@@ -638,6 +805,13 @@ void capture_set_horizontal_parameters(int sr_divider, int trigger_offset)
   g_trigger_offset  = trigger_offset;
   g_sample_period   = BASE_SAMPLE_PERIOD * (1 << sr_divider);
   g_auto_mode_count = (BASE_SAMPLE_RATE / (1 << sr_divider)) / AUTO_MODE_COUNT_DIV;
+
+  // Decide the record mode here rather than per acquisition: it only depends
+  // on the timebase and the pan, and capture_get_record_period() has to be
+  // able to answer before the first frame under the new settings lands
+  g_record_full_rate = record_window_fits(g_sample_period);
+  g_storage_buffer_info.period = g_record_full_rate ?
+      g_sample_period : (g_sample_period * STORAGE_BUFFER_RATIO);
 
   if (g_auto_mode_count < CAPTURE_BUFFER_SIZE)
     g_auto_mode_count = CAPTURE_BUFFER_SIZE;
@@ -985,9 +1159,54 @@ bool capture_get_raw_measure(Measure *out)
 }
 
 //---------------------------------------------------------------------
+bool capture_get_raw_measure_fresh(Measure *out)
+{
+  return measure_active_buffer_ex(out, true);
+}
+
+//---------------------------------------------------------------------
+// Mean level of each converter separately, read straight from the raw ring
+// and WITHOUT config.calib_channel_delta applied - which is exactly what
+// calibrating that delta needs. Even ring bytes are ADC B (straight wiring),
+// odd ones ADC A (bit-reversed, see doc/Hardware.md). Only meaningful while a
+// dual-channel acquisition is running: a stopped ring has already been
+// un-reversed in place, and a single-channel one holds ADC B only.
+bool capture_get_channel_means(int *a_x100, int *b_x100)
+{
+  const int count = 4096; // ring bytes averaged, i.e. 2048 per converter
+  int64_t sum_a = 0, sum_b = 0;
+
+  if (!g_dual_channel || g_stopped || g_buffer_generation == 0)
+    return false;
+
+  for (int i = 0; i < count; i += 2)
+  {
+    sum_b += g_capture_buffer[i];
+    sum_a += (int)(__RBIT((uint32_t)g_capture_buffer[i + 1]) >> 24);
+  }
+
+  *b_x100 = (int)(sum_b * 200 / count);
+  *a_x100 = (int)(sum_a * 200 / count);
+
+  return true;
+}
+
+//---------------------------------------------------------------------
 uint32_t capture_get_generation(void)
 {
   return g_buffer_generation;
+}
+
+//---------------------------------------------------------------------
+// Sample period of the record consumers actually see, which is the ring's
+// only while the full-rate window applies (see update_storage_window); a
+// stopped scope always reads the raw ring.
+int capture_get_record_period(void)
+{
+  if (g_stopped && g_capture_buffer_info.valid)
+    return g_sample_period;
+
+  return g_storage_buffer_info.period;
 }
 
 //---------------------------------------------------------------------

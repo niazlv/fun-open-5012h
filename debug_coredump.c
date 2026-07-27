@@ -442,13 +442,21 @@ static void draw_coredump_list(void)
         lcd_puts(8, BODY_Y + 50, "and by error(). They live in retained SRAM,");
         lcd_puts(8, BODY_Y + 62, "so after a crash you reboot from the fault");
         lcd_puts(8, BODY_Y + 74, "screen and the dump is waiting here.");
-        lcd_puts(8, BODY_Y + 92, "Cutting the power clears them.");
+
+        // Accented, because this is the sentence people come back about: a
+        // test dump added here is gone after the next power cycle, and that
+        // is the storage working as built, not a dump that failed to save
+        lcd_set_color(CD_BG, CD_ACCENT);
+        lcd_puts(8, BODY_Y + 92, "Cutting the power clears them. Read a dump");
+        lcd_puts(8, BODY_Y + 104, "before switching off, or it is gone.");
+        lcd_set_color(CD_BG, CD_FG);
 
         snprintf(buf, sizeof(buf), "This is boot %lu.",
             (unsigned long)g_store->boot_id);
-        lcd_puts(8, BODY_Y + 110, buf);
+        lcd_puts(8, BODY_Y + 122, buf);
 
-        lcd_puts(8, BODY_Y + 128, "MENU > Add test dump records a synthetic one.");
+        lcd_puts(8, BODY_Y + 140, "MENU > Add test dump records a synthetic one;");
+        lcd_puts(8, BODY_Y + 152, "it survives Advanced > Reboot, not a power cut.");
 
         draw_footer("MENU: settings and help",
             "SHIFT+MENU: back to the launcher");
@@ -458,8 +466,12 @@ static void draw_coredump_list(void)
     for (int i = 0; i < g_coredump_count; i++)
         draw_list_row(i);
 
-    draw_footer("UP/DOWN: select   MODE or RIGHT: open",
-        "MENU: settings and help");
+    // The volatility belongs on the screen that shows the dumps, not only on
+    // the empty one and in Help. A list of recorded crashes reads as something
+    // that was stored; these are in RAM, and switching the device off ends
+    // them. Anyone who needs one kept has to read it before powering down.
+    draw_footer("UP/DOWN: select  MODE: open  MENU: more",
+        "In RAM: kept over a reboot, lost on power off.");
 }
 
 //-----------------------------------------------------------------------------
@@ -481,7 +493,7 @@ static void draw_detail_header(const char *what)
 static void draw_detail_footer(void)
 {
     draw_footer("LEFT: back to the list   UP/DOWN: page",
-        "MENU: settings and help");
+        "In RAM: kept over a reboot, lost on power off.");
 }
 
 //-----------------------------------------------------------------------------
@@ -787,9 +799,15 @@ static const char *const g_help_lines[] =
     "error screen. Rebooting from there brings you",
     "back here with the dump intact: the ring sits",
     "in a part of SRAM that nothing is linked into,",
-    "so reset does not clear it. Only cutting the",
-    "power does. Each entry records which boot it",
-    "came from.",
+    "so reset does not clear it.",
+    "",
+    "SRAM is not storage. Switching the device off",
+    "ends every dump in the list, including one you",
+    "added with Add test dump - that is the design,",
+    "not a save that failed. Read what you need off",
+    "the screen before you power down.",
+    "",
+    "Each entry records which boot it came from.",
 };
 
 static const info_page_t g_help_page =

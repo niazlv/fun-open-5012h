@@ -11,14 +11,22 @@
  * .incbin rather than a generated C array: 200 KB of initialisers would be
  * pointless work for the compiler, and this way the data lands in .rodata with
  * the alignment the engine's 32-bit tables need.
+ *
+ * The Makefile picks the file: `make DOOM=1` links the real pack, and the
+ * default links an empty stand-in, because the pack is over half of the 384 KB
+ * the firmware has to itself.
  */
+
+#ifndef DOOM_ASSETS_FILE
+#define DOOM_ASSETS_FILE "../doom/doom_assets.bin"
+#endif
 
     .section .rodata.doom_assets, "a"
     .align 4
 
     .global doom_assets
 doom_assets:
-    .incbin "../doom/doom_assets.bin"
+    .incbin DOOM_ASSETS_FILE
 doom_assets_end:
 
     /* With an empty pack the symbol would otherwise point at whatever .rodata

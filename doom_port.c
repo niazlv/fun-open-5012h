@@ -297,13 +297,14 @@ static void draw_no_assets(void)
     else
     {
         lcd_set_color(LCD_BLACK_COLOR, HUD_FG);
-        lcd_puts(12, 110, "Build a pack from a real IWAD:");
+        lcd_puts(12, 110, "The pack is 208 KB of a 384 KB image, so");
+        lcd_puts(12, 122, "builds leave it out unless asked:");
         lcd_set_color(LCD_BLACK_COLOR, HUD_HI);
-        lcd_puts(12, 130, "python3 tools/wadpack.py doom1.wad \\");
-        lcd_puts(12, 142, "        -o doom/doom_assets.bin");
+        lcd_puts(12, 142, "python3 tools/wadpack.py doom1.wad \\");
+        lcd_puts(12, 154, "        -o doom/doom_assets.bin");
+        lcd_puts(12, 166, "cd make && make DOOM=1");
         lcd_set_color(LCD_BLACK_COLOR, HUD_FG);
-        lcd_puts(12, 162, "then rebuild and reflash. Any DOOM IWAD");
-        lcd_puts(12, 174, "works, including the free Freedoom.");
+        lcd_puts(12, 186, "Any DOOM IWAD works, Freedoom included.");
     }
 
     lcd_puts(12, 206, "SHIFT+MENU returns to the launcher.");

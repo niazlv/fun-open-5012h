@@ -232,6 +232,12 @@ static void body_system_info(void)
   // bld/pnt=texts built and bands repainted, len=length of the current text
   scope_get_panel_state(buf, sizeof(buf));
   lcd_puts(INFO_X, 165, buf);
+
+  // Settings store health. "saved" with a rising entry number is a store that
+  // is persisting; "NO STORED CONFIG" on a device that has been used before
+  // means the last session's settings were lost on the way to flash.
+  config_get_state(buf, sizeof(buf));
+  lcd_puts(INFO_X, 180, buf);
 }
 
 //-----------------------------------------------------------------------------
@@ -289,6 +295,13 @@ static void action_exit_app(const void *arg)
 static void action_reboot(const void *arg)
 {
   (void)arg;
+
+  // The settings store saves on a 1 s timer and then takes a few passes of
+  // the main loop to finish writing. Resetting straight from the menu threw
+  // both away, so a reboot was the one action guaranteed to lose the setting
+  // the user had just changed.
+  config_flush();
+
   NVIC_SystemReset();
 }
 

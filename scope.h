@@ -37,6 +37,11 @@
 // The scope's section of the system menu, see scope_menu.c
 extern const menu_def_t scope_menu;
 
+// Calibration mode: the scope screen turns into the calibration UI (raw ADC
+// readout plus one adjustable parameter). The menu toggles this directly and
+// then calls scope_calibration_changed().
+extern bool scope_calibration_mode;
+
 /*- Prototypes --------------------------------------------------------------*/
 void scope_init(bool calibration_mode);
 void scope_buttons_handler(int buttons);
@@ -47,6 +52,19 @@ void scope_redraw_all(void);
 // repainted in full when the menu closes)
 void scope_apply_trigger_level(void);
 void scope_trigger_50_percent(void);
+void scope_calibration_changed(void);
+// Find Z, D and O by measurement, with nothing connected to the input. Gain
+// (S) needs a reference amplitude and is not part of it.
+void scope_autocal_start(void);
+
+// Numeric calibration entry from the menu: change config.calib_* directly,
+// then call scope_calib_apply(). touch_dac only for the two parameters that
+// feed the offset DAC (zero and DAC step) - it restarts acquisition.
+void scope_calib_apply(bool touch_dac);
+// Reference level the gain step aims at, normalized (a config saved before
+// the field existed reads 0)
+int scope_calib_ref_mv(void);
+void scope_set_vertical_scale(int scale);
 int scope_get_fps(void);
 
 // Live state of the measurements panel, for the System Info page: this is

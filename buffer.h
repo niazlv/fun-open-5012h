@@ -33,6 +33,7 @@
 void buffer_decimate(uint32_t dst, uint32_t src, uint32_t count, uint32_t offset);
 void buffer_decimate_reverse(uint32_t dst, uint32_t src, uint32_t count, uint32_t offset);
 void buffer_reverse(uint32_t buf, uint32_t count);
+void buffer_unreverse(uint32_t buf, uint32_t count);
 
 #endif // _BUFFER_H_
 
