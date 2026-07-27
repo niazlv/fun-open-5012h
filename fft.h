@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * Radix-2 FFT spectrum for the oscilloscope, sized for the Cortex-M4 FPU.
  *

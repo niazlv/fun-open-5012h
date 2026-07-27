@@ -1,6 +1,7 @@
 #!/bin/sh
 #
 # Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
 #
 # Build and run the coredump ring tests on the host.
 #

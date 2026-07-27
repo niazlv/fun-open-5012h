@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #
 # Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
 """
 wadpack - turn a real DOOM IWAD into a flash-resident asset pack.
 

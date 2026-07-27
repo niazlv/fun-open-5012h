@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * Signal type classification from measurement statistics and (optionally)
  * an FFT magnitude spectrum. Pure C, host-testable.

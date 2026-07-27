@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  */
 
 /* Host test stub: just enough of the CMSIS device header for debug_coredump.c */
