@@ -1,0 +1,7 @@
+# A 10 kHz sine, found and scaled by the firmware's own auto-setup
+wait 300
+press mode
+wait 500
+press auto
+wait 1500
+shot screenshots/02-scope-sine.png

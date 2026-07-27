@@ -1,0 +1,43 @@
+# UART decode of "Hiмир!" (ASCII + UTF-8, no separator) at 115200 8N1,
+# framed on the boundary: 48/H and 69/i with their ASCII labels, then the
+# two-byte UTF-8 sequence D0 BC = U+043C. Bit grid on the trace.
+#
+# The record edge cuts one frame of the endless stream; the decoder counts
+# it as a framing error, which is what it is.
+#
+# AUTO, slow the timebase until the record holds a whole message, STOP,
+# SHIFT+EDGE to decode, TRIG_UP x4 to the boundary, SHIFT+LEFT to 20 us/div.
+wait 300
+press mode
+wait 500
+press auto
+wait 1500
+press shift+right
+wait 400
+press shift+right
+wait 400
+press shift+right
+wait 800
+press stop
+wait 600
+press shift+edge
+wait 2500
+press trigup
+wait 200
+press trigup
+wait 200
+press trigup
+wait 200
+press trigup
+wait 400
+press shift+left
+wait 300
+press shift+left
+wait 300
+press shift+left
+wait 300
+press shift+left
+wait 300
+press shift+left
+wait 1000
+shot screenshots/05-uart.png

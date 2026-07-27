@@ -1,0 +1,10 @@
+# SHIFT+50% hunts for the narrowest pulse in the record, stops on it and pans
+# the display there - the runt pulse the signal hides once every 32 periods
+wait 300
+press mode
+wait 500
+press auto
+wait 1500
+press shift+50
+wait 2000
+shot screenshots/06-glitch.png

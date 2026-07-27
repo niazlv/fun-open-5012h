@@ -1,0 +1,14 @@
+# The scope's own section of the system menu: trigger, measurements, display,
+# protocol decoder and calibration, all stored in flash. The scope's text
+# pages are not here - they are in the root Help section, with every other
+# application's.
+wait 300
+press mode
+wait 500
+press auto
+wait 2500
+press menu
+wait 500
+press right
+wait 800
+shot screenshots/10-menu.png

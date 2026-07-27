@@ -1,0 +1,13 @@
+# Spectrum view. STOP first: on a live acquisition the breakdown panel is
+# erased and rewritten on every pass, so freezing the record is both how you
+# read the numbers on a real instrument and how a still frame catches them.
+wait 300
+press mode
+wait 500
+press auto
+wait 1500
+press stop
+wait 800
+press shift+mode
+wait 2000
+shot screenshots/04-fft.png

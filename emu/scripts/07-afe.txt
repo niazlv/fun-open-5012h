@@ -1,0 +1,8 @@
+# A 2 MHz square with ideal edges at the source: what reaches the screen is
+# whatever the front end and the converter leave of it
+wait 300
+press mode
+wait 500
+press auto
+wait 1500
+shot screenshots/07-afe.png

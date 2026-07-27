@@ -1,0 +1,18 @@
+# One level down: which measurements the translucent panel over the trace
+# lists, each a toggle the firmware stores in flash
+wait 300
+press mode
+wait 500
+press auto
+wait 1200
+press menu
+wait 400
+press down
+wait 300
+press right
+wait 400
+press down
+wait 300
+press right
+wait 700
+shot screenshots/11-measure-menu.png

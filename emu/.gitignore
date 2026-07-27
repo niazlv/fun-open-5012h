@@ -1,0 +1,11 @@
+# Emulator build output
+build/
+
+# Screenshots produced by a run: the ones committed to the repository live in
+# emu/screenshots/, everything else is a working file
+*.png
+!screenshots/*.png
+
+# Persisted settings store from --flash
+*.flash
+*.bin

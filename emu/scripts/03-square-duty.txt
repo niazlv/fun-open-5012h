@@ -1,0 +1,7 @@
+# A 30% duty square: the firmware measures the duty cycle from the record
+wait 300
+press mode
+wait 500
+press auto
+wait 1500
+shot screenshots/03-square-duty.png

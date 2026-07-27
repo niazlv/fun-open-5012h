@@ -1,0 +1,3 @@
+# The application launcher, as the firmware draws it at boot
+wait 400
+shot screenshots/01-launcher.png
