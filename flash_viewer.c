@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * Flash Memory Viewer
  *
@@ -643,8 +644,6 @@ static const menu_item_t g_menu_items[] =
       .u.action = { action_goto_start, NULL } },
     { .kind = MI_ACTION, .label = "Go to image end",
       .u.action = { action_goto_image_end, NULL } },
-    { .kind = MI_ACTION, .label = "Help",
-      .u.action = { menu_action_info, &g_help_page } },
 };
 
 const menu_def_t flash_viewer_menu =
@@ -652,4 +651,19 @@ const menu_def_t flash_viewer_menu =
     .title = "Flash Viewer",
     .items = g_menu_items,
     .count = ARRAY_SIZE(g_menu_items),
+};
+
+// Read-only pages: the system menu shows them under Help, not among the
+// settings above
+static const menu_item_t g_help_items[] =
+{
+    { .kind = MI_ACTION, .label = "Controls",
+      .u.action = { menu_action_info, &g_help_page } },
+};
+
+const menu_def_t flash_viewer_help_menu =
+{
+    .title = "Flash Viewer",
+    .items = g_help_items,
+    .count = ARRAY_SIZE(g_help_items),
 };

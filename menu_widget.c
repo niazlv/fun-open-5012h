@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * Generic menu widget
  */
@@ -23,6 +24,8 @@
 #define POPUP_SUBMENU_WIDTH   160
 #define POPUP_ITEM_H          20
 #define POPUP_MARGIN          2
+#define POPUP_EDIT_BG         LCD_COLOR(255, 200, 0)
+#define POPUP_EDIT_TEXT       LCD_COLOR(0, 0, 0)
 #define POPUP_BG              LCD_COLOR(240, 240, 240)
 #define POPUP_BORDER          LCD_COLOR(128, 128, 128)
 #define POPUP_TEXT            LCD_COLOR(0, 0, 0)
@@ -67,6 +70,8 @@ typedef struct
   int count;
   int sel;
   int scroll;
+  int vis;      // rows that fit on screen; count > vis means the menu scrolls
+  bool editing; // value edit focus: arrows adjust the value, not the cursor
   int x, y, w, h;
 } menu_inst_t;
 
@@ -159,12 +164,12 @@ static void popup_draw_row(const menu_inst_t *m, int index)
 {
   const menu_item_t *it = &m->items[index];
   int x = m->x + POPUP_MARGIN;
-  int y = m->y + POPUP_MARGIN + index * POPUP_ITEM_H;
+  int y = m->y + POPUP_MARGIN + (index - m->scroll) * POPUP_ITEM_H;
   int w = m->w - 2 * POPUP_MARGIN;
   bool selected = (index == m->sel);
   char buf[16];
 
-  if (y < 0 || y + POPUP_ITEM_H > LCD_HEIGHT)
+  if (index < m->scroll || index >= m->scroll + m->vis)
     return;
 
   if (MI_SEPARATOR == it->kind)
@@ -185,7 +190,19 @@ static void popup_draw_row(const menu_inst_t *m, int index)
   const char *value = item_value_str(it, buf, sizeof(buf));
 
   if (value[0])
-    lcd_puts(x + w - 8 - strlen(value) * FW_SMALL, y + 6, value);
+  {
+    int vx = x + w - 8 - strlen(value) * FW_SMALL;
+
+    // Edit focus: the VALUE inverts, saying the arrows now belong to it
+    if (selected && m->editing)
+    {
+      lcd_fill_rect(vx - 3, y + 3, strlen(value) * FW_SMALL + 6,
+          POPUP_ITEM_H - 6, POPUP_EDIT_BG);
+      lcd_set_color(POPUP_EDIT_BG, POPUP_EDIT_TEXT);
+    }
+
+    lcd_puts(vx, y + 6, value);
+  }
 }
 
 //-----------------------------------------------------------------------------
@@ -197,8 +214,20 @@ static void popup_draw(const menu_inst_t *m, bool full)
   lcd_fill_rect(m->x, m->y, m->w, m->h, POPUP_BG);
   lcd_draw_rect(m->x, m->y, m->w - 1, m->h - 1, POPUP_BORDER);
 
-  for (int i = 0; i < m->count; i++)
+  for (int i = m->scroll; i < m->scroll + m->vis && i < m->count; i++)
     popup_draw_row(m, i);
+
+  if (m->count > m->vis)
+  {
+    lcd_set_font(FONT_SMALL);
+    lcd_set_color(POPUP_BG, POPUP_TEXT);
+
+    if (m->scroll > 0)
+      lcd_puts(m->x + m->w - 14, m->y + 3, "^");
+
+    if (m->scroll + m->vis < m->count)
+      lcd_puts(m->x + m->w - 14, m->y + m->h - 11, "v");
+  }
 }
 
 //-----------------------------------------------------------------------------
@@ -234,7 +263,19 @@ static void fs_draw_item(const menu_inst_t *m, int index)
   const char *value = item_value_str(it, buf, sizeof(buf));
 
   if (value[0])
-    lcd_puts(LCD_WIDTH - FS_MARGIN - 5 - strlen(value) * FW_LARGE, item_y + 7, value);
+  {
+    int vx = LCD_WIDTH - FS_MARGIN - 5 - strlen(value) * FW_LARGE;
+
+    // Edit focus: the VALUE inverts, saying the arrows now belong to it
+    if (selected && m->editing)
+    {
+      lcd_fill_rect(vx - 4, item_y + 4, strlen(value) * FW_LARGE + 8, 22,
+          POPUP_EDIT_BG);
+      lcd_set_color(POPUP_EDIT_BG, POPUP_EDIT_TEXT);
+    }
+
+    lcd_puts(vx, item_y + 7, value);
+  }
 
   if (it->desc && it->desc[0])
   {
@@ -266,8 +307,8 @@ static void fs_draw(const menu_inst_t *m, bool full)
     lcd_fill_rect(FS_MARGIN, footer_y, LCD_WIDTH - 2 * FS_MARGIN, 2, FS_BORDER);
     lcd_set_font(FONT_SMALL);
     lcd_set_color(FS_BG, FS_TEXT);
-    lcd_puts(FS_MARGIN, footer_y + 5, "UP/DOWN: Navigate  MODE: Select");
-    lcd_puts(FS_MARGIN, footer_y + 15, "MENU: System menu");
+    lcd_puts(FS_MARGIN, footer_y + 5, "UP/DOWN: Navigate  MODE: Select/Edit");
+    lcd_puts(FS_MARGIN, footer_y + 15, "LEFT: Back  Edit: arrows set, MODE done");
   }
 
   lcd_fill_rect(FS_MARGIN, FS_CONTENT_Y, LCD_WIDTH - 2 * FS_MARGIN, FS_CONTENT_H, FS_BG);
@@ -296,13 +337,13 @@ static void fs_draw(const menu_inst_t *m, bool full)
 //-----------------------------------------------------------------------------
 static void ensure_visible(menu_inst_t *m)
 {
-  if (!m->fullscreen)
+  if (m->vis <= 0)
     return;
 
   if (m->sel < m->scroll)
     m->scroll = m->sel;
-  else if (m->sel >= m->scroll + FS_VISIBLE_ITEMS)
-    m->scroll = m->sel - FS_VISIBLE_ITEMS + 1;
+  else if (m->sel >= m->scroll + m->vis)
+    m->scroll = m->sel - m->vis + 1;
 }
 
 //-----------------------------------------------------------------------------
@@ -370,29 +411,25 @@ static void popup_open_common(const menu_item_t *items, int count, int x, int y,
   if (NULL == m)
     return;
 
+  int max_vis = (LCD_HEIGHT - 2 * POPUP_MARGIN) / POPUP_ITEM_H;
+
   m->fullscreen = false;
   m->is_submenu = is_submenu;
   m->items = items;
   m->count = count;
+  m->vis = (count < max_vis) ? count : max_vis;
   m->x = x;
   m->y = y;
   m->w = w;
-  m->h = count * POPUP_ITEM_H + 2 * POPUP_MARGIN;
+  m->h = m->vis * POPUP_ITEM_H + 2 * POPUP_MARGIN;
   m->sel = 0;
 
   if (m->x + m->w > LCD_WIDTH)
     m->x = LCD_WIDTH - m->w;
   if (m->y + m->h > LCD_HEIGHT)
     m->y = LCD_HEIGHT - m->h;
-
-  // Popups do not scroll. A table too tall for the screen would be drawn at a
-  // negative offset, so clamp it: the rows that fall off the bottom are
-  // skipped by popup_draw_row instead of corrupting the frame buffer window.
   if (m->y < 0)
-  {
     m->y = 0;
-    m->h = LCD_HEIGHT;
-  }
 
   m->sel = first_selectable(m);
 
@@ -428,10 +465,12 @@ void menu_open_fullscreen(const menu_def_t *def)
     return;
 
   m->fullscreen = true;
+  m->vis = FS_VISIBLE_ITEMS;
   m->title = def->title;
   m->items = def->items;
   m->count = def->count;
   m->sel = first_selectable(m);
+  ensure_visible(m);
 
   ui_push(&menu_screen_fs, m);
 }
@@ -449,10 +488,12 @@ void menu_open_dialog(const menu_def_t *def)
 
   m->fullscreen = true;
   m->is_submenu = true; // gives it the submenu close behavior
+  m->vis = FS_VISIBLE_ITEMS;
   m->title = def->title;
   m->items = def->items;
   m->count = def->count;
   m->sel = first_selectable(m);
+  ensure_visible(m);
 
   ui_push(&menu_screen_fs, m);
 }
@@ -572,11 +613,67 @@ static void menu_draw(void *ctx, bool full)
 }
 
 //-----------------------------------------------------------------------------
+// Input, in two modes.
+//
+// NAVIGATING: UP/DOWN move the cursor, LEFT goes back one level (any level:
+// submenu, dialog - and on the root popup it closes the menu), RIGHT/MODE
+// enter things. A number or choice row is ENTERED like anything else - MODE
+// (or RIGHT) gives it the edit focus.
+//
+// EDITING: the arrows belong to the value - LEFT/RIGHT fine step, UP/DOWN
+// coarse step - and MODE or MENU hands them back. This exists because the
+// old direct-edit model made LEFT ambiguous: on a value row it adjusted,
+// everywhere else it went back, so a menu whose cursor stood on a value had
+// no way back at all.
 static bool menu_input(void *ctx, int buttons)
 {
   menu_inst_t *m = (menu_inst_t *)ctx;
   bool repeat = (buttons & BTN_REPEAT);
   const menu_item_t *it = &m->items[m->sel];
+  bool editable = (MI_NUMBER == it->kind || MI_CHOICE == it->kind);
+
+  if (m->editing)
+  {
+    if (!editable)
+    {
+      m->editing = false; // the item changed under us somehow: recover
+    }
+    else if (buttons & (BTN_LEFT | BTN_RIGHT | BTN_UP | BTN_DOWN))
+    {
+      int dir = (buttons & (BTN_RIGHT | BTN_UP)) ? 1 : -1;
+
+      if (MI_NUMBER == it->kind)
+      {
+        // Vertical = coarse, horizontal = fine: the calibration numbers
+        // live in the thousands and one step per press cannot reach them
+        int step = (buttons & (BTN_UP | BTN_DOWN)) ?
+            it->u.number.step_repeat : it->u.number.step;
+
+        if (repeat)
+          step *= 4;
+
+        number_adjust(it, dir * step);
+      }
+      else if (!repeat)
+      {
+        choice_adjust(it, dir);
+      }
+
+      return true;
+    }
+    else if (buttons & (BTN_MODE | BTN_MENU))
+    {
+      if (!repeat)
+      {
+        m->editing = false;
+        ui_request_redraw();
+      }
+
+      return true;
+    }
+
+    return true; // stray keys stay ours while editing
+  }
 
   if (buttons & BTN_UP)
   {
@@ -592,24 +689,30 @@ static bool menu_input(void *ctx, int buttons)
 
   if (buttons & BTN_LEFT)
   {
-    if (MI_NUMBER == it->kind)
-      number_adjust(it, -(repeat ? it->u.number.step_repeat : it->u.number.step));
-    else if (MI_CHOICE == it->kind && !repeat)
-      choice_adjust(it, -1);
-    else if (m->is_submenu && !repeat)
+    // Back, one level, from anywhere - the cursor position no longer matters
+    if (repeat)
+      return true;
+
+    if (m->is_submenu)
       ui_pop();
+    else if (!m->fullscreen)
+      menu_close_popups();
 
     return true;
   }
 
   if (buttons & BTN_RIGHT)
   {
-    if (MI_NUMBER == it->kind)
-      number_adjust(it, repeat ? it->u.number.step_repeat : it->u.number.step);
-    else if (MI_CHOICE == it->kind && !repeat)
-      choice_adjust(it, 1);
-    else if (MI_SUBMENU == it->kind && !repeat)
+    if (repeat)
+      return true;
+
+    if (MI_SUBMENU == it->kind)
       open_submenu(m, it);
+    else if (editable)
+    {
+      m->editing = true;
+      ui_request_redraw();
+    }
 
     return true;
   }
@@ -632,8 +735,10 @@ static bool menu_input(void *ctx, int buttons)
         ui_request_redraw();
         break;
 
+      case MI_NUMBER:
       case MI_CHOICE:
-        choice_adjust(it, 1);
+        m->editing = true;
+        ui_request_redraw();
         break;
 
       case MI_ACTION:

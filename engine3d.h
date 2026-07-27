@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * Advanced 3D Engine
  * Full-featured 3D graphics engine with camera control, scene management,
@@ -153,7 +154,9 @@ void engine3d_cleanup(void);
 void engine3d_redraw(void);
 
 /*- Variables ---------------------------------------------------------------*/
+// Settings for the system menu, help pages for its Help section
 extern const menu_def_t engine3d_menu;
+extern const menu_def_t engine3d_help_menu;
 
 // Scene management
 void engine3d_clear_scene(void);

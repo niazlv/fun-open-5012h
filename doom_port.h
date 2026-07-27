@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * DOOM - id Software's renderer running a real WAD level.
  *
@@ -20,7 +21,9 @@
 #include "menu_widget.h"
 
 /*- Variables ---------------------------------------------------------------*/
+// Settings for the system menu, help pages for its Help section
 extern const menu_def_t doom_port_menu;
+extern const menu_def_t doom_port_help_menu;
 
 /*- Prototypes --------------------------------------------------------------*/
 void doom_port_init(void);

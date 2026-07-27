@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * Simple Flappy Bird Game
  * Basic side-scrolling bird game
@@ -14,7 +15,9 @@
 #include "menu_widget.h"
 
 /*- Variables ---------------------------------------------------------------*/
+// Settings for the system menu, help pages for its Help section
 extern const menu_def_t flappy_bird_menu;
+extern const menu_def_t flappy_bird_help_menu;
 
 /*- Prototypes --------------------------------------------------------------*/
 void flappy_bird_init(void);

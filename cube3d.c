@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * 3D Cube Renderer
  * Rotating, back-face culled 3D cube demo
@@ -728,8 +729,6 @@ static const menu_item_t g_menu_items[] =
     { .kind = MI_SEPARATOR },
     { .kind = MI_ACTION, .label = "Reset view",
       .u.action = { action_reset_view, NULL } },
-    { .kind = MI_ACTION, .label = "Help",
-      .u.action = { menu_action_info, &g_help_page } },
 };
 
 const menu_def_t cube3d_menu =
@@ -737,4 +736,19 @@ const menu_def_t cube3d_menu =
     .title = "3D Cube",
     .items = g_menu_items,
     .count = ARRAY_SIZE(g_menu_items),
+};
+
+// Read-only pages: the system menu shows them under Help, not among the
+// settings above
+static const menu_item_t g_help_items[] =
+{
+    { .kind = MI_ACTION, .label = "Controls",
+      .u.action = { menu_action_info, &g_help_page } },
+};
+
+const menu_def_t cube3d_help_menu =
+{
+    .title = "3D Cube",
+    .items = g_help_items,
+    .count = ARRAY_SIZE(g_help_items),
 };

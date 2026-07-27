@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * Simple Ray Tracing Test
  *
@@ -456,8 +457,6 @@ static const menu_item_t g_menu_items[] =
     { .kind = MI_SEPARATOR },
     { .kind = MI_ACTION, .label = "Render now",
       .u.action = { action_render, NULL } },
-    { .kind = MI_ACTION, .label = "Help",
-      .u.action = { menu_action_info, &g_help_page } },
 };
 
 const menu_def_t raytrace_test_menu =
@@ -465,4 +464,19 @@ const menu_def_t raytrace_test_menu =
     .title = "Ray Trace Test",
     .items = g_menu_items,
     .count = ARRAY_SIZE(g_menu_items),
+};
+
+// Read-only pages: the system menu shows them under Help, not among the
+// settings above
+static const menu_item_t g_help_items[] =
+{
+    { .kind = MI_ACTION, .label = "Controls",
+      .u.action = { menu_action_info, &g_help_page } },
+};
+
+const menu_def_t raytrace_test_help_menu =
+{
+    .title = "Ray Trace Test",
+    .items = g_help_items,
+    .count = ARRAY_SIZE(g_help_items),
 };

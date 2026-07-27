@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * DOOM.
  *
@@ -522,8 +523,6 @@ static const menu_item_t g_menu_items[] =
     { .kind = MI_SEPARATOR },
     { .kind = MI_ACTION, .label = "Restart level",
       .u.action = { action_respawn, NULL } },
-    { .kind = MI_ACTION, .label = "Help",
-      .u.action = { menu_action_info, &g_help_page } },
 };
 
 const menu_def_t doom_port_menu =
@@ -531,4 +530,19 @@ const menu_def_t doom_port_menu =
     .title = "DOOM",
     .items = g_menu_items,
     .count = ARRAY_SIZE(g_menu_items),
+};
+
+// Read-only pages: the system menu shows them under Help, not among the
+// settings above
+static const menu_item_t g_help_items[] =
+{
+    { .kind = MI_ACTION, .label = "Controls",
+      .u.action = { menu_action_info, &g_help_page } },
+};
+
+const menu_def_t doom_port_help_menu =
+{
+    .title = "DOOM",
+    .items = g_help_items,
+    .count = ARRAY_SIZE(g_help_items),
 };

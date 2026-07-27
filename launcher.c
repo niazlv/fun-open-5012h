@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * Application launcher
  */
@@ -38,6 +39,7 @@ typedef struct
   void (*cleanup)(void);
   void (*redraw)(void);       // full repaint after an overlay closes
   const menu_def_t *menu;     // application section of the system menu
+  const menu_def_t *help;     // its pages in the system menu's Help section
 } app_desc_t;
 
 /*- Variables ---------------------------------------------------------------*/
@@ -67,31 +69,36 @@ static const app_desc_t g_apps[] =
 {
   { "Oscilloscope", "Digital oscilloscope with signal analysis",
     scope_init_wrapper, scope_task, scope_buttons_handler, scope_cleanup_wrapper,
-    scope_redraw_all, &scope_menu },
+    scope_redraw_all, &scope_menu, &scope_help_menu },
   { "3D Graphics", "Rotating 3D cube demo",
     cube3d_init, cube3d_task, cube3d_buttons_handler, cube3d_cleanup,
-    cube3d_redraw, &cube3d_menu },
+    cube3d_redraw, &cube3d_menu, &cube3d_help_menu },
   { "3D Engine", "Advanced 3D engine with RayCast/RayTrace",
     engine3d_init, engine3d_task, engine3d_buttons_handler, engine3d_cleanup,
-    engine3d_redraw, &engine3d_menu },
+    engine3d_redraw, &engine3d_menu, &engine3d_help_menu },
   { "Ray Trace Test", "Simple ray tracing demo",
     raytrace_test_init, raytrace_test_task, raytrace_test_buttons_handler,
-    raytrace_test_cleanup, raytrace_test_redraw, &raytrace_test_menu },
+    raytrace_test_cleanup, raytrace_test_redraw, &raytrace_test_menu,
+    &raytrace_test_help_menu },
   { "Flappy Bird", "Side-scrolling bird game",
     flappy_bird_init, flappy_bird_task, flappy_bird_buttons_handler,
-    flappy_bird_cleanup, flappy_bird_redraw, &flappy_bird_menu },
+    flappy_bird_cleanup, flappy_bird_redraw, &flappy_bird_menu,
+    &flappy_bird_help_menu },
   { "Snake Game", "Classic snake game",
     snake_game_init, snake_game_task, snake_game_buttons_handler,
-    snake_game_cleanup, snake_game_redraw, &snake_game_menu },
+    snake_game_cleanup, snake_game_redraw, &snake_game_menu,
+    &snake_game_help_menu },
   { "DOOM", "id Software's renderer on a real WAD level",
     doom_port_init, doom_port_task, doom_port_buttons_handler,
-    doom_port_cleanup, doom_port_redraw, &doom_port_menu },
+    doom_port_cleanup, doom_port_redraw, &doom_port_menu, &doom_port_help_menu },
   { "CoreDump Viewer", "View crash dumps and stack traces",
     coredump_app_init, coredump_app_task, coredump_app_buttons_handler,
-    coredump_app_cleanup, coredump_app_redraw, &coredump_menu },
+    coredump_app_cleanup, coredump_app_redraw, &coredump_menu,
+    &coredump_help_menu },
   { "Flash Viewer", "Explore flash memory structure",
     flash_viewer_init, flash_viewer_task, flash_viewer_buttons_handler,
-    flash_viewer_cleanup, flash_viewer_redraw, &flash_viewer_menu },
+    flash_viewer_cleanup, flash_viewer_redraw, &flash_viewer_menu,
+    &flash_viewer_help_menu },
 };
 
 static menu_item_t g_app_items[ARRAY_SIZE(g_apps)];
@@ -232,6 +239,12 @@ void launcher_exit_app(void)
 const menu_def_t *launcher_app_menu(void)
 {
   return g_running ? g_running->menu : NULL;
+}
+
+//-----------------------------------------------------------------------------
+const menu_def_t *launcher_app_help(void)
+{
+  return g_running ? g_running->help : NULL;
 }
 
 //-----------------------------------------------------------------------------

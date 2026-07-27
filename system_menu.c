@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * System menu: the popup opened with the MENU key over whatever is running.
  *
@@ -41,11 +42,17 @@
 
 // A popup has no scrolling, so the assembled menu has to fit on the screen:
 // 11 rows x 20 px + margins = 224 px, opened at y = 10. MAIN_FIXED counts the
-// rows this file always contributes (2 submenus, 2 separators, Exit); the
+// rows this file always contributes (3 submenus, 2 separators, Exit); the
 // rest is the budget for the application's own rows.
 #define MAIN_MAX_ITEMS    11
-#define MAIN_FIXED        5
+#define MAIN_FIXED        6
 #define MAIN_APP_BUDGET   (MAIN_MAX_ITEMS - MAIN_FIXED)
+
+// Help: the application's own pages, then the ones that belong to the device.
+// HELP_FIXED is the separator plus Key Bindings.
+#define HELP_MAX_ITEMS    11
+#define HELP_FIXED        2
+#define HELP_APP_BUDGET   (HELP_MAX_ITEMS - HELP_FIXED)
 
 // Linker script symbols for memory usage calculation
 extern uint32_t _etext;
@@ -59,6 +66,11 @@ extern uint32_t __etext; // end of all flash data, including .data image
 /*- Variables ---------------------------------------------------------------*/
 static menu_item_t g_main_items[MAIN_MAX_ITEMS];
 static menu_def_t g_main_menu;
+
+// Assembled next to the main menu, and alive for as long as it is: the Help
+// row points straight at this array
+static menu_item_t g_help_items[HELP_MAX_ITEMS];
+static int g_help_count;
 
 /*- Implementations ---------------------------------------------------------*/
 
@@ -253,7 +265,8 @@ static const char *const g_key_bindings_lines[] =
   "SHIFT x2    - Sticky shift (if enabled)",
   "",
   "The rows above the first separator belong to",
-  "the running application; Help lists its keys.",
+  "the running application. Its keys, and every",
+  "other read-only page, are under Help.",
   "",
   "Remappable keys:",
   "  F1 F2 SAVE AUTO AC/DC 1X/10X",
@@ -330,9 +343,6 @@ static const menu_item_t g_general_items[] =
     .u.toggle = { &config.shift_mode_enabled, shift_mode_changed } },
   { .kind = MI_TOGGLE, .label = "Key Remap",
     .u.toggle = { &config.key_remapping_enabled, NULL } },
-  { .kind = MI_SEPARATOR },
-  { .kind = MI_ACTION, .label = "Key Bindings",
-    .u.action = { menu_action_info, &g_page_key_bindings } },
 };
 
 static const menu_item_t g_advanced_items[] =
@@ -347,10 +357,43 @@ static const menu_item_t g_advanced_items[] =
 };
 
 //-----------------------------------------------------------------------------
+// Help: one section for every read-only page in the firmware.
+//
+// Applications keep their text out of their own settings tables and hand it
+// over as a second table (launcher_app_help), so a page is always one place
+// away no matter which application is running: MENU > Help. The running
+// application's pages come first, the device's own below the separator.
+//-----------------------------------------------------------------------------
+static void help_menu_build(void)
+{
+  const menu_def_t *app_help = launcher_app_help();
+  int n = 0;
+
+  if (app_help && app_help->items)
+  {
+    for (int i = 0; i < app_help->count && n < HELP_APP_BUDGET; i++)
+      g_help_items[n++] = app_help->items[i];
+  }
+
+  if (n > 0)
+    g_help_items[n++] = (menu_item_t){ .kind = MI_SEPARATOR };
+
+  g_help_items[n++] = (menu_item_t)
+  {
+    .kind = MI_ACTION, .label = "Key Bindings",
+    .u.action = { menu_action_info, &g_page_key_bindings },
+  };
+
+  g_help_count = n;
+}
+
+//-----------------------------------------------------------------------------
 void system_menu_open(void)
 {
   const menu_def_t *app_menu = launcher_app_menu();
   int n = 0;
+
+  help_menu_build();
 
   // The running application's own settings come first: spliced in directly
   // when they fit, otherwise nested under the application name
@@ -384,6 +427,12 @@ void system_menu_open(void)
   {
     .kind = MI_SUBMENU, .label = "Advanced",
     .u.submenu = { g_advanced_items, ARRAY_SIZE(g_advanced_items) },
+  };
+
+  g_main_items[n++] = (menu_item_t)
+  {
+    .kind = MI_SUBMENU, .label = "Help",
+    .u.submenu = { g_help_items, g_help_count },
   };
 
   if (launcher_app_running())

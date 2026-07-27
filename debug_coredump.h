@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * Debug Coredump System
  * Provides stack trace and error analysis functionality
@@ -77,7 +78,9 @@ typedef struct {
 } coredump_store_t;
 
 /*- Variables ---------------------------------------------------------------*/
+// Settings for the system menu, help pages for its Help section
 extern const menu_def_t coredump_menu;
+extern const menu_def_t coredump_help_menu;
 
 /*- Prototypes --------------------------------------------------------------*/
 void debug_coredump_init(void);
