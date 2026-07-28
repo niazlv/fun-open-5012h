@@ -11,7 +11,7 @@
  *      servo_decode.c can_decode.c dht_decode.c sent_decode.c \
  *      midi_decode.c lin_decode.c ev1527_decode.c dshot_decode.c \
  *      spi_decode.c manchester_decode.c rc5_decode.c dali_decode.c \
- *      knx_decode.c \
+ *      knx_decode.c swo_decode.c swd_decode.c \
  *      record_window.c trend.c -lm -o /tmp/scope_test && /tmp/scope_test
  */
 
@@ -897,6 +897,156 @@ static void knx_g_telegram(KnxGen *g, const uint8_t *b, int n)
   }
 
   knx_g_char(g, (uint8_t)~x);
+}
+
+// SWO: an ordinary 8N1 line idling high, at whatever rate the trace clock
+// divider landed on. What makes it SWO is the bytes, so the generator only
+// has to put bytes on a wire.
+typedef struct { uint8_t *buf; int size; double t; double sps_bit; } SwoGen;
+
+static void swo_g(SwoGen *g, uint8_t *buf, int size, double period_ns,
+    double baud)
+{
+  g->buf = buf;
+  g->size = size;
+  g->sps_bit = 1e9 / baud / period_ns;
+  g->t = 20 * g->sps_bit;
+
+  memset(buf, 200, (size_t)size);
+}
+
+static void swo_g_byte(SwoGen *g, uint8_t v)
+{
+  int bits[10];
+
+  bits[0] = 0;                            // start
+
+  for (int k = 0; k < 8; k++)
+    bits[1 + k] = (v >> k) & 1;           // least significant first
+
+  bits[9] = 1;                            // stop
+
+  for (int k = 0; k < 10; k++)
+  {
+    int a = (int)(g->t + k * g->sps_bit + 0.5);
+    int e = (int)(g->t + (k + 1) * g->sps_bit + 0.5);
+
+    for (int i = a; i < e && i < g->size; i++)
+      g->buf[i] = bits[k] ? 200 : 56;
+  }
+
+  g->t += 10 * g->sps_bit;
+}
+
+static void swo_g_bytes(SwoGen *g, const uint8_t *b, int n)
+{
+  for (int i = 0; i < n; i++)
+    swo_g_byte(g, b[i]);
+}
+
+// SWD: bits at a clock the decoder cannot see. The turnaround cycles HOLD the
+// previous level, which is what an undriven line on a real bus does and what
+// the decoder must therefore ignore rather than read.
+typedef struct
+{
+  uint8_t *buf; int size; double t; double sps_bit; int last;
+} SwdGen;
+
+static void swd_g(SwdGen *g, uint8_t *buf, int size, double period_ns,
+    double hz)
+{
+  g->buf = buf;
+  g->size = size;
+  g->sps_bit = 1e9 / hz / period_ns;
+  g->t = 20 * g->sps_bit;
+  g->last = 0;
+
+  memset(buf, 56, (size_t)size);          // the host holds SWDIO low at rest
+}
+
+static void swd_g_bit(SwdGen *g, int b)
+{
+  int a = (int)(g->t + 0.5);
+  int e = (int)(g->t + g->sps_bit + 0.5);
+
+  for (int i = a; i < e && i < g->size; i++)
+    g->buf[i] = b ? 200 : 56;
+
+  g->last = b;
+  g->t += g->sps_bit;
+}
+
+static void swd_g_trn(SwdGen *g)          // undriven: the line stays put
+{
+  swd_g_bit(g, g->last);
+}
+
+static void swd_g_idle(SwdGen *g, int n)
+{
+  for (int i = 0; i < n; i++)
+    swd_g_bit(g, 0);
+}
+
+// One transaction. `a` is the register index A[3:2], `ack` is 1 OK, 2 WAIT,
+// 4 FAULT, and `flip` breaks the data parity on purpose.
+static void swd_g_tx(SwdGen *g, int ap, int write, int a, uint32_t data,
+    int ack, int flip)
+{
+  int rnw = write ? 0 : 1;
+  int a2 = a & 1, a3 = (a >> 1) & 1;
+  int par = (ap ^ rnw ^ a2 ^ a3) & 1;
+  int ones = 0;
+
+  swd_g_bit(g, 1);                        // start
+  swd_g_bit(g, ap);
+  swd_g_bit(g, rnw);
+  swd_g_bit(g, a2);
+  swd_g_bit(g, a3);
+  swd_g_bit(g, par);
+  swd_g_bit(g, 0);                        // stop
+  swd_g_bit(g, 1);                        // park
+  swd_g_trn(g);
+
+  for (int k = 0; k < 3; k++)
+    swd_g_bit(g, (ack >> k) & 1);         // least significant first
+
+  if (1 != ack)
+  {
+    swd_g_trn(g);
+    swd_g_idle(g, 8);
+
+    return;                               // WAIT and FAULT have no data phase
+  }
+
+  if (write)
+    swd_g_trn(g);
+
+  for (int k = 0; k < 32; k++)
+  {
+    int b = (int)((data >> k) & 1);
+
+    ones += b;
+    swd_g_bit(g, b);
+  }
+
+  swd_g_bit(g, (ones & 1) ^ (flip ? 1 : 0));
+
+  if (!write)
+    swd_g_trn(g);
+
+  swd_g_idle(g, 8);
+}
+
+static void swd_g_reset(SwdGen *g)        // fifty-two clocks of ones
+{
+  for (int i = 0; i < 52; i++)
+    swd_g_bit(g, 1);
+}
+
+static void swd_g_switch(SwdGen *g)       // 0xE79E, least significant first
+{
+  for (int k = 0; k < 16; k++)
+    swd_g_bit(g, (0xE79E >> k) & 1);
 }
 
 static double fn_sine(double ph, void *arg)     { (void)arg; return sin(2 * M_PI * ph); }
@@ -2163,6 +2313,35 @@ int main(void)
       for (int i = 0; i < n && ok; i++)
         ok = (lr.bytes[i] == ws_bytes[i]);
       check_near("payload match", ok, 1, 0);
+
+      // Three bytes are one pixel, and the colour is the thing the hex dump
+      // cannot show: the wire order is G-R-B, so 11 22 33 is #221133
+      const WsAnalysis *wa = ws2812_analysis();
+      char lab[16];
+      int gs, gl;
+
+      check_near("pixels", wa->pixels, 2, 0);
+      check_near("frames", wa->frames, 1, 0);
+      check_near("no partial pixel", wa->partial, 0, 0);
+
+      ws2812_group_at(wa, 1, &gs, &gl);
+      check_near("group start", gs, 0, 0);
+      check_near("group len", gl, 3, 0);
+
+      ws2812_group_at(wa, 5, &gs, &gl);
+      check_near("second group start", gs, 3, 0);
+
+      ws2812_byte_label(wa, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("pixel 0 colour", strcmp(lab, "#221133"), 0, 0);
+
+      ws2812_byte_label(wa, 5, lr.bytes[5], lab, sizeof(lab));
+      check_near("pixel 1 colour", strcmp(lab, "#55AAFF"), 0, 0);
+
+      ws2812_field_label(wa, 3, lr.bytes[3], lab, sizeof(lab));
+      check_near("field G1", strcmp(lab, "G1"), 0, 0);
+
+      ws2812_field_label(wa, 5, lr.bytes[5], lab, sizeof(lab));
+      check_near("field B1", strcmp(lab, "B1"), 0, 0);
     }
 
     // ----- NEC: addr 0x04 cmd 0x08, 10 us sample period -----
@@ -5655,6 +5834,383 @@ int main(void)
       synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
       check_near("sine is not knx",
           knx_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+    }
+
+    // ============================== SWO / ITM ==============================
+    //
+    // Electrically a UART and nothing else, so every bit of the identification
+    // is in what the bytes SAY. The packet grammar is the whole decoder.
+    printf("swo, a printf on stimulus port 0:\n");
+    {
+      // The synchronisation sequence a trace session opens with - 47 zero
+      // bits and a one - and then ITM_SendChar five times over
+      const uint8_t s[] =
+      {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+        0x01, 'H', 0x01, 'e', 0x01, 'l', 0x01, 'l', 0x01, 'o',
+      };
+      SwoGen g;
+      char lab[16];
+
+      swo_g(&g, buf, SIZE, 100.0, 1000000.0);
+      swo_g_bytes(&g, s, sizeof(s));
+
+      int n = logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      const SwoAnalysis *a = swo_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_SWO, 0);
+      check_near("every byte", n, (int)sizeof(s), 0);
+      check_near("rate", lr.rate, 1000000, 2);
+      check_near("one synchronisation", a->sync, 1, 0);
+      check_near("five characters", a->sw, 5, 0);
+      check_near("nothing left over", a->bad, 0, 0);
+      check_near("...so it is not ambiguous", lr.ambiguous, 0, 0);
+
+      // The point of the pin: the firmware's own printf, off one wire
+      check_near("the text came back", !strcmp(a->text, "Hello"), 1, 0);
+      check_near("on port 0", a->text_port, 0, 0);
+      check_near("and the header shows it",
+          NULL != strstr(lr.info, "\"Hello\""), 1, 0);
+
+      swo_byte_label(a, 7, lr.bytes[7], lab, sizeof(lab));
+      check_near("a character reads as one", !strcmp(lab, "'H'"), 1, 0);
+      swo_field_label(a, 6, lr.bytes[6], lab, sizeof(lab));
+      check_near("its header names the port", !strcmp(lab, "p0"), 1, 0);
+      swo_field_label(a, 7, lr.bytes[7], lab, sizeof(lab));
+      check_near("and the payload is numbered", !strcmp(lab, "D0"), 1, 0);
+      swo_byte_label(a, 5, lr.bytes[5], lab, sizeof(lab));
+      check_near("the sync sequence is named", !strcmp(lab, "SYNC"), 1, 0);
+
+      // A packet is one thing, so its header and payload light together
+      int gs, gl;
+
+      swo_group_at(a, 7, &gs, &gl);
+      check_near("header and payload are one", gs, 6, 0);
+      check_near("...of two bytes", gl, 2, 0);
+      swo_group_at(a, 2, &gs, &gl);
+      check_near("and the sync is one of six", gl, 6, 0);
+    }
+
+    // The other half of what a trace pin carries, and the half a UART could
+    // never be mistaken for: the DWT reporting on the core itself
+    printf("swo, what the DWT says:\n");
+    {
+      const uint8_t s[] =
+      {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+        0x0E, 0x0F, 0x10,                    // exception 15 entered
+        0x17, 0x00, 0x01, 0x00, 0x08,        // PC sample = 0x08000100
+        0x0E, 0x0F, 0x20,                    // ...and exited again
+      };
+      SwoGen g;
+      char lab[16];
+
+      swo_g(&g, buf, SIZE, 100.0, 2000000.0);
+      swo_g_bytes(&g, s, sizeof(s));
+
+      logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      const SwoAnalysis *a = swo_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_SWO, 0);
+      check_near("three hardware packets", a->hw, 3, 0);
+      check_near("no stimulus traffic", a->sw, 0, 0);
+      check_near("nothing left over", a->bad, 0, 0);
+
+      // An exception number is a name, not a number: 15 is the SysTick
+      swo_byte_label(a, 8, lr.bytes[8], lab, sizeof(lab));
+      check_near("the exception is named", !strcmp(lab, "SysTick in"), 1, 0);
+      swo_byte_label(a, 16, lr.bytes[16], lab, sizeof(lab));
+      check_near("...and so is the way out", !strcmp(lab, "SysTick out"), 1, 0);
+      swo_byte_label(a, 13, lr.bytes[13], lab, sizeof(lab));
+      check_near("the sampled PC", !strcmp(lab, "PC=08000100"), 1, 0);
+      swo_field_label(a, 9, lr.bytes[9], lab, sizeof(lab));
+      check_near("its header names the DWT unit", !strcmp(lab, "DWT2"), 1, 0);
+    }
+
+    // Timestamps interleave with the data, and an overflow says the macrocell
+    // dropped trace - which is worth seeing, because what follows has holes
+    printf("swo, timestamps and an overflow:\n");
+    {
+      const uint8_t s[] =
+      {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+        0x01, 'A', 0x30, 0x01, 'B', 0x70, 0x01, 'C',
+      };
+      SwoGen g;
+      char lab[16];
+
+      swo_g(&g, buf, SIZE, 100.0, 1000000.0);
+      swo_g_bytes(&g, s, sizeof(s));
+
+      swo_decode(buf, SIZE, 0, 100, &scratch, &lr);
+      const SwoAnalysis *a = swo_analysis();
+
+      check_near("one timestamp", a->ts, 1, 0);
+      check_near("three characters", a->sw, 3, 0);
+      check_near("nothing left over", a->bad, 0, 0);
+
+      swo_byte_label(a, 8, lr.bytes[8], lab, sizeof(lab));
+      check_near("the short timestamp", !strcmp(lab, "t+3"), 1, 0);
+      swo_byte_label(a, 11, lr.bytes[11], lab, sizeof(lab));
+      check_near("the overflow says so", !strcmp(lab, "OVERFLOW"), 1, 0);
+
+      // The text skips over both of them, because a timestamp is not a
+      // character and the stream is still one line
+      check_near("the text is still a line", !strcmp(a->text, "ABC"), 1, 0);
+    }
+
+    // A record that begins in the middle of a packet: the bytes in front of
+    // the first whole one are not a reading of anything, and saying so is the
+    // difference between a decoder and a guess
+    printf("swo, a record that opened mid-packet:\n");
+    {
+      const uint8_t s[] =
+      {
+        0x04,                                 // the tail of a packet gone by
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+        0x01, 'o', 0x01, 'k',
+      };
+      SwoGen g;
+      char lab[16];
+
+      swo_g(&g, buf, SIZE, 100.0, 1000000.0);
+      swo_g_bytes(&g, s, sizeof(s));
+
+      swo_decode(buf, SIZE, 0, 100, &scratch, &lr);
+      const SwoAnalysis *a = swo_analysis();
+
+      check_near("it found the first whole packet", a->cut, 1, 0);
+      check_near("and read the rest", a->sw, 2, 0);
+      check_near("with nothing left over", a->bad, 0, 0);
+
+      swo_field_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("the orphan byte says so", !strcmp(lab, "cut"), 1, 0);
+    }
+
+    printf("swo rejects the rest:\n");
+    {
+      // The case that matters, and the reason the grammar is checked at all:
+      // a console is the same signal on the same kind of wire
+      synth_uart(buf, SIZE, 1000.0, 9600.0, "MILKV-UART-TEST", 20000.0);
+      check_near("a console is not a trace pin",
+          swo_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      synth_uart(buf, SIZE, 1000.0, 9600.0, "Hello, world! 1234", 20000.0);
+      check_near("...nor is a longer line",
+          swo_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      synth_uart(buf, SIZE, 100.0, 1000000.0, "boot ok, temp 24.5C", 2000.0);
+      check_near("...nor one at an SWO rate",
+          swo_decode(buf, SIZE, 0, 100, &scratch, &lr), 0, 0);
+
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      check_near("sine is not swo",
+          swo_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+    }
+
+    // ================================= SWD =================================
+    //
+    // One probe on a two-wire bus, like the SPI decoder - and unlike it, the
+    // protocol checks itself, so a transaction that reads clean confirms the
+    // recovered clock along with itself.
+    printf("swd, a debugger attaching:\n");
+    {
+      SwdGen g;
+      char lab[16];
+
+      swd_g(&g, buf, SIZE, 100.0, 1000000.0);
+      swd_g_reset(&g);                          // fifty clocks of ones
+      swd_g_switch(&g);                         // out of JTAG, into SWD
+      swd_g_idle(&g, 8);
+      swd_g_tx(&g, 0, 0, 0, 0x2BA01477, 1, 0);  // DP read DPIDR
+      swd_g_tx(&g, 0, 1, 1, 0x50000000, 1, 0);  // DP write CTRL/STAT
+
+      int n = logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      const SwdAnalysis *a = swd_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_SWD, 0);
+      check_near("two transactions", a->txs, 2, 0);
+      check_near("a line reset", a->resets, 1, 0);
+      check_near("and the switch sequence", a->switches, 1, 0);
+      check_near("clock", a->clock_hz, 1000000, 4);
+      check_near("bytes: two of switch and two transactions", n, 12, 0);
+      check_near("it is sure", a->sure, 1, 0);
+      check_near("...so not ambiguous", lr.ambiguous, 0, 0);
+
+      // 0xA5 is the request every debug session opens with, and it comes out
+      // of the wire bits in the order they were sent
+      check_near("the DPIDR request", lr.bytes[2], 0xA5, 0);
+      check_near("...and the identifier it answered with", lr.bytes[3], 0x77, 0);
+      check_near("the CTRL/STAT write", lr.bytes[7], 0xA9, 0);
+
+      swd_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("the register is named", !strcmp(lab, "RD DPIDR"), 1, 0);
+      swd_byte_label(a, 6, lr.bytes[6], lab, sizeof(lab));
+      check_near("the value written once", !strcmp(lab, "2BA01477"), 1, 0);
+      swd_byte_label(a, 7, lr.bytes[7], lab, sizeof(lab));
+      check_near("and the write named", !strcmp(lab, "WR CTRL/STAT"), 1, 0);
+      swd_byte_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("the switch sequence is named",
+          !strcmp(lab, "JTAG>SWD"), 1, 0);
+
+      // Four bytes are one register and are shown as one
+      int gs, gl;
+
+      swd_group_at(a, 4, &gs, &gl);
+      check_near("the data groups", gs, 3, 0);
+      check_near("...as four", gl, 4, 0);
+      swd_group_at(a, 2, &gs, &gl);
+      check_near("the request stands alone", gl, 1, 0);
+    }
+
+    // An AP register has no name of its own: which one A[3:2] selects depends
+    // on a SELECT write that went past earlier, exactly the way a 1-Wire
+    // function command depends on the family code before it
+    printf("swd, an AP read needs the bank:\n");
+    {
+      SwdGen g;
+      char lab[16];
+
+      swd_g(&g, buf, SIZE, 100.0, 1000000.0);
+      swd_g_tx(&g, 0, 1, 2, 0x00000000, 1, 0);  // DP write SELECT, bank 0
+      swd_g_tx(&g, 1, 0, 0, 0x23000042, 1, 0);  // AP read CSW
+      swd_g_tx(&g, 1, 1, 1, 0x20000000, 1, 0);  // AP write TAR
+
+      logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      const SwdAnalysis *a = swd_analysis();
+
+      check_near("three transactions", a->txs, 3, 0);
+      check_near("the bank was remembered", a->select, 0, 0);
+
+      swd_byte_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("SELECT named", !strcmp(lab, "WR SELECT"), 1, 0);
+      swd_byte_label(a, 5, lr.bytes[5], lab, sizeof(lab));
+      check_near("the AP register named", !strcmp(lab, "RD CSW"), 1, 0);
+      swd_byte_label(a, 10, lr.bytes[10], lab, sizeof(lab));
+      check_near("...and the next one", !strcmp(lab, "WR TAR"), 1, 0);
+    }
+
+    // WAIT means "ask again": the target acknowledged and then said nothing,
+    // so there is no data phase to read and inventing one would be a lie
+    printf("swd, a target that said WAIT:\n");
+    {
+      SwdGen g;
+      char lab[16];
+
+      swd_g(&g, buf, SIZE, 100.0, 1000000.0);
+      swd_g_tx(&g, 1, 0, 3, 0, 2, 0);           // AP read DRW -> WAIT
+      swd_g_tx(&g, 1, 0, 3, 0x20000000, 1, 0);  // ...and again, this time OK
+      swd_g_tx(&g, 1, 0, 3, 0x20000004, 1, 0);
+
+      logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      const SwdAnalysis *a = swd_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_SWD, 0);
+      check_near("all three transactions", a->txs, 3, 0);
+      check_near("one of them waited", a->waits, 1, 0);
+      // A WAIT carries no data phase, so it is one byte and not five -
+      // inventing four more would be inventing a register read that never
+      // happened
+      check_near("one byte for it, five for each of the rest",
+          lr.count, 11, 0);
+      check_near("the two that answered", a->ok_txs, 2, 0);
+
+      swd_byte_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("and it says so", NULL != strstr(lab, "WAIT"), 1, 0);
+      check_near("the header too", NULL != strstr(lr.info, "W"), 1, 0);
+    }
+
+    // The data parity is REPORTED and not required: a packet that got that
+    // far passed five other checks, so a bad parity is a fact about the
+    // traffic and hiding the transaction would hide the fault
+    printf("swd, a data parity that does not agree:\n");
+    {
+      SwdGen g;
+      char lab[16];
+
+      swd_g(&g, buf, SIZE, 100.0, 1000000.0);
+      swd_g_tx(&g, 0, 0, 0, 0x2BA01477, 1, 1);  // parity flipped on purpose
+      swd_g_tx(&g, 0, 0, 3, 0x00000001, 1, 0);
+
+      swd_decode(buf, SIZE, 0, 100, &scratch, &lr);
+      const SwdAnalysis *a = swd_analysis();
+
+      check_near("still decoded", a->txs, 2, 0);
+      check_near("the parity is counted", a->par_err, 1, 0);
+      check_near("...as an error", lr.errors, 1, 0);
+
+      swd_byte_label(a, 4, lr.bytes[4], lab, sizeof(lab));
+      check_near("and marked on the value",
+          NULL != strstr(lab, "par!"), 1, 0);
+      check_near("the header says so",
+          NULL != strstr(lr.info, "par!"), 1, 0);
+    }
+
+    // One transaction is six checks, which unrelated traffic passes about
+    // once in a hundred candidate edges - and a record has hundreds of them.
+    // So one on its own is reported and marked, and auto mode passes over it.
+    printf("swd, one transaction is not enough:\n");
+    {
+      SwdGen g;
+
+      swd_g(&g, buf, SIZE, 100.0, 1000000.0);
+      swd_g_tx(&g, 0, 0, 0, 0x2BA01477, 1, 0);
+
+      check_near("asked for by name it decodes",
+          swd_decode(buf, SIZE, 0, 100, &scratch, &lr) > 0, 1, 0);
+      check_near("but it is not sure", swd_analysis()->sure, 0, 0);
+      check_near("...and says so", lr.ambiguous, 1, 0);
+      check_near("so auto passes over it",
+          logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr) > 0 &&
+          lr.proto == PROTO_SWD, 0, 0);
+    }
+
+    // Told the clock, the rate stops being an estimate - and the header
+    // stops apologising for it
+    printf("swd, told the clock off SWCLK:\n");
+    {
+      SwdGen g;
+
+      swd_g(&g, buf, SIZE, 100.0, 2000000.0);
+      swd_g_tx(&g, 0, 0, 0, 0x2BA01477, 1, 0);
+      swd_g_tx(&g, 0, 1, 1, 0x50000000, 1, 0);
+
+      swd_decode_set_clock(2000000);
+      swd_decode(buf, SIZE, 0, 100, &scratch, &lr);
+
+      check_near("two transactions", swd_analysis()->txs, 2, 0);
+      check_near("and it was told", swd_analysis()->told, 1, 0);
+      check_near("so the header does not hedge",
+          NULL == strstr(lr.info, "~"), 1, 0);
+
+      // ...and a clock that is not this record's produces NOTHING, which is
+      // the failure this decoder must have: no output beats wrong output
+      swd_decode_set_clock(200000);
+      check_near("a wrong clock decodes nothing",
+          swd_decode(buf, SIZE, 0, 100, &scratch, &lr), 0, 0);
+
+      swd_decode_set_clock(0);
+    }
+
+    printf("swd rejects the rest:\n");
+    {
+      synth_uart(buf, SIZE, 1000.0, 9600.0, "MILKV-UART-TEST", 20000.0);
+      check_near("uart is not swd",
+          swd_decode(buf, SIZE, 0, 1000, &scratch, &lr) > 0 &&
+          !lr.ambiguous, 0, 0);
+
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      check_near("sine is not swd",
+          swd_decode(buf, SIZE, 0, 1000, &scratch, &lr) > 0 &&
+          !lr.ambiguous, 0, 0);
+
+      DaliGen dg;
+
+      dali_g(&dg, buf, SIZE, 20000.0);
+      dali_g_fwd(&dg, 0x0A, 128);
+      check_near("dali is not swd",
+          swd_decode(buf, SIZE, 0, 20000, &scratch, &lr) > 0 &&
+          !lr.ambiguous, 0, 0);
     }
 
     // ----- structured decoders must all reject a sine -----

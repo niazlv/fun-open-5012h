@@ -83,6 +83,7 @@ static const char *const g_decoder_proto_labels[] =
 {
   "Auto", "UART", "1-Wire", "WS2812", "NEC IR", "Raw", "Servo PWM", "CAN",
   "DHT11/22", "SENT", "MIDI", "LIN", "EV1527", "DShot", "SPI! no clk", "Manchester", "RC5/RC6 IR", "DALI", "KNX TP1",
+  "SWO / ITM", "SWD (SWDIO)",
 };
 
 _Static_assert(ARRAY_SIZE(g_decoder_proto_labels) == PROTO_COUNT,
@@ -107,6 +108,16 @@ static void action_spi_clock(const void *arg)
 {
   (void)arg;
   scope_spi_clock_capture();
+  menu_close_popups();
+}
+
+//-----------------------------------------------------------------------------
+// ...and the same first half for SWD: the probe is on SWCLK now, and SWDIO is
+// where it goes next
+static void action_swd_clock(const void *arg)
+{
+  (void)arg;
+  scope_swd_clock_capture();
   menu_close_popups();
 }
 
@@ -769,6 +780,80 @@ static const char *const g_decoder_help_lines[] =
   "bus nobody is driving (all ones)",
   "fails it instead of reading as two",
   "pins that are high.",
+  "",
+  "SWO / ITM is the trace pin every",
+  "Cortex-M has and hardly anyone",
+  "looks at: the firmware's own printf,",
+  "off ONE wire. The library writes a",
+  "character to stimulus port 0 and the",
+  "macrocell puts it on the pin.",
+  "Electrically it is 8N1 idling high,",
+  "at traceclk/(SWOSCALER+1) - any rate",
+  "at all, not a standard baud - so the",
+  "rate is measured off the record.",
+  "What makes it SWO and not a console",
+  "is the PACKET GRAMMAR. Every byte is",
+  "a header or somebody's payload:",
+  "  xxxxxxSS  a source packet, SS says",
+  "  1/2/4 payload bytes, bit 2 says",
+  "  stimulus port or DWT",
+  "  0TTT0000  short timestamp",
+  "  11TT0000  long one, 7 bits a byte",
+  "  0x70      OVERFLOW - trace was",
+  "  dropped, so what follows has holes",
+  "  5x 00, 80 the sync sequence",
+  "Reserved DWT numbers and wrong",
+  "payload sizes are what turn a serial",
+  "console down, and it walks into one",
+  "within a few bytes. The packets must",
+  "TILE the record with nothing left",
+  "over, unless a sync sequence proves",
+  "it outright. Under 100 kbit is not a",
+  "trace port and is not offered - MIDI",
+  "at 31250 would otherwise fit.",
+  "The DWT half is the interesting one:",
+  "exceptions by NAME ('SysTick in'),",
+  "sampled program counters, and the",
+  "watchpoint reads and writes.",
+  "The header shows the text itself.",
+  "2 MHz: 20 to 100 us/div.",
+  "",
+  "SWD reads a debugger at work off",
+  "SWDIO alone. Same predicament as",
+  "SPI - the clock is on the other wire",
+  "- and a different outcome, because",
+  "SWD CHECKS ITSELF: parity over the",
+  "four address bits, a stop bit that",
+  "must be 0, a park bit that must be",
+  "1, three acknowledgement bits with",
+  "three legal values, and parity over",
+  "the 32 data bits. Six checks. A bit",
+  "time even slightly wrong fails them,",
+  "so a transaction that reads clean",
+  "confirms the recovered clock too.",
+  "Each packet is anchored on its OWN",
+  "start bit, so a probe that clocks in",
+  "bursts and stops between them costs",
+  "nothing - unlike SPI, the phase",
+  "never drifts past one packet.",
+  "Registers are NAMED, and an AP",
+  "register needs the bank out of a DP",
+  "SELECT write that went past earlier,",
+  "so SELECT is tracked as it goes.",
+  "Auto mode takes it on a JTAG-to-SWD",
+  "switch sequence, or on two clean",
+  "transactions with nothing but idle",
+  "between them. Otherwise pick it by",
+  "name: a WAIT costs an impostor only",
+  "four of the six checks, and four is",
+  "not rare enough.",
+  "Assumed, and producing NO output",
+  "rather than wrong output if untrue:",
+  "one turnaround cycle and overrun",
+  "detection off. Both are the reset",
+  "defaults. Decoder > 'SWD clock =",
+  "measured' with the probe on SWCLK",
+  "first; '~' marks a guessed rate.",
 };
 
 static const info_page_t g_page_decoder_help =
@@ -889,6 +974,10 @@ static const menu_item_t g_decoder_items[] =
   { .kind = MI_CHOICE, .label = "Manchester bit",
     .desc = "RC5 is Rise=1, DALI is Rise=0",
     .u.choice = { &config.man_polarity, g_man_pol_labels, 3, NULL } },
+  { .kind = MI_SEPARATOR },
+  { .kind = MI_ACTION, .label = "SWD clock = measured",
+    .desc = "Probe on SWCLK, then move it to SWDIO",
+    .u.action = { action_swd_clock, NULL } },
 };
 
 //-----------------------------------------------------------------------------

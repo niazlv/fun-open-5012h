@@ -210,7 +210,14 @@ typedef struct
   int      man_rate;
   int      man_polarity;
 
-  uint32_t padding[8];  // Reduced padding to accommodate new fields
+  // The SWD clock, in Hz, measured on SWCLK before the probe moved to SWDIO.
+  // Its own field rather than a share of spi_clock_hz: a bench that has both
+  // buses on it would otherwise have to re-measure every time the probe moved
+  // between them. 0 = work the bit time out of the record. Carved out of
+  // padding, like everything above it.
+  int      swd_clock_hz;
+
+  uint32_t padding[7];  // Reduced padding to accommodate new fields
 
   int      calib_channel_delta;
   int      calib_dac_zero;

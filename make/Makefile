@@ -74,6 +74,8 @@ SRCS += \
   ../rc5_decode.c \
   ../dali_decode.c \
   ../knx_decode.c \
+  ../swo_decode.c \
+  ../swd_decode.c \
   ../cube3d.c \
   ../engine3d.c \
   ../ui.c \

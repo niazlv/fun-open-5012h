@@ -53,6 +53,11 @@ typedef enum
   PROTO_RC5,      // RC5, RC5X and RC6: the Philips remotes, read as messages
   PROTO_DALI,     // IEC 62386 lighting: Manchester at 1200, read as commands
   PROTO_KNX,      // KNX TP1: 9600, pulse-presence coded - NOT Manchester
+  PROTO_SWO,      // SWO/ITM: a Cortex-M's trace pin, 8N1 carrying ITM packets
+  // SWD on SWDIO alone. Like SPI it is one probe on a clocked bus - unlike
+  // SPI, the protocol checks itself, so a transaction that reads clean is
+  // confirmed rather than merely plausible.
+  PROTO_SWD,
   PROTO_COUNT,
 } proto_t;
 
@@ -511,6 +516,30 @@ typedef struct
   DaliFrame frame[DALI_MAX_FRAMES];
 } DaliAnalysis;
 
+// WS2812 and the strips that copy it. Three bytes to a pixel, and the wire
+// sends them G-R-B: a reader looking at "11 22 33" is looking at green 0x11,
+// red 0x22 and blue 0x33, which is the one order nobody writes a colour in.
+//
+// A gap long enough to latch the strip ends an update and the next one
+// addresses pixel 0 again, so which pixel a byte belongs to is a question
+// about its FRAME and not about its place in the record.
+#define WS_MAX_PIXELS  (LOGIC_MAX_BYTES / 3)
+
+typedef struct
+{
+  int      bit_ns;
+  int      count;                  // bytes behind this reading
+  int      pixels;                 // whole ones over the record
+  int      frames;                 // updates: one per latching gap, plus the last
+  // A frame whose byte count was not a multiple of three. The strip ignores
+  // the remainder; here it means the record began or ended inside a pixel,
+  // which is worth saying rather than padding over.
+  bool     partial;
+  uint8_t  rgb[WS_MAX_PIXELS][3];  // put back into R-G-B order
+  uint8_t  pix[LOGIC_MAX_BYTES];   // which pixel; 0xFF for one cut short
+  uint8_t  base[LOGIC_MAX_BYTES];  // first byte of this byte's frame
+} WsAnalysis;
+
 // KNX TP1. Not a line code question but an addressing one: what a person
 // wants off this bus is who told whom, and both addresses are packed fields
 // rather than numbers.
@@ -528,6 +557,114 @@ typedef struct
   bool     fcs_ok;
 } KnxAnalysis;
 
+// SWO / ITM. What comes off a Cortex-M trace pin is a stream of packets, and
+// which packet a byte heads decides everything about it - a stimulus port
+// carries a character, a DWT discriminator carries a program counter or an
+// exception number, and both are the same eight bits on the wire.
+typedef enum
+{
+  ITM_NONE = 0,
+  ITM_SYNC,       // 47 zero bits and a one: a trace session opening
+  ITM_OVERFLOW,   // the macrocell dropped trace; what follows has holes in it
+  ITM_LTS,        // local timestamp, short or continuation-coded
+  ITM_GTS,        // global timestamp, lower or upper half
+  ITM_EXT,        // extension: a stimulus port page, usually
+  ITM_SW,         // instrumentation: a write to stimulus port N. printf.
+  ITM_HW,         // the DWT: event counters, exceptions, PC samples, watches
+} itm_kind_t;
+
+// Sixty-four bytes of record hold at most this many packets in practice: a
+// printf stream is two bytes a packet, so thirty-two covers a full record of
+// the densest traffic there is.
+#define SWO_MAX_PKTS  32
+
+typedef struct
+{
+  uint8_t  kind;    // itm_kind_t
+  uint8_t  id;      // stimulus port, DWT discriminator, or a format selector
+  uint8_t  first;   // its header byte in LogicResult.bytes
+  uint8_t  count;   // header and payload together
+  uint32_t value;   // the payload, assembled
+} ItmPacket;
+
+typedef struct
+{
+  int      rate;    // bit/s on the wire
+  int      packets;
+  int      sw;      // instrumentation packets: the printf
+  int      hw;      // DWT packets: exceptions, PC samples, watchpoints
+  int      sync;
+  int      ts;      // timestamps, local and global
+  // Bytes that could head no packet at all. The single most useful number
+  // here: the grammar is what tells SWO from a serial console, and this
+  // counts how often the record failed it.
+  int      bad;
+  uint32_t portmask;    // which stimulus ports were written to
+  // Where the first WHOLE packet starts. A record can open in the middle of
+  // one, and the bytes in front of it are not a reading of anything.
+  uint8_t  cut;
+  int8_t   text_port;   // the port carrying the text, or -1
+  uint8_t  pidx[LOGIC_MAX_BYTES];   // which packet each byte belongs to
+  ItmPacket pkt[SWO_MAX_PKTS];
+  char     text[20];    // the printf, reassembled, for the panel header
+} SwoAnalysis;
+
+// SWD. A transaction is a request byte and, when the target acknowledged it,
+// four bytes of register - and what the register IS depends on a SELECT write
+// that may have gone past several transactions earlier.
+typedef enum
+{
+  SWD_R_NONE = 0,
+  SWD_R_REQ,
+  SWD_R_DATA,
+  SWD_R_SWITCH,   // the sixteen bits that take a port out of JTAG into SWD
+} swd_role_t;
+
+#define SWD_MAX_TX  12
+
+typedef struct
+{
+  uint8_t  req;       // the eight wire bits, start in bit 0: 0xA5 is DPIDR
+  uint8_t  ack;       // 1 OK, 2 WAIT, 4 FAULT
+  uint8_t  reg;       // A[3:2]
+  uint8_t  first;     // its first byte in LogicResult.bytes
+  uint8_t  count;
+  bool     ap;        // AP rather than DP
+  bool     write;
+  bool     has_data;  // a data phase followed; WAIT and FAULT have none
+  bool     par_ok;    // the parity over the thirty-two data bits
+  uint32_t data;
+} SwdTx;
+
+typedef struct
+{
+  int      clock_hz;
+  int      txs;
+  int      resets;    // line resets: fifty clocks of ones, a debugger arriving
+  int      switches;  // JTAG-to-SWD sequences
+  int      waits;
+  int      faults;
+  int      par_err;
+  // Transactions the target acknowledged AND whose data parity agreed. The
+  // number that matters: a WAIT costs a would-be impostor only four of the
+  // six checks, and four is not enough to be rare.
+  int      ok_txs;
+  // Transactions with something OTHER than an idle line in front of them.
+  // Between two packets a host clocks idle cycles with SWDIO held low, so a
+  // gap carrying traffic means these two "transactions" are slices out of
+  // somebody else's signal.
+  int      gap_bad;
+  bool     told;      // the clock was measured on SWCLK, not guessed
+  // What lets auto mode take the record. See swd_decode() - the short version
+  // is that a debugger attaching is unmistakable and two clean transactions
+  // back to back on an otherwise idle line is nearly so.
+  bool     sure;
+  uint32_t select;    // the last DP SELECT written: which AP bank is current
+  uint8_t  role[LOGIC_MAX_BYTES];
+  uint8_t  tidx[LOGIC_MAX_BYTES];
+  SwdTx    tx[SWD_MAX_TX];
+} SwdAnalysis;
+
 typedef union
 {
   OwAnalysis     ow;
@@ -543,6 +680,9 @@ typedef union
   Rc5Analysis    rc5;
   DaliAnalysis   dali;
   KnxAnalysis    knx;
+  WsAnalysis     ws;
+  SwoAnalysis    swo;
+  SwdAnalysis    swd;
 } LogicAnalysis;
 
 extern LogicAnalysis g_logic_analysis;
@@ -625,8 +765,18 @@ void onewire_group_at(const OwAnalysis *a, int idx, int *start, int *len);
 // of bit numbers and the bracket labelled "command" under it are both needed.
 void onewire_field_label(const OwAnalysis *a, int idx, uint8_t v,
     char *buf, int size);
+// WS2812/WS2812B. Three bytes to a pixel, so the group is the pixel and the
+// value written across it is its colour - which the hex dump cannot show,
+// the wire order being G-R-B.
 int ws2812_decode(const uint8_t *data, int size, int offset, int period_ns,
     LogicScratch *scratch, LogicResult *out);
+const WsAnalysis *ws2812_analysis(void);
+void ws2812_byte_label(const WsAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void ws2812_field_label(const WsAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void ws2812_group_at(const WsAnalysis *a, int idx, int *start, int *len);
+
 int nec_decode(const uint8_t *data, int size, int offset, int period_ns,
     LogicScratch *scratch, LogicResult *out);
 // Servo bytes are the pulse width in tens of microseconds, so 150 is 1.50 ms
@@ -803,6 +953,39 @@ void knx_byte_label(const KnxAnalysis *a, int idx, uint8_t v,
 void knx_field_label(const KnxAnalysis *a, int idx, uint8_t v,
     char *buf, int size);
 void knx_group_at(const KnxAnalysis *a, int idx, int *start, int *len);
+
+// SWO / ITM: a Cortex-M's trace pin. An ordinary 8N1 line electrically, so
+// what identifies it is the ITM packet grammar the bytes have to satisfy -
+// which is strict enough that a serial console fails it within a few bytes.
+// The rate is measured off the record: SWO comes out of an integer divider
+// on the trace clock and is not on a baud table at all.
+int swo_decode(const uint8_t *data, int size, int offset, int period_ns,
+    LogicScratch *scratch, LogicResult *out);
+const SwoAnalysis *swo_analysis(void);
+void swo_byte_label(const SwoAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void swo_field_label(const SwoAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void swo_group_at(const SwoAnalysis *a, int idx, int *start, int *len);
+
+// SWD with one probe on SWDIO. The clock is on the other wire and cannot be
+// seen - but a transaction carries six checks of its own, so one that reads
+// clean confirms the bit time along with itself. Anchored on each packet's
+// own start bit, which is what makes a gated probe clock harmless.
+int swd_decode(const uint8_t *data, int size, int offset, int period_ns,
+    LogicScratch *scratch, LogicResult *out);
+const SwdAnalysis *swd_analysis(void);
+
+// The clock measured on SWCLK before the probe moved to SWDIO, in Hz. 0 (the
+// default) works the bit time out of the record, which needs a single-clock
+// run somewhere in it to have anything to measure.
+void swd_decode_set_clock(int hz);
+
+void swd_byte_label(const SwdAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void swd_field_label(const SwdAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void swd_group_at(const SwdAnalysis *a, int idx, int *start, int *len);
 
 // Dispatcher: forced = PROTO_AUTO tries every decoder and keeps the best
 // fit (most bytes, then fewest errors); a specific proto runs only that one

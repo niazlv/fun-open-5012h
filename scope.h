@@ -92,6 +92,7 @@ int scope_get_fps(void);
 void scope_decode_catch_start(void);
 void scope_decode_redraw(void);
 void scope_spi_clock_capture(void);
+void scope_swd_clock_capture(void);
 
 // Forget the accumulated persistence envelope and averaging state: the menu
 // calls it when it toggles either feature; the scope itself calls it on

@@ -56,6 +56,8 @@ const char *logic_proto_name(proto_t proto)
     case PROTO_RC5:     return "RC5";
     case PROTO_DALI:    return "DALI";
     case PROTO_KNX:     return "KNX";
+    case PROTO_SWO:     return "ITM";
+    case PROTO_SWD:     return "SWD";
     case PROTO_RAW:     return "RAW";
     default:            return "----";
   }
@@ -298,6 +300,14 @@ int logic_decode(const uint8_t *data, int size, int offset, int period_ns,
     // NEC only because a 9 ms infrared leader followed by four zero bits has
     // the same shape, and NEC's own leader is the more specific of the two.
     { PROTO_LIN,     lin_decode },
+    // Ahead of the shape-matchers, and it has to be: a trace pin at 1 Mbit
+    // puts runs of three to nine samples on the wire at a 100 ns timebase,
+    // which is a WS2812 strip's territory exactly, and the strip decoder gets
+    // four bytes out of it. What settles the argument is that this one is
+    // confirmed by a packet grammar - headers, payload sizes, reserved
+    // discriminators, a synchronisation sequence - and the strip decoder is
+    // confirmed by two pulse widths. The more specific claim goes first.
+    { PROTO_SWO,     swo_decode },
     { PROTO_ONEWIRE, onewire_decode },
     { PROTO_WS2812,  ws2812_decode },
     // After 1-Wire, whose zero slots are the same shape as a DHT bit and
@@ -333,6 +343,11 @@ int logic_decode(const uint8_t *data, int size, int offset, int period_ns,
     // it can sit ahead of the generic decoders. Guessing its own rate leaves
     // a factor of two open, and it says so by marking the record ambiguous.
     { PROTO_MANCH,   manchester_decode },
+    // Ahead of the generic readers, and it has earned the place the same way
+    // CAN and DShot did: a transaction is reported only once its address
+    // parity, its stop and park bits, its acknowledgement and its data parity
+    // all agree, and it takes two of those before it will claim a record.
+    { PROTO_SWD,     swd_decode },
     { PROTO_SERVO,   servo_decode },
     { PROTO_UART,    uart_decode },
     // Dead last but for the raw reader, and it never wins anyway: a data

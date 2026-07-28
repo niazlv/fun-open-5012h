@@ -529,6 +529,7 @@ static bool g_decode_hunt = false;
 // work here rather than doing it under the menu.
 static bool g_decode_hunt_request = false;
 static bool g_spi_clock_request = false;
+static bool g_swd_clock_request = false;
 static LogicResult g_logic;
 // The protocol-level read of the same record - which device answered on the
 // 1-Wire bus, which CAN frames went past, what the MIDI link said. Kept next
@@ -554,7 +555,10 @@ static union
   ManAnalysis  man;    // ...the bits under a self-clocking line code
   Rc5Analysis  rc5;    // ...which key on a Philips remote went down
   DaliAnalysis dali;   // ...which ballast was told what
-  KnxAnalysis  knx;    // ...and who told whom on a building's twisted pair
+  KnxAnalysis  knx;    // ...who told whom on a building's twisted pair
+  WsAnalysis   ws;     // ...what colour each pixel of a strip was told to be
+  SwoAnalysis  swo;    // ...what a running MCU printed out of its trace pin
+  SwdAnalysis  swd;    // ...and which registers a debugger was reading
 } g_pana;
 static int g_decode_sel = 0;              // selected byte (jump target)
 static int g_decode_period_ns = 0;        // record metrics the decode ran on
@@ -688,8 +692,51 @@ static int g_dband_row0 = DBAND_BOTTOM;
 static int g_dband_sel_start = 0;
 static int g_dband_sel_len = 1;
 static int8_t g_dband_byte[GRID_WIDTH];  // decoded byte under each column, -1 none
-static uint8_t g_dband_edge[(GRID_WIDTH + 7) / 8];             // frame starts
+static uint8_t g_dband_edge[(GRID_WIDTH + 7) / 8];             // byte starts
+// ...and where a GROUP starts, which is a subset of them. A byte boundary is
+// a fact about the rows that show bytes, and only about those: the bottom row
+// holds one value written across every byte of its group, so the boundaries
+// INSIDE that group divide nothing there. Ticking them anyway ran a coloured
+// hairline down the middle of "#221133" and "S1=543" - the row whose whole
+// point is that those bytes are one thing was the row being cut into three.
+static uint8_t g_dband_gedge[(GRID_WIDTH + 7) / 8];            // group starts
+// Columns no byte covers that were filled in to make a group one strip. The
+// fill is for the group's row and for nothing else: the rows that show BYTES
+// keep their boundaries exactly as the record drew them, gaps included.
+static uint8_t g_dband_gap[(GRID_WIDTH + 7) / 8];
+// The first row of the group's value. Above it a tick marks a byte, at it and
+// below a tick marks a group; DBAND_H1 has no such row and never reaches it.
+static int g_dband_group_y = DBAND_H3;
 static uint8_t g_dband_mask[DBAND_H3][(GRID_WIDTH + 7) / 8];   // the text
+
+// The colour swatch beside a group's value, where the value NAMES a colour.
+// "#221133" asks the reader to render a colour in their head, which is the
+// one thing an instrument that has the colour should never make them do.
+//
+// A box five pixels wide and one of gutter - exactly one character cell - so
+// it costs one character everywhere the fit arithmetic runs, on the trace and
+// in the panel alike. Outlined rather than bare: an unlit pixel is #000000,
+// and a black square on a dimmed band is indistinguishable from no square at
+// all, which is the one reading it must not have.
+#define DBAND_SW_W     5
+#define DBAND_SW_H     7
+#define DBAND_SW_EDGE  LCD_COLOR(160, 160, 170)
+
+// Which columns a swatch covers, and nothing else: the box's own edges are
+// its outermost columns, and a column knows it is one by its neighbour not
+// being in the box. Boxes are always separated by the text they sit beside,
+// so two of them can never touch and be read as one.
+static uint8_t g_dband_sw[(GRID_WIDTH + 7) / 8];
+
+static inline bool dband_sw_at(int c)
+{
+  return (c >= 0 && c < GRID_WIDTH) &&
+      ((g_dband_sw[c / 8] >> (c % 8)) & 1);
+}
+
+// The colour a group's value IS, for the swatch. Answered by the one protocol
+// whose values are colours; everything else has nothing to show.
+static bool decode_group_color(int idx, uint16_t *col);
 
 // Column-major, one byte per screen column holding the eight pixels of the
 // bit-number row there: the sweep then reads ONE byte per column instead of
@@ -1022,6 +1069,11 @@ static void build_trace_column(int c, uint16_t *column)
   // that a decoded byte covers the trace is dimmed and tinted in the byte's
   // colour, the column where a frame starts gets a full-height tick, and the
   // value is written in wherever it fits.
+  //
+  // In two steps, and the order is the whole point: everything that marks
+  // where a byte IS goes down first, and the text goes over it. A tick and a
+  // glyph want the same pixel often enough that whichever is written second
+  // wins, and the one worth keeping is never the tick.
   if (g_dband_rows && g_dband_byte[c] >= 0)
   {
     int b = g_dband_byte[c];
@@ -1031,18 +1083,55 @@ static void build_trace_column(int c, uint16_t *column)
         grouped ? DSTRIP_GROUP :
         ((b & 1) ? DSTRIP_ODD : DSTRIP_EVEN);
     bool edge = (g_dband_edge[c / 8] >> (c % 8)) & 1;
+    bool gedge = (g_dband_gedge[c / 8] >> (c % 8)) & 1;
+    bool gap = (g_dband_gap[c / 8] >> (c % 8)) & 1;
 
     for (int y = 0; y < g_dband_rows; y++)
     {
       int row = g_dband_row0 + y;
 
-      if (edge || y == g_dband_rows - 1)
-        column[row] = tint;                    // frame boundary / baseline
+      // A filled gap is the group's business alone. Above the group's row the
+      // column is left exactly as it was before anything was filled - no byte
+      // covers it, so no byte claims it.
+      if (gap && y < g_dband_group_y)
+        continue;
+      // Byte boundaries divide the rows that show bytes; the row that shows
+      // what a whole group came to is divided by the group's edges alone
+      bool tick = (y < g_dband_group_y) ? edge : gedge;
+
+      if (tick || y == g_dband_rows - 1)
+        column[row] = tint;                    // boundary / baseline
       else
         column[row] = MPANEL_DIM(column[row]); // room for the text to read
 
+      // The colour itself, beside the hex that names it
+      if (dband_sw_at(c) && y >= g_dband_group_y &&
+          y < g_dband_group_y + DBAND_SW_H)
+      {
+        bool frame = !dband_sw_at(c - 1) || !dband_sw_at(c + 1) ||
+            y == g_dband_group_y || y == g_dband_group_y + DBAND_SW_H - 1;
+        uint16_t swc;
+
+        if (frame || !decode_group_color(b, &swc))
+          swc = DBAND_SW_EDGE;
+
+        column[row] = swc;
+      }
+    }
+  }
+
+  // ...and the text over all of it, whether or not a byte covers this column.
+  // Bytes do not touch: a WS2812 byte ends on its last bit's high half and
+  // the next begins after the low tail, so a group's value - written once
+  // across every byte it took - runs over columns no byte covers. Gating the
+  // whole band on coverage took the glyphs in those columns out with the
+  // tint, and the value came out sliced at each byte boundary.
+  if (g_dband_rows)
+  {
+    for (int y = 0; y < g_dband_rows; y++)
+    {
       if (g_dband_mask[y][c / 8] & (1 << (c % 8)))
-        column[row] = LCD_WHITE_COLOR;
+        column[g_dband_row0 + y] = LCD_WHITE_COLOR;
     }
   }
 
@@ -1663,7 +1752,10 @@ static bool decode_proto_is_text(void)
 // landed in the middle of a message.
 static bool decode_proto_is_serial(proto_t proto)
 {
-  return (proto == PROTO_UART || proto == PROTO_MIDI);
+  // SWO joins them: whatever the packets mean, the wire is 8N1 idling high,
+  // so fitting the window to the rate and waiting for a line at rest work on
+  // it exactly as they do on a console
+  return (proto == PROTO_UART || proto == PROTO_MIDI || proto == PROTO_SWO);
 }
 
 //-----------------------------------------------------------------------------
@@ -1730,6 +1822,9 @@ static void decode_group_at(int idx, int *start, int *len)
       case PROTO_RC5:     rc5_group_at(&g_pana.rc5, idx, start, len); break;
       case PROTO_DALI:    dali_group_at(&g_pana.dali, idx, start, len); break;
       case PROTO_KNX:     knx_group_at(&g_pana.knx, idx, start, len); break;
+      case PROTO_WS2812:  ws2812_group_at(&g_pana.ws, idx, start, len); break;
+      case PROTO_SWO:     swo_group_at(&g_pana.swo, idx, start, len); break;
+      case PROTO_SWD:     swd_group_at(&g_pana.swd, idx, start, len); break;
       default: break;
     }
   }
@@ -1749,6 +1844,28 @@ static void decode_group_at(int idx, int *start, int *len)
     *start = idx;
     *len = 1;
   }
+}
+
+//-----------------------------------------------------------------------------
+// The colour byte `idx`'s group came to, where its value is a colour at all.
+// A WS2812 pixel is the only value any of these decoders reports that has
+// one; a CAN identifier and a temperature do not, and inventing a colour for
+// them would be decoration rather than information.
+static bool decode_group_color(int idx, uint16_t *col)
+{
+  if (g_logic.proto != PROTO_WS2812 || idx < 0 || idx >= g_logic.count)
+    return false;
+
+  uint8_t p = g_pana.ws.pix[idx];
+
+  // A pixel the frame cut short has three bytes and no colour
+  if (p >= WS_MAX_PIXELS)
+    return false;
+
+  *col = LCD_COLOR(g_pana.ws.rgb[p][0], g_pana.ws.rgb[p][1],
+      g_pana.ws.rgb[p][2]);
+
+  return true;
 }
 
 //-----------------------------------------------------------------------------
@@ -1796,7 +1913,6 @@ static void dband_ascii_text(char *buf, int size, uint8_t v)
 static void dband_meaning_text(char *buf, int size, int idx, uint8_t v)
 {
   static const char *const nec_field[4] = { "ADDR", "~ADDR", "CMD", "~CMD" };
-  static const char *const ws_field[3] = { "G", "R", "B" }; // WS2812 wire order
 
   switch (g_logic.proto)
   {
@@ -1805,7 +1921,10 @@ static void dband_meaning_text(char *buf, int size, int idx, uint8_t v)
       break;
 
     case PROTO_WS2812:
-      snprintf(buf, size, "%s%d", ws_field[idx % 3], idx / 3);
+      // The colour of the pixel, written once across the three bytes it took.
+      // The wire sends them G-R-B, so the hex dump is the one form of a
+      // colour nobody can read at a glance
+      ws2812_byte_label(&g_pana.ws, idx, v, buf, size);
       break;
 
     case PROTO_ONEWIRE:
@@ -1890,6 +2009,17 @@ static void dband_meaning_text(char *buf, int size, int idx, uint8_t v)
       knx_byte_label(&g_pana.knx, idx, v, buf, size);
       break;
 
+    case PROTO_SWO:
+      // What the packet was: a character out of a stimulus port, an exception
+      // the core took, a program counter the DWT sampled
+      swo_byte_label(&g_pana.swo, idx, v, buf, size);
+      break;
+
+    case PROTO_SWD:
+      // Which register the debugger touched, and what came back
+      swd_byte_label(&g_pana.swd, idx, v, buf, size);
+      break;
+
     case PROTO_SERVO:
       // The byte IS the width, in tens of microseconds; put it back into the
       // units the servo is commanded in, which is the only form anyone reads
@@ -1919,6 +2049,7 @@ static void dband_field_text(char *buf, int size, int idx, uint8_t v)
     case PROTO_MIDI:    midi_field_label(&g_pana.midi, idx, v, buf, size); break;
     case PROTO_EV1527:  ev1527_field_label(&g_pana.ev, idx, v, buf, size); break;
     case PROTO_DSHOT:   dshot_field_label(&g_pana.dshot, idx, v, buf, size); break;
+    case PROTO_WS2812:  ws2812_field_label(&g_pana.ws, idx, v, buf, size); break;
 
     case PROTO_MANCH:
       manchester_field_label(&g_pana.man, idx, v, buf, size);
@@ -1941,6 +2072,14 @@ static void dband_field_text(char *buf, int size, int idx, uint8_t v)
 
       if (0 == buf[0])
         dband_ascii_text(buf, size, v);
+      break;
+
+    case PROTO_SWO:
+      swo_field_label(&g_pana.swo, idx, v, buf, size);
+      break;
+
+    case PROTO_SWD:
+      swd_field_label(&g_pana.swd, idx, v, buf, size);
       break;
 
     // Everything else names its bytes one at a time already
@@ -1977,6 +2116,21 @@ static void dband_render_text(int x, int y, const char *str)
     }
 
     x += font->width;
+  }
+}
+
+//-----------------------------------------------------------------------------
+// ...and the swatch box beside it. Only its columns are recorded: which rows
+// it occupies is the same everywhere it appears, and the colour is looked up
+// from the byte the column already knows about.
+static void dband_render_swatch(int x)
+{
+  for (int i = 0; i < DBAND_SW_W; i++)
+  {
+    int px = x + i;
+
+    if (px >= 0 && px < GRID_WIDTH)
+      g_dband_sw[px / 8] |= (uint8_t)(1 << (px % 8));
   }
 }
 
@@ -2028,6 +2182,8 @@ static int decode_bit_slots(int *data0, bool *msb_first)
     case PROTO_UART:
     case PROTO_MIDI:
     case PROTO_LIN:
+    // An SWO pin is 8N1 on the wire, whatever the bytes turn out to mean
+    case PROTO_SWO:
       *data0 = 1;          // the start bit takes the first cell
       return 10;           // ...and the stop bit the last
 
@@ -2048,6 +2204,14 @@ static int decode_bit_slots(int *data0, bool *msb_first)
     // not land on the signal's own edges, the assumed rate is wrong.
     case PROTO_SPI:
       *msb_first = g_pana.spi.msb_first;
+      return 8;
+
+    // SWD for the same reason, and with less doubt attached: its bytes are
+    // eight clock cycles exactly, first bit off the wire in bit 0, and the
+    // grid drawn over them is the recovered clock. Lines that miss the
+    // signal's own edges mean the rate is wrong - except that here the
+    // parity already said it was not.
+    case PROTO_SWD:
       return 8;
 
     default:
@@ -2177,6 +2341,9 @@ static void decode_band_build(void)
 
   memset(g_dband_byte, -1, sizeof(g_dband_byte));
   memset(g_dband_edge, 0, sizeof(g_dband_edge));
+  memset(g_dband_gedge, 0, sizeof(g_dband_gedge));
+  memset(g_dband_gap, 0, sizeof(g_dband_gap));
+  memset(g_dband_sw, 0, sizeof(g_dband_sw));
   memset(g_dband_mask, 0, sizeof(g_dband_mask));
   memset(DBIT, 0, sizeof(*DBIT));
   g_dband_rows = 0;
@@ -2255,6 +2422,11 @@ static void decode_band_build(void)
     g_dband_rows = grouped ? DBAND_H3 : DBAND_H2;
   }
 
+  // Which row stops being about bytes. DBAND_H1 has no such row, so nothing
+  // ever reaches it and every tick stays a byte tick.
+  g_dband_group_y = (g_dband_rows == DBAND_H3) ? DBAND_TEXT_Y2 :
+      (g_dband_rows == DBAND_H2) ? DBAND_TEXT_Y1 : g_dband_rows;
+
   g_dband_row0 = DBAND_BOTTOM - g_dband_rows;
 
   // Second pass, walked a CHARACTER at a time rather than a byte at a time.
@@ -2280,6 +2452,35 @@ static void decode_band_build(void)
     // Wide enough for the longest a decoder writes: "DS1990 key", "RH=45.3%",
     // "SysEx Waldrf", "On C#-1 v127"
     char text[16];
+
+    // Where the group starts is the only boundary its value's row has
+    if (c0 >= 0 && c0 < GRID_WIDTH - 1)
+      g_dband_gedge[c0 / 8] |= (uint8_t)(1 << (c0 % 8));
+
+    // A group is one strip. Its bytes do not touch - the gap is the tail of
+    // the last bit of the byte before it - and leaving those columns uncovered
+    // left an undimmed slot of raw trace under the middle of the group's own
+    // value. The tail belongs to the byte it is the tail OF, so that is the
+    // byte whose tint it takes.
+    if (glyph > 1)
+    {
+      int lo = (c0 < 0) ? 0 : c0;
+      int hi = (gend > GRID_WIDTH - 1) ? GRID_WIDTH - 1 : gend;
+      int last = -1;
+
+      for (int c = lo; c < hi; c++)
+      {
+        if (g_dband_byte[c] >= 0)
+        {
+          last = g_dband_byte[c];
+        }
+        else if (last >= 0)
+        {
+          g_dband_byte[c] = (int8_t)last;
+          g_dband_gap[c / 8] |= (uint8_t)(1 << (c % 8));
+        }
+      }
+    }
 
     for (int i = 0; i < glyph; i++)
     {
@@ -2347,12 +2548,24 @@ static void decode_band_build(void)
     else
       dband_meaning_text(text, sizeof(text), b - 1, g_logic.bytes[b - 1]);
 
+    uint16_t swc;
+    // One character cell for the box and its gutter, and only where the value
+    // is a colour. The swatch goes with the text or not at all: half of a
+    // "#221133 [ ]" that did not fit says less than the hex on its own.
+    int swpx = decode_group_color(b - 1, &swc) ? font->width : 0;
     int span = gend - c0;
     int need = (int)strlen(text) * font->width;
 
-    if (text[0] && need <= span - 2)
-      dband_render_text(c0 + (span - need) / 2,
+    if (text[0] && need + swpx <= span - 2)
+    {
+      int x = c0 + (span - need - swpx) / 2;
+
+      if (swpx)
+        dband_render_swatch(x);
+
+      dband_render_text(x + swpx,
           (g_dband_rows == DBAND_H3) ? DBAND_TEXT_Y2 : DBAND_TEXT_Y1, text);
+    }
   }
 
   // Bottom-aligned, so a band that grew or shrank is repainted over the
@@ -3354,6 +3567,14 @@ static void dbit_span_update(void)
   g_dbit_top = top;
   g_dbit_bot = (bot > GRID_HEIGHT - 2) ? GRID_HEIGHT - 2 : bot;
 
+  // ...and it stops at the band. The line is a ruler for the WAVEFORM - that
+  // is the whole argument for drawing it over the trace - and the band is not
+  // waveform, it is screen the band took away from it. Run on into the band
+  // and the ruler becomes a hairline down the middle of the text there, which
+  // the band can only dim and not remove.
+  if (g_dband_rows && g_dbit_bot >= g_dband_row0)
+    g_dbit_bot = g_dband_row0 - 1;
+
   // The numbers go in the middle of that span. A digital trace lives at its
   // two rails and crosses the middle only on its edges - which is exactly
   // where the lines are and exactly where the numbers are not.
@@ -4217,6 +4438,16 @@ void scope_spi_clock_capture(void)
 }
 
 //-----------------------------------------------------------------------------
+// The same two-pass workflow for SWD: the probe is on SWCLK now, SWDIO next.
+// Its own stored number rather than a share of the SPI one, because a bench
+// with both buses on it would otherwise re-measure every time the probe moved
+// from one to the other.
+void scope_swd_clock_capture(void)
+{
+  g_swd_clock_request = true;
+}
+
+//-----------------------------------------------------------------------------
 void scope_decode_catch_start(void)
 {
   g_decode_hunt_request = true;
@@ -4256,6 +4487,7 @@ static void decode_update(void)
   uart_decode_set_baud(decoder_baud_value());
   spi_decode_set_clock(config.spi_clock_hz);
   spi_decode_set_order(config.spi_order);
+  swd_decode_set_clock(config.swd_clock_hz);
   manchester_decode_set_rate(decoder_man_rate_value());
   manchester_decode_set_polarity(config.man_polarity);
 
@@ -4375,6 +4607,12 @@ static void decode_update(void)
       g_pana.dali = *dali_analysis();
     else if (res.proto == PROTO_KNX)
       g_pana.knx = *knx_analysis();
+    else if (res.proto == PROTO_WS2812)
+      g_pana.ws = *ws2812_analysis();
+    else if (res.proto == PROTO_SWO)
+      g_pana.swo = *swo_analysis();
+    else if (res.proto == PROTO_SWD)
+      g_pana.swd = *swd_analysis();
 
     g_logic_have = true;
     g_decode_held = false;
@@ -4481,6 +4719,19 @@ static void decode_byte_label(char *buf, int size, int idx)
   if (!buf[0])
     snprintf(buf, size, "..");
 }
+
+//-----------------------------------------------------------------------------
+// How many character cells the label takes, swatch included. The swatch is a
+// cell wide by design, so this row's arithmetic stays in characters and the
+// pass that decides how many labels fit cannot drift from the pass that
+// draws them.
+static int decode_label_cells(const char *lab, int idx)
+{
+  uint16_t col;
+
+  return (int)strlen(lab) + (decode_group_color(idx, &col) ? 1 : 0);
+}
+
 // The text row is 30 characters wide and the outer two are the < > that say
 // the message runs on past what is shown
 #define DECODE_TEXT_MAX  26
@@ -4557,7 +4808,8 @@ static void draw_decode_panel(void)
 
           decode_group_at(i, &gs, &gl);
           decode_byte_label(lab, sizeof(lab), gs + gl - 1);
-          w = ((int)strlen(lab) + (i > txt_base ? 1 : 0)) * DECODE_CHAR_W;
+          w = (decode_label_cells(lab, gs + gl - 1) +
+              (i > txt_base ? 1 : 0)) * DECODE_CHAR_W;
 
           if (px + w > budget)
             break;
@@ -4711,6 +4963,18 @@ static void draw_decode_panel(void)
 
         // Lit for the group the cursor is in, whichever of its bytes that is
         bool sel = (g_decode_sel >= gs && g_decode_sel < gs + gl);
+        uint16_t swc;
+
+        // The colour itself where the label names one, in the character cell
+        // the fit arithmetic already reserved for it
+        if (decode_group_color(gs + gl - 1, &swc))
+        {
+          int sy = DECODE_PANEL_Y + 34 + (8 - DBAND_SW_H) / 2;
+
+          lcd_fill_rect(x, sy, DBAND_SW_W, DBAND_SW_H, swc);
+          lcd_draw_rect(x, sy, DBAND_SW_W, DBAND_SW_H, DBAND_SW_EDGE);
+          x += DECODE_CHAR_W;
+        }
 
         lcd_set_color(BG_COLOR, sel ? DSTRIP_SEL :
             (gs & 1) ? MPANEL_DIM(MEASURE_FREQ_COLOR) : MEASURE_FREQ_COLOR);
@@ -6780,6 +7044,28 @@ void scope_task(void)
     else
     {
       snprintf(msg, sizeof(msg), "SPI clock: nothing periodic to measure");
+    }
+
+    toast_show();
+    lcd_puts(GRID_LEFT, STATUS_LINE_Y, msg);
+    mpanel_invalidate();
+  }
+
+  if (g_swd_clock_request)
+  {
+    Measure m;
+    char msg[48];
+
+    g_swd_clock_request = false;
+
+    if (capture_get_raw_measure(&m) && m.frequency > 0)
+    {
+      config.swd_clock_hz = m.frequency;
+      snprintf(msg, sizeof(msg), "SWD clock stored: %d Hz", m.frequency);
+    }
+    else
+    {
+      snprintf(msg, sizeof(msg), "SWD clock: nothing periodic to measure");
     }
 
     toast_show();
