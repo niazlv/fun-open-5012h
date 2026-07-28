@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * Waveform measurements over a ring buffer of 8-bit samples.
  *
@@ -31,6 +32,13 @@ typedef struct
   int  periods;    // number of full periods seen
   int  slope_pos;  // samples where the signal was rising (beyond noise)
   int  slope_neg;  // samples where the signal was falling (beyond noise)
+  int  period_med_ns;   // median period in ns (what `frequency` is 1/x of)
+  int  period_min_ns;   // shortest and longest period seen - the one runt or
+  int  period_max_ns;   // stretched cycle the median deliberately hides
+  int  jitter_rms_ps;   // stddev of all periods, ps (sub-sample crossing
+                        // interpolation: ~31 ps resolution at 8 ns/sample);
+                        // -1 when no periods were found
+  int  jitter_pp_ps;    // max-min period spread, ps; -1 when n/a
   int  period_good_pct; // % of periods within +-25% of the median period:
                         // ~100 for a periodic signal, low for noise; glitch
                         // spikes only dent it instead of poisoning min/max
@@ -51,5 +59,14 @@ typedef struct
 // the record.
 void measure_run(const uint8_t *data, int size, int offset,
     int period_ns, int zero_point, Measure *m);
+
+// Time index (samples from the oldest) of the center of the narrowest
+// complete pulse in the record, with its width in samples; -1 when the
+// record has no two transitions. Thresholds are the caller's Schmitt pair
+// (typically mid +- hysteresis from a Measure). count_out (optional) gets
+// the number of pulses at that same width and polarity: 1 = a genuine
+// outlier, thousands = the signal's own half-periods.
+int measure_find_min_pulse(const uint8_t *data, int size, int offset,
+    int level_lo, int level_hi, int *width_out, bool *high_out, int *count_out);
 
 #endif // _MEASURE_H_

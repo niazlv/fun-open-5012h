@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * Waveform measurements over a ring buffer of 8-bit samples.
  *
@@ -34,6 +35,14 @@ static uint32_t g_hist[256];
 static int g_periods[MAX_PERIODS];
 
 /*- Implementations ---------------------------------------------------------*/
+
+//-----------------------------------------------------------------------------
+// Jitter figures are in picoseconds; a noisy millisecond-scale signal can
+// exceed what an int holds (2.1 ms in ps), so saturate instead of wrapping
+static int sat_ps(int64_t ps)
+{
+  return (ps > 0x7fffffff) ? 0x7fffffff : (int)ps;
+}
 
 //-----------------------------------------------------------------------------
 static uint32_t isqrt64(uint64_t value)
@@ -116,6 +125,11 @@ void measure_run(const uint8_t *data, int size, int offset,
   m->periods   = 0;
   m->period_good_pct = 0;
   m->level_pct = 0;
+  m->period_med_ns = 0;
+  m->period_min_ns = 0;
+  m->period_max_ns = 0;
+  m->jitter_rms_ps = -1; // no periods, no jitter figure
+  m->jitter_pp_ps  = -1;
 
   for (int v = 0; v < 256; v++)
     g_hist[v] = 0;
@@ -324,6 +338,41 @@ void measure_run(const uint8_t *data, int size, int offset,
   m->period_good_pct = good * 100 / nperiods;
   m->frequency = (int)((1000000000ll * 256) / ((int64_t)med * period_ns));
 
+  // Period statistics over every period in the record - the median above
+  // deliberately hides what these expose. sigma answers "how stable is this
+  // clock", min/max catch the one runt or stretched cycle a median erases.
+  // Periods are in x256 sub-sample units (31 ps resolution at 8 ns), so
+  // sigma is meaningful well below one sample period.
+  {
+    int64_t sum2 = 0, sq2 = 0;
+    int pmin = g_periods[0], pmax = g_periods[0];
+    int64_t mean_x256, var, sigma_x256;
+
+    for (int i = 0; i < nperiods; i++)
+    {
+      int p = g_periods[i];
+
+      sum2 += p;
+      sq2 += (int64_t)p * p;
+
+      if (p < pmin)
+        pmin = p;
+
+      if (p > pmax)
+        pmax = p;
+    }
+
+    mean_x256 = sum2 / nperiods;
+    var = sq2 / nperiods - mean_x256 * mean_x256;
+    sigma_x256 = (var > 0) ? (int64_t)isqrt64((uint64_t)var) : 0;
+
+    m->period_med_ns = (int)((int64_t)med * period_ns / 256);
+    m->period_min_ns = (int)((int64_t)pmin * period_ns / 256);
+    m->period_max_ns = (int)((int64_t)pmax * period_ns / 256);
+    m->jitter_rms_ps = sat_ps(sigma_x256 * period_ns * 1000 / 256);
+    m->jitter_pp_ps  = sat_ps((int64_t)(pmax - pmin) * period_ns * 1000 / 256);
+  }
+
   // Duty cycle over the whole-period span only. high_samples also counted
   // the tail after the last crossing; subtract it.
   int span = span_end - span_start;
@@ -353,4 +402,87 @@ void measure_run(const uint8_t *data, int size, int offset,
 
     m->duty_x10 = high_in_span * 1000 / span;
   }
+}
+
+//-----------------------------------------------------------------------------
+// The narrowest complete pulse in the record - the glitch finder's engine.
+//
+// The record holds 98304 samples and the screen shows 300 of them: 99.7% of
+// every acquisition is never seen. This scans all of it with the same Schmitt
+// thresholds the frequency counter uses, so what counts as "a pulse" is
+// consistent between the two.
+//
+// A pulse is a run of one Schmitt state bounded by transitions on both
+// sides; the leading and trailing partial runs are not counted (their true
+// width is unknowable from this record). Returns the time index (samples
+// from the oldest) of the CENTER of the narrowest pulse and its width, or -1
+// when the record never completed two transitions.
+//
+// count_out (optional) receives how many pulses of that same width and
+// polarity the record holds. It is the verdict on the report: one narrow
+// pulse among thousands of wide ones is a glitch; thousands of equally
+// narrow ones are just the signal's own half-periods quantized by the
+// sample clock (a 25 MHz sine at 125 MS/s is 5 samples/period, so its high
+// runs legitimately alternate between 2 and 3 samples).
+int measure_find_min_pulse(const uint8_t *data, int size, int offset,
+    int level_lo, int level_hi, int *width_out, bool *high_out, int *count_out)
+{
+  int state = -1;      // Schmitt state; -1 until the first decisive sample
+  int run_start = -1;  // time index where the current run began, -1 = partial
+  int best_w = 0, best_pos = -1, best_count = 0;
+  bool best_high = false;
+  int index = offset;
+
+  for (int i = 0; i < size; i++)
+  {
+    int v = data[index];
+    int ns = state;
+
+    if (v > level_hi)
+      ns = 1;
+    else if (v < level_lo)
+      ns = 0;
+
+    if (ns != state)
+    {
+      // A run that began at a transition (not at the record edge) is
+      // complete now and has a true width
+      if (state >= 0 && run_start >= 0)
+      {
+        int w = i - run_start;
+
+        if (best_pos < 0 || w < best_w)
+        {
+          best_w = w;
+          best_pos = run_start + w / 2;
+          best_high = (state == 1);
+          best_count = 1;
+        }
+        else if (w == best_w && (state == 1) == best_high)
+        {
+          best_count++;
+        }
+      }
+
+      run_start = (state >= 0) ? i : -1; // the very first run is partial too
+      state = ns;
+    }
+
+    if (++index == size)
+      index = 0;
+  }
+
+  if (best_pos < 0)
+    return -1;
+
+  if (width_out)
+    *width_out = best_w;
+
+  if (high_out)
+    *high_out = best_high;
+
+  if (count_out)
+    *count_out = best_count;
+
+  return best_pos;
 }
