@@ -40,7 +40,7 @@
 #include <ctype.h>
 
 #include "emu.h"
-#include "../../common.h"
+#include "../../src/core/common.h"
 
 /*- Definitions -------------------------------------------------------------*/
 #define ZERO_COUNT   128       /* the converter's mid-scale                   */

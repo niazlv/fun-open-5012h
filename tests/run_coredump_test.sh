@@ -22,14 +22,19 @@ stage=${TMPDIR:-/tmp}/coredump_test_stage
 rm -rf "$stage"
 mkdir -p "$stage"
 
-cp "$root/debug_coredump.c" "$stage/"
+cp "$root/src/debug/debug_coredump.c" "$stage/"
 cp "$root"/tests/hoststub/*.h "$stage/"
 
 # The pointer/integer cast warnings are about 32-bit device addresses being
 # handled on a 64-bit host; on the target they are exact.
+#
+# -I"$stage" stays first: the stubs have to win over the real capture.h,
+# lcd.h, timer.h and utils.h that the subsystem directories below also carry.
 cc -O1 -W -Wall -Wno-unused-function \
    -Wno-pointer-to-int-cast -Wno-int-to-pointer-cast \
-   -I"$stage" -I"$root" \
+   -I"$stage" \
+   -I"$root/src/debug" -I"$root/src/ui" -I"$root/src/hal" \
+   -I"$root/src/core" -I"$root/src/acq" \
    "$root/tests/coredump_test.c" -o "$stage/coredump_test"
 
 "$stage/coredump_test"

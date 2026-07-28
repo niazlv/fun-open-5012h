@@ -35,59 +35,111 @@ LDFLAGS += -Wl,--print-memory-usage
 LDFLAGS += -Wl,-Map=$(BUILD)/$(BIN).map
 LDFLAGS += -Wl,--script=$(LDSCRIPT)
 
+# One -I per subsystem, so a source keeps including a header by its bare name
+# ("measure.h", not "../dsp/measure.h"). The directories are an index for the
+# reader; they are deliberately not part of the include graph, so a file can be
+# regrouped later without touching every #include that names it.
+#
+# -I.. stays for "doom/doom.h", which names its directory on purpose: that tree
+# is vendored, and the path is what marks it as coming from outside.
 INCLUDES += \
   -I../include \
   -I../doom \
   -I.. \
+  -I../src/core \
+  -I../src/hal \
+  -I../src/acq \
+  -I../src/dsp \
+  -I../src/decode \
+  -I../src/ui \
+  -I../src/scope \
+  -I../src/apps \
+  -I../src/debug \
+
+# Objects land flat in $(BUILD), so every basename here must be unique across
+# all directories - two "utils.c" would quietly share one utils.o.
+SRCS += \
+  ../src/core/main.c \
+  ../src/core/startup_gd32f4.c \
+  ../src/core/syscalls.c \
+  ../src/core/config.c \
+  ../src/core/timer.c \
+  ../src/core/utils.c \
+
+# Parts that touch the hardware directly
+SRCS += \
+  ../src/hal/lcd.c \
+  ../src/hal/flash.c \
+  ../src/hal/buttons.c \
+  ../src/hal/battery.c \
+  ../src/hal/input.c \
+
+# Acquisition path: samples in
+SRCS += \
+  ../src/acq/capture.c \
+  ../src/acq/trigger.c \
+  ../src/acq/buffer.c \
+
+# What the samples are turned into
+SRCS += \
+  ../src/dsp/measure.c \
+  ../src/dsp/fft.c \
+  ../src/dsp/classify.c \
+  ../src/dsp/trend.c \
+  ../src/dsp/record_window.c \
+
+# Protocol decoders. logic_decode.c is the dispatcher the rest hang off.
+SRCS += \
+  ../src/decode/logic_decode.c \
+  ../src/decode/uart_decode.c \
+  ../src/decode/onewire_decode.c \
+  ../src/decode/ws2812_decode.c \
+  ../src/decode/nec_decode.c \
+  ../src/decode/servo_decode.c \
+  ../src/decode/can_decode.c \
+  ../src/decode/dht_decode.c \
+  ../src/decode/sent_decode.c \
+  ../src/decode/midi_decode.c \
+  ../src/decode/lin_decode.c \
+  ../src/decode/ev1527_decode.c \
+  ../src/decode/dshot_decode.c \
+  ../src/decode/spi_decode.c \
+  ../src/decode/manchester_decode.c \
+  ../src/decode/rc5_decode.c \
+  ../src/decode/dali_decode.c \
+  ../src/decode/knx_decode.c \
+  ../src/decode/swo_decode.c \
+  ../src/decode/swd_decode.c \
+
+# Widgets and screen furniture, with no scope logic of their own
+SRCS += \
+  ../src/ui/ui.c \
+  ../src/ui/menu_widget.c \
+  ../src/ui/launcher.c \
+  ../src/ui/system_menu.c \
+  ../src/ui/flash_viewer.c \
+  ../src/ui/fonts.c \
+  ../src/ui/images.c \
+
+# The instrument itself
+SRCS += \
+  ../src/scope/scope.c \
+  ../src/scope/scope_menu.c \
+
+# Everything the launcher can start that is not the scope
+SRCS += \
+  ../src/apps/cube3d.c \
+  ../src/apps/engine3d.c \
+  ../src/apps/raytrace_test.c \
+  ../src/apps/flappy_bird.c \
+  ../src/apps/snake_game.c \
+  ../src/apps/doom_port.c \
 
 SRCS += \
-  ../main.c \
-  ../lcd.c \
-  ../flash.c \
-  ../timer.c \
-  ../config.c \
-  ../buttons.c \
-  ../battery.c \
-  ../capture.c \
-  ../trigger.c \
-  ../buffer.c \
-  ../record_window.c \
-  ../measure.c \
-  ../trend.c \
-  ../fft.c \
-  ../classify.c \
-  ../logic_decode.c \
-  ../uart_decode.c \
-  ../onewire_decode.c \
-  ../ws2812_decode.c \
-  ../nec_decode.c \
-  ../servo_decode.c \
-  ../can_decode.c \
-  ../dht_decode.c \
-  ../sent_decode.c \
-  ../midi_decode.c \
-  ../lin_decode.c \
-  ../ev1527_decode.c \
-  ../dshot_decode.c \
-  ../spi_decode.c \
-  ../manchester_decode.c \
-  ../rc5_decode.c \
-  ../dali_decode.c \
-  ../knx_decode.c \
-  ../swo_decode.c \
-  ../swd_decode.c \
-  ../cube3d.c \
-  ../engine3d.c \
-  ../ui.c \
-  ../menu_widget.c \
-  ../input.c \
-  ../launcher.c \
-  ../system_menu.c \
-  ../scope_menu.c \
-  ../raytrace_test.c \
-  ../flappy_bird.c \
-  ../snake_game.c \
-  ../doom_port.c \
+  ../src/debug/debug_coredump.c \
+
+# Vendored: the DOOM engine, under its own COPYING
+SRCS += \
   ../doom/w_assets.c \
   ../doom/r_main.c \
   ../doom/r_bsp.c \
@@ -97,14 +149,6 @@ SRCS += \
   ../doom/p_move.c \
   ../doom/p_player.c \
   ../doom/p_doors.c \
-  ../scope.c \
-  ../syscalls.c \
-  ../utils.c \
-  ../fonts.c \
-  ../images.c \
-  ../debug_coredump.c \
-  ../flash_viewer.c \
-  ../startup_gd32f4.c \
 
 # Get build information
 BUILD_DATE := $(shell date '+%Y-%m-%d')
@@ -227,4 +271,14 @@ layout: $(BUILD)/$(BIN).elf
 	@arm-none-eabi-nm $(BUILD)/$(BIN).elf | grep -E ' (T|t) doom_assets(_end)?$$' | sort
 	@echo "image size: `wc -c < $(BUILD)/$(BIN).bin` bytes"
 
--include $(wildcard $(BUILD)/*.d)
+# *.o.d, not *.d: every dependency file this build writes is "<object>.o.d",
+# and the narrower pattern is what keeps an iCloud conflict copy out.
+#
+# iCloud renames the loser of a conflict by inserting a space and a number
+# before the extension, so "foo.o.d" comes back as "foo.o 2.d". The wide
+# pattern matched that, make split the name on the space, and the first half
+# was "build/foo.o" - a real file, so make read the object as a makefile and
+# died on the first NUL byte. It did so at parse time, which meant `make clean`
+# could not parse either: the tree could only be recovered by deleting build/
+# by hand. "foo.o 2.d" does not end in .o.d, so it is simply not matched.
+-include $(wildcard $(BUILD)/*.o.d)

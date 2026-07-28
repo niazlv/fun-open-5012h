@@ -1,7 +1,11 @@
 .settings
 #.vscode
-debug
+# Anchored: this is the Eclipse output directory at the repository root, not
+# any directory named "debug" - an unanchored pattern also swallowed
+# src/debug/, so new files there would never have been offered for commit.
+/debug/
 make/build
+tests/build
 .DS_Store
 .project
 # Built from a real IWAD by tools/wadpack.py - carries the WAD artwork,

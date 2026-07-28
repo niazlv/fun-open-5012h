@@ -6,13 +6,10 @@
  * known parameters and check the measured values against ground truth.
  *
  * Build & run (no hardware needed), from the repository root:
- *   cc -O2 -I. tests/host_test.c measure.c fft.c classify.c uart_decode.c \
- *      logic_decode.c nec_decode.c onewire_decode.c ws2812_decode.c \
- *      servo_decode.c can_decode.c dht_decode.c sent_decode.c \
- *      midi_decode.c lin_decode.c ev1527_decode.c dshot_decode.c \
- *      spi_decode.c manchester_decode.c rc5_decode.c dali_decode.c \
- *      knx_decode.c swo_decode.c swd_decode.c \
- *      record_window.c trend.c -lm -o /tmp/scope_test && /tmp/scope_test
+ *   make test
+ *
+ * The source list lives in tests/Makefile. It used to be spelled out here,
+ * where nothing compiled it and a moved file left it quietly wrong.
  */
 
 #include <stdio.h>

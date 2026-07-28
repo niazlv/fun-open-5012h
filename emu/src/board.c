@@ -29,7 +29,7 @@
 
 #include "gd32f4xx.h"
 #include "emu.h"
-#include "../../common.h"
+#include "../../src/core/common.h"
 
 /*- Definitions -------------------------------------------------------------*/
 #define PERIPH_OFF(addr)   ((uint32_t)(addr) - EMU_PERIPH_BASE)
