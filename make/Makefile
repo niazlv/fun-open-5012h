@@ -71,6 +71,7 @@ SRCS += \
   ../dshot_decode.c \
   ../spi_decode.c \
   ../manchester_decode.c \
+  ../rc5_decode.c \
   ../cube3d.c \
   ../engine3d.c \
   ../ui.c \
