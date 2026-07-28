@@ -324,197 +324,201 @@ int manchester_decode(const uint8_t *data, int size, int offset, int period_ns,
   if (rate < MAN_RATE_MIN || rate > MAN_RATE_MAX)
     return 0;
 
-  // Two passes at the most, and the second only when the convention was left
-  // to be worked out. A preamble exists to be recognised: it is 0x55 in
-  // nearly everything that has one, so a first byte of 0xAA means the frame
-  // was read the wrong way round and the whole record flips.
-  //
-  // This is an assumption about the PROTOCOL and not a fact about the
-  // waveform - 0x55 and 0xAA are equally good data, and no amount of looking
-  // at the samples separates the two conventions. So it is done only when
-  // asked for, and the panel says the reading was inferred.
-  for (int pass = 0; pass < 2; pass++)
+  // Walk the record looking for stretches where EVERY run is half a bit or a
+  // whole one. That is the structural claim, and it is checked before a
+  // single bit is read out.
+  for (int r = 1; r + 1 < runs && g_man.frames < MAN_MAX_FRAMES; r++)
   {
-    out->count = 0;
-    out->truncated = false;
-    g_man.frames = 0;
-    g_man.bits = 0;
-    g_man.viol = 0;
-    g_man.sure = false;
+    if (0 == man_halves(scratch->len[r], half_x256))
+      continue;
 
-    // Walk the record looking for stretches where EVERY run is half a bit or a
-    // whole one. That is the structural claim, and it is checked before a
-    // single bit is read out.
-    for (int r = 1; r + 1 < runs && g_man.frames < MAN_MAX_FRAMES; r++)
+    int r1 = r;
+    int shorts = 0, longs = 0, broken = 0;
+
+    while (r1 + 1 < runs && man_halves(scratch->len[r1 + 1], half_x256))
+      r1++;
+
+    for (int k = r; k <= r1; k++)
     {
-      if (0 == man_halves(scratch->len[r], half_x256))
-        continue;
+      int h = man_halves(scratch->len[k], half_x256);
 
-      int r1 = r;
-      int shorts = 0, longs = 0, broken = 0;
-
-      while (r1 + 1 < runs && man_halves(scratch->len[r1 + 1], half_x256))
-        r1++;
-
-      for (int k = r; k <= r1; k++)
-      {
-        int h = man_halves(scratch->len[k], half_x256);
-
-        if (1 == h)
-          shorts++;
-        else if (2 == h)
-          longs++;
-        else
-          broken++;
-      }
-
-      // A frame with a broken bit in it is still a frame; a stretch held
-      // together BY its broken bits is a different signal read wrongly.
-      //
-      // The RATIO is what matters, not the count. Letting runs of three and
-      // four halves into a stretch is exactly what lets an ordinary UART in:
-      // at half its rate a three-bit run is three halves, so the runs that
-      // used to END a stretch - and leave it bounded by something that is not
-      // silence - now sit inside one and join two of them together. A real
-      // frame has one broken bit in thirty runs, not one in three.
-      if (broken > 2 || broken * 8 > shorts + longs)
-      {
-        r = r1;
-
-        continue;
-      }
-
-      // Silence either side of it, or the end of the record - which is cut and
-      // says nothing either way
-      int64_t quiet = bit_x256 * MAN_IDLE_BITS;
-
-      if (r > 1 && (int64_t)scratch->len[r - 1] * 256 < quiet)
-      {
-        r = r1;
-
-        continue;
-      }
-
-      if (r1 + 1 < runs - 1 && (int64_t)scratch->len[r1 + 1] * 256 < quiet)
-      {
-        r = r1;
-
-        continue;
-      }
-
-      // The edge that starts a frame may be a mid-bit one or a boundary one,
-      // and nothing before it says which. The wrong choice runs out of
-      // transitions almost at once - the mid-bit edges it is looking for are
-      // only there when the data happens to put them there - so both are read
-      // and the one that gets further is the right one. That is what a
-      // self-clocking code lets you do.
-      uint8_t b0[MAN_MAX_BITS / 8], b1[MAN_MAX_BITS / 8];
-      int p0[MAN_MAX_BITS / 8], e0[MAN_MAX_BITS / 8];
-      int p1[MAN_MAX_BITS / 8], e1[MAN_MAX_BITS / 8];
-      uint32_t v0 = 0, v1 = 0;
-      int last0 = r, last1 = r;
-      int vi0 = 0, vi1 = 0, vb0 = 0, vb1 = 0;
-      int lim = (r1 + 2 < runs) ? r1 + 2 : runs;
-      int n0 = man_read(scratch, lim, bit_x256, r, r1, b0, p0, e0, &v0, &last0,
-          &vi0, &vb0);
-      int n1 = (r + 1 <= r1) ? man_read(scratch, lim, bit_x256, r + 1, r1, b1,
-          p1, e1, &v1, &last1, &vi1, &vb1) : 0;
-
-      // The reading with fewer violations wins, and the longer one only breaks
-      // a tie: a phase that is half a bit out turns every single bit into a
-      // violation, which is exactly how the wrong one now identifies itself.
-      bool take0 = (vi0 < vi1) || (vi0 == vi1 && n0 >= n1);
-      uint8_t *bytes = take0 ? b0 : b1;
-      int *bpos = take0 ? p0 : p1;
-      int *bend = take0 ? e0 : e1;
-      uint32_t value = take0 ? v0 : v1;
-      int n = take0 ? n0 : n1;
-      int last = take0 ? last0 : last1;
-      int viol = take0 ? vi0 : vi1;
-      int viol_bit = take0 ? vb0 : vb1;
-
-      r = r1;      // past this stretch either way
-
-      if (n < MAN_MIN_BITS)
-        continue;
-
-      // One bit in twenty-four with no middle is a fault in an otherwise
-      // sound frame. One in four is not a fault - it is a signal that does
-      // not put a transition in the middle of its bits, which is every
-      // signal that is not Manchester. The ratio is the line between "broken"
-      // and "not this protocol", and it has to be drawn somewhere.
-      if (viol * 6 > n)
-        continue;
-
-      // ...and it has to have eaten the WHOLE stretch. A Manchester frame's
-      // runs are the frame: every one of them is half a bit or a whole one
-      // because every bit put them there, so a reading that stops in the middle
-      // of a stretch has not read a frame - it has found a few runs of a UART's
-      // that happen to be one and two bit times long and given up where the
-      // three-bit one starts. That check is what keeps ordinary serial traffic
-      // out, and it costs nothing on a real frame.
-      if (last < r1 && n < MAN_MAX_BITS)
-        continue;
-
-      if (n >= MAN_MAX_BITS)
-        out->truncated = true;
-
-      int nbytes = (n + 7) / 8;
-
-      if (out->count + nbytes > LOGIC_MAX_BYTES)
-      {
-        out->truncated = true;
-        break;
-      }
-
-      ManFrame *f = &g_man.frame[g_man.frames];
-
-      f->bits = (uint8_t)n;
-      f->value = (n <= 32) ? value : 0;
-      f->first = (uint8_t)out->count;
-      f->count = (uint8_t)nbytes;
-      f->viol = (uint8_t)((viol > 255) ? 255 : viol);
-      f->viol_bit = (uint8_t)viol_bit;
-
-      for (int i = 0; i < nbytes; i++)
-      {
-        out->bytes[out->count] = bytes[i];
-        out->pos[out->count] = bpos[i];
-        out->end[out->count] = bend[i];
-        out->count++;
-      }
-
-      // BOTH run lengths, and no broken bit - or this frame proves nothing.
-      //
-      // A stretch whose runs are all one length is a square wave, and a
-      // square wave is Manchester of identical bits, and a stream of 0x55 out
-      // of a UART, and a clock: the same samples, with nothing in them to
-      // choose between the readings.
-      //
-      // And a frame with a bit that has no middle is still REPORTED - that is
-      // the whole point of tracking the phase rather than chasing edges - but
-      // it is not what a record gets claimed on. "Manchester with a fault in
-      // it" and "something else that fits Manchester badly" look identical
-      // from one frame; what tells them apart is a clean frame elsewhere in
-      // the record, and this is what waits for one.
-      if (shorts > 0 && longs > 0 && 0 == viol)
-        g_man.sure = true;
-
-      g_man.frames++;
-      g_man.bits += n;
-      g_man.viol += viol;
+      if (1 == h)
+        shorts++;
+      else if (2 == h)
+        longs++;
+      else
+        broken++;
     }
 
+    // A frame with a broken bit in it is still a frame; a stretch held
+    // together BY its broken bits is a different signal read wrongly.
+    //
+    // The RATIO is what matters, not the count. Letting runs of three and
+    // four halves into a stretch is exactly what lets an ordinary UART in:
+    // at half its rate a three-bit run is three halves, so the runs that
+    // used to END a stretch - and leave it bounded by something that is not
+    // silence - now sit inside one and join two of them together. A real
+    // frame has one broken bit in thirty runs, not one in three.
+    if (broken > 2 || broken * 8 > shorts + longs)
+    {
+      r = r1;
 
-    if (MAN_POL_AUTO != g_man_pol || 1 == pass)
+      continue;
+    }
+
+    // Silence either side of it, or the end of the record - which is cut and
+    // says nothing either way
+    int64_t quiet = bit_x256 * MAN_IDLE_BITS;
+
+    if (r > 1 && (int64_t)scratch->len[r - 1] * 256 < quiet)
+    {
+      r = r1;
+
+      continue;
+    }
+
+    if (r1 + 1 < runs - 1 && (int64_t)scratch->len[r1 + 1] * 256 < quiet)
+    {
+      r = r1;
+
+      continue;
+    }
+
+    // The edge that starts a frame may be a mid-bit one or a boundary one,
+    // and nothing before it says which. The wrong choice runs out of
+    // transitions almost at once - the mid-bit edges it is looking for are
+    // only there when the data happens to put them there - so both are read
+    // and the one that gets further is the right one. That is what a
+    // self-clocking code lets you do.
+    uint8_t b0[MAN_MAX_BITS / 8], b1[MAN_MAX_BITS / 8];
+    int p0[MAN_MAX_BITS / 8], e0[MAN_MAX_BITS / 8];
+    int p1[MAN_MAX_BITS / 8], e1[MAN_MAX_BITS / 8];
+    uint32_t v0 = 0, v1 = 0;
+    int last0 = r, last1 = r;
+    int vi0 = 0, vi1 = 0, vb0 = 0, vb1 = 0;
+    int lim = (r1 + 2 < runs) ? r1 + 2 : runs;
+    int n0 = man_read(scratch, lim, bit_x256, r, r1, b0, p0, e0, &v0, &last0,
+        &vi0, &vb0);
+    int n1 = (r + 1 <= r1) ? man_read(scratch, lim, bit_x256, r + 1, r1, b1,
+        p1, e1, &v1, &last1, &vi1, &vb1) : 0;
+
+    // The reading with fewer violations wins, and the longer one only breaks
+    // a tie: a phase that is half a bit out turns every single bit into a
+    // violation, which is exactly how the wrong one now identifies itself.
+    bool take0 = (vi0 < vi1) || (vi0 == vi1 && n0 >= n1);
+    uint8_t *bytes = take0 ? b0 : b1;
+    int *bpos = take0 ? p0 : p1;
+    int *bend = take0 ? e0 : e1;
+    uint32_t value = take0 ? v0 : v1;
+    int n = take0 ? n0 : n1;
+    int last = take0 ? last0 : last1;
+    int viol = take0 ? vi0 : vi1;
+    int viol_bit = take0 ? vb0 : vb1;
+
+    r = r1;      // past this stretch either way
+
+    if (n < MAN_MIN_BITS)
+      continue;
+
+    // One bit in twenty-four with no middle is a fault in an otherwise
+    // sound frame. One in four is not a fault - it is a signal that does
+    // not put a transition in the middle of its bits, which is every
+    // signal that is not Manchester. The ratio is the line between "broken"
+    // and "not this protocol", and it has to be drawn somewhere.
+    if (viol * 6 > n)
+      continue;
+
+    // ...and it has to have eaten the WHOLE stretch. A Manchester frame's
+    // runs are the frame: every one of them is half a bit or a whole one
+    // because every bit put them there, so a reading that stops in the middle
+    // of a stretch has not read a frame - it has found a few runs of a UART's
+    // that happen to be one and two bit times long and given up where the
+    // three-bit one starts. That check is what keeps ordinary serial traffic
+    // out, and it costs nothing on a real frame.
+    if (last < r1 && n < MAN_MAX_BITS)
+      continue;
+
+    if (n >= MAN_MAX_BITS)
+      out->truncated = true;
+
+    int nbytes = (n + 7) / 8;
+
+    if (out->count + nbytes > LOGIC_MAX_BYTES)
+    {
+      out->truncated = true;
       break;
+    }
 
-    if (0 == g_man.frames || 0xAA != out->bytes[0])
-      break;
+    // The convention, decided PER FRAME. A preamble is there to be
+    // recognised - it is 0x55 in nearly everything that has one - so a frame
+    // whose first byte comes out 0xAA was read the wrong way round.
+    //
+    // Per frame and not per record, because a record holds several: a bench
+    // that sends the same message in both conventions one after the other
+    // puts them in ONE capture, and a rule that looked at the first byte of
+    // the record would flip on the first frame's preamble and leave every
+    // other frame exactly as wrong as it was. Which is what it did.
+    //
+    // Flipping is free: the two conventions are exact inverses, so
+    // complementing the bits IS re-reading. Only the padding at the end of
+    // the last byte has to be put back, because those bits are not data.
+    bool flipped = false;
 
-    g_man_inverted = !g_man_inverted;
-    g_man.auto_inv = true;
+    if (MAN_POL_AUTO == g_man_pol && n >= 8 && 0xAA == bytes[0])
+    {
+      for (int i = 0; i < nbytes; i++)
+        bytes[i] = (uint8_t)~bytes[i];
+
+      if (n % 8)
+        bytes[nbytes - 1] &= (uint8_t)(0xFF << (8 - n % 8));
+
+      if (n <= 32)
+        value = (~value) & (uint32_t)((n == 32) ? 0xFFFFFFFFu :
+            ((1u << n) - 1u));
+
+      flipped = true;
+      g_man.auto_inv = true;
+    }
+
+    ManFrame *f = &g_man.frame[g_man.frames];
+
+    f->bits = (uint8_t)n;
+    f->value = (n <= 32) ? value : 0;
+    f->first = (uint8_t)out->count;
+    f->count = (uint8_t)nbytes;
+    f->viol = (uint8_t)((viol > 255) ? 255 : viol);
+    f->viol_bit = (uint8_t)viol_bit;
+    f->inv = flipped ? !g_man_inverted : g_man_inverted;
+
+    for (int i = 0; i < nbytes; i++)
+    {
+      out->bytes[out->count] = bytes[i];
+      out->pos[out->count] = bpos[i];
+      out->end[out->count] = bend[i];
+      out->count++;
+    }
+
+    // BOTH run lengths, and no broken bit - or this frame proves nothing.
+    //
+    // A stretch whose runs are all one length is a square wave, and a
+    // square wave is Manchester of identical bits, and a stream of 0x55 out
+    // of a UART, and a clock: the same samples, with nothing in them to
+    // choose between the readings.
+    //
+    // And a frame with a bit that has no middle is still REPORTED - that is
+    // the whole point of tracking the phase rather than chasing edges - but
+    // it is not what a record gets claimed on. "Manchester with a fault in
+    // it" and "something else that fits Manchester badly" look identical
+    // from one frame; what tells them apart is a clean frame elsewhere in
+    // the record, and this is what waits for one.
+    if (shorts > 0 && longs > 0 && 0 == viol)
+      g_man.sure = true;
+
+    g_man.frames++;
+    g_man.bits += n;
+    g_man.viol += viol;
   }
+
 
   if (0 == out->count)
     return 0;
@@ -551,15 +555,32 @@ int manchester_decode(const uint8_t *data, int size, int offset, int period_ns,
   // counted, and the bit is named: "somewhere in here" is not an answer.
   out->errors = g_man.viol;
 
-  char bad[10] = "";
+  // Which bit, in WHICH frame. Reading the bit number off frame zero when
+  // the violation is in frame two names a bit that was perfectly good.
+  char bad[12] = "";
 
-  if (g_man.viol > 0)
-    snprintf(bad, sizeof(bad), " !b%d", g_man.frame[0].viol ?
-        g_man.frame[0].viol_bit : 0);
+  for (int i = 0; i < g_man.frames; i++)
+  {
+    if (0 == g_man.frame[i].viol)
+      continue;
 
-  snprintf(out->info, sizeof(out->info), "MAN %s%d %s%s%s%s",
-      g_man.told ? "" : "~", rate, body,
-      g_man_inverted ? " inv" : "", g_man.auto_inv ? "?" : "", bad);
+    if (1 == g_man.frames)
+      snprintf(bad, sizeof(bad), " !b%d", g_man.frame[i].viol_bit);
+    else
+      snprintf(bad, sizeof(bad), " !f%db%d", i, g_man.frame[i].viol_bit);
+
+    break;
+  }
+
+  // The header describes the FIRST frame, so it says how that one was read.
+  // A record with both conventions in it gets 'inv?' only if the first frame
+  // needed flipping; the others carry their own 'i' on the trace.
+  bool first_inv = (g_man.frames > 0) ? g_man.frame[0].inv : g_man_inverted;
+  const char *how = !first_inv ? "" :
+      (MAN_POL_AUTO == g_man_pol) ? " inv?" : " inv";
+
+  snprintf(out->info, sizeof(out->info), "MAN %s%d %s%s%s",
+      g_man.told ? "" : "~", rate, body, how, bad);
 
   return out->count;
 }
@@ -585,11 +606,16 @@ void manchester_byte_label(const ManAnalysis *a, int idx, uint8_t v, char *buf,
     if (idx < f->first || idx >= f->first + f->count)
       continue;
 
+    // Which convention THIS frame was read in travels with it: in a record
+    // holding both, a header that names one of them names the wrong one for
+    // half the frames
+    const char *how = f->inv ? "i" : "";
+
     if (f->bits <= 32)
-      snprintf(buf, size, "%db %lX%s", f->bits, (unsigned long)f->value,
-          f->viol ? "!" : "");
+      snprintf(buf, size, "%db %lX%s%s", f->bits, (unsigned long)f->value,
+          how, f->viol ? "!" : "");
     else
-      snprintf(buf, size, "%db%s", f->bits, f->viol ? "!" : "");
+      snprintf(buf, size, "%db%s%s", f->bits, how, f->viol ? "!" : "");
 
     return;
   }

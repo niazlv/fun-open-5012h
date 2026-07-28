@@ -425,6 +425,7 @@ typedef struct
   // one is kept because "somewhere in here" is not an answer.
   uint8_t  viol;
   uint8_t  viol_bit;
+  bool     inv;     // which convention THIS frame was read in
   uint32_t value;   // the frame right-aligned, for the frames that fit
 } ManFrame;
 

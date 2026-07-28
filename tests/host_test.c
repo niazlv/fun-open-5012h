@@ -5091,6 +5091,37 @@ int main(void)
       check_near("it says it inferred that", a->auto_inv, 1, 0);
       check_near("header marks it", NULL != strstr(lr.info, "inv?"), 1, 0);
 
+      // ...and the case the bench actually produces: BOTH conventions in one
+      // record, one after the other, which is what a slow enough timebase
+      // catches. A rule that looked at the first byte of the RECORD would
+      // flip on the first frame's preamble and leave every other frame
+      // exactly as wrong as it was - so the convention is decided per FRAME.
+      man_g(&g, buf, SIZE, 20000.0, 1000.0);
+      man_g_frame(&g, 0x55A5C3, 24);
+      man_g_frame(&g, (~0x55A5C3u) & 0xFFFFFFu, 24);
+
+      manchester_decode_set_polarity(MAN_POL_AUTO);
+      manchester_decode(buf, SIZE, 0, 20000, &scratch, &lr);
+      const ManAnalysis *b = manchester_analysis();
+
+      check_near("two frames", b->frames, 2, 0);
+      check_near("the first was already right", b->frame[0].inv, 0, 0);
+      check_near("...and reads 55", lr.bytes[0], 0x55, 0);
+      check_near("the second was flipped", b->frame[1].inv, 1, 0);
+      check_near("...and reads 55 too",
+          lr.bytes[b->frame[1].first], 0x55, 0);
+      check_near("...with the payload", lr.bytes[b->frame[1].first + 1],
+          0xA5, 0);
+
+      // The frame that was flipped says so on the trace, because a header
+      // naming one convention names the wrong one for half the record
+      char lab2[16];
+
+      manchester_byte_label(b, b->frame[1].first, 0, lab2, sizeof(lab2));
+      check_near("and it says so", NULL != strchr(lab2, 'i'), 1, 0);
+      manchester_byte_label(b, 0, 0, lab2, sizeof(lab2));
+      check_near("the other does not", NULL == strchr(lab2, 'i'), 1, 0);
+
       manchester_decode_set_polarity(0);
     }
 
@@ -5153,6 +5184,10 @@ int main(void)
       check_near("the second is not", b->frame[1].viol, 1, 0);
       check_near("...on the same bit", b->frame[1].viol_bit, 15, 0);
       check_near("and the error is counted", lr.errors, 1, 0);
+      // ...and the header names the frame as well as the bit, because a bit
+      // number on its own points at a perfectly good bit of frame zero
+      check_near("header names frame and bit",
+          NULL != strstr(lr.info, "!f1b15"), 1, 0);
     }
 
     printf("manchester rejects the rest:\n");
