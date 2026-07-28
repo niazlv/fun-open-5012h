@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * Single-wire protocol decoding: shared run-length helper, the raw-bitstream
  * fallback and the auto-detecting dispatcher.
@@ -37,6 +38,12 @@ const char *logic_proto_name(proto_t proto)
     case PROTO_ONEWIRE: return "1-Wire";
     case PROTO_WS2812:  return "WS2812";
     case PROTO_NEC:     return "NEC IR";
+    case PROTO_SERVO:   return "Servo";
+    case PROTO_CAN:     return "CAN";
+    case PROTO_DHT:     return "DHT";
+    case PROTO_SENT:    return "SENT";
+    case PROTO_MIDI:    return "MIDI";
+    case PROTO_LIN:     return "LIN";
     case PROTO_RAW:     return "RAW";
     default:            return "----";
   }
@@ -268,14 +275,44 @@ int logic_decode(const uint8_t *data, int size, int offset, int period_ns,
     decoder_fn fn;
   } decoders[] =
   {
+    // First, and safely so: a CAN frame is confirmed by its own CRC-15
+    // before it is reported at all, so this one never takes a record that
+    // belongs to anything else
+    { PROTO_CAN,     can_decode },
     { PROTO_NEC,     nec_decode },
+    // Its break is at least ten dominant bits and 8N1 cannot send more than
+    // nine, so a LIN frame is as self-identifying as a CAN frame is. After
+    // NEC only because a 9 ms infrared leader followed by four zero bits has
+    // the same shape, and NEC's own leader is the more specific of the two.
+    { PROTO_LIN,     lin_decode },
     { PROTO_ONEWIRE, onewire_decode },
     { PROTO_WS2812,  ws2812_decode },
+    // After 1-Wire, whose zero slots are the same shape as a DHT bit and
+    // whose reset pulse a DHT start pulse would answer to; before the two
+    // generic ones, because forty slots and a checksum is a signature
+    { PROTO_DHT,     dht_decode },
+    // Its sync pulse calibrates the frame that follows it, so a SENT record
+    // says what its own tick is - but the shape is only a strong hint, and
+    // sent_decode marks a record with no CRC behind it ambiguous, which is
+    // what keeps this from taking anyone else's
+    { PROTO_SENT,    sent_decode },
+    // MIDI is a UART link, so it has to come before the UART decoder or it
+    // would never be reached; and before the servo, because a stream of
+    // clock bytes at a steady tempo IS a fixed-rate pulse train. What earns
+    // it the place is that it answers to one rate only and reads the bytes
+    // as a grammar, so it takes nothing that is not MIDI.
+    { PROTO_MIDI,    midi_decode },
+    // Before UART, because a servo pulse train IS decodable as UART - a
+    // 1.5 ms pulse frames bytes at 667 baud perfectly well - and after the
+    // three above, whose leaders and reset pulses are more specific still
+    { PROTO_SERVO,   servo_decode },
     { PROTO_UART,    uart_decode },
     { PROTO_RAW,     raw_decode },
   };
 
-  LogicResult cur;
+  // Static, not automatic: half a kilobyte of decoded record does not belong
+  // on the stack of a function the main loop calls every frame
+  static LogicResult cur;
 
   memset(out, 0, sizeof(*out));
 
@@ -290,6 +327,16 @@ int logic_decode(const uint8_t *data, int size, int offset, int period_ns,
 
     if (decoders[i].fn(data, size, offset, period_ns, scratch, &cur) > 0)
     {
+      // A decoder can report frames it cannot tell apart from something
+      // simpler: a UART record that never catches the line at rest and holds
+      // one repeated byte value IS a square wave, sample for sample. Guessing
+      // the protocol from that is not on, so in auto mode it falls through to
+      // the next decoder. Asked for UART by name - by the user, or by the
+      // caller's own earlier match - the question is already answered and the
+      // frames stand.
+      if (cur.ambiguous && forced == PROTO_AUTO)
+        continue;
+
       *out = cur;
       return cur.count;
     }
