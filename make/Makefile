@@ -69,6 +69,7 @@ SRCS += \
   ../lin_decode.c \
   ../ev1527_decode.c \
   ../dshot_decode.c \
+  ../spi_decode.c \
   ../cube3d.c \
   ../engine3d.c \
   ../ui.c \
