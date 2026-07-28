@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * Host-side tests for measure.c and fft.c: generate synthetic waveforms with
  * known parameters and check the measured values against ground truth.
@@ -7,7 +8,9 @@
  * Build & run (no hardware needed), from the repository root:
  *   cc -O2 -I. tests/host_test.c measure.c fft.c classify.c uart_decode.c \
  *      logic_decode.c nec_decode.c onewire_decode.c ws2812_decode.c \
- *      record_window.c -lm -o /tmp/scope_test && /tmp/scope_test
+ *      servo_decode.c can_decode.c dht_decode.c sent_decode.c \
+ *      midi_decode.c lin_decode.c \
+ *      record_window.c trend.c -lm -o /tmp/scope_test && /tmp/scope_test
  */
 
 #include <stdio.h>
@@ -20,6 +23,7 @@
 #include "classify.h"
 #include "logic_decode.h"
 #include "record_window.h"
+#include "trend.h"
 
 #define ZERO_POINT 128
 
@@ -61,6 +65,460 @@ static void synth(uint8_t *buf, int size, int offset,
 
     buf[(offset + i) % size] = (uint8_t)c;
   }
+}
+
+// 8N1 into a record: idle high, start bit low, LSB first, frames back to back
+// with no inter-frame gap - which is what a UART actually sends. start_ns may
+// be negative, for a record that opens in the middle of a message.
+static void synth_uart(uint8_t *buf, int size, double period_ns, double baud,
+    const char *msg, double start_ns)
+{
+  double bit_ns = 1e9 / baud;
+  int len = (int)strlen(msg);
+
+  for (int i = 0; i < size; i++)
+  {
+    double x = i * period_ns - start_ns;
+    int level = 1;
+
+    if (x >= 0)
+    {
+      int b = (int)(x / bit_ns);
+      int frame = b / 10, pos = b % 10;
+
+      if (frame < len)
+        level = (pos == 0) ? 0 : (pos == 9) ? 1 : ((msg[frame] >> (pos - 1)) & 1);
+    }
+
+    buf[i] = level ? 200 : 56;
+  }
+}
+
+// 1-Wire at 1 us per sample: the bus a DS18B20 or an iButton key actually
+// puts on the probe. Reset + presence, then bytes as bit slots - LSB first,
+// a short low for '1' and a long low for '0'.
+typedef struct { uint8_t *buf; int size; int pos; } OwGen;
+
+static void ow_level(OwGen *g, int level, int us)
+{
+  int end = g->pos + us;
+
+  for (; g->pos < end && g->pos < g->size; g->pos++)
+    g->buf[g->pos] = level ? 200 : 56;
+}
+
+static void ow_reset(OwGen *g)
+{
+  ow_level(g, 1, 100);
+  ow_level(g, 0, 480);  // reset
+  ow_level(g, 1, 70);
+  ow_level(g, 0, 100);  // presence
+  ow_level(g, 1, 200);
+}
+
+static void ow_byte(OwGen *g, uint8_t v)
+{
+  for (int b = 0; b < 8; b++)
+  {
+    int bit = (v >> b) & 1;
+
+    ow_level(g, 0, bit ? 6 : 60);
+    ow_level(g, 1, bit ? 64 : 10);
+  }
+}
+
+static void ow_bytes(OwGen *g, const uint8_t *d, int n)
+{
+  for (int i = 0; i < n; i++)
+    ow_byte(g, d[i]);
+}
+
+// One bus slot, for the SEARCH ROM triplets, which are not byte-aligned work
+static void ow_bit(OwGen *g, int bit)
+{
+  ow_level(g, 0, bit ? 6 : 60);
+  ow_level(g, 1, bit ? 64 : 10);
+}
+
+// Dallas CRC8: the tests build valid ROMs and scratchpads rather than
+// hard-coding check bytes, so a changed payload stays a valid one
+static uint8_t ow_crc(const uint8_t *d, int n)
+{
+  uint8_t crc = 0;
+
+  while (n--)
+  {
+    uint8_t b = *d++;
+
+    for (int i = 0; i < 8; i++)
+    {
+      uint8_t mix = (uint8_t)((crc ^ b) & 1);
+
+      crc >>= 1;
+      if (mix) crc ^= 0x8C;
+      b >>= 1;
+    }
+  }
+
+  return crc;
+}
+
+// CAN 2.0A/2.0B onto a wire: build the bit sequence a controller would send,
+// stuff it, and paint it into the record at a given bit time. `inv` is the
+// CAN_H view, where dominant is the HIGH level.
+typedef struct
+{
+  uint8_t *buf;
+  int      size;
+  int      pos;         // samples written
+  double   bit_samples;
+  int      inv;
+  uint16_t crc;
+  uint16_t crc_xor;     // corrupt the transmitted CRC, for the refusal tests
+  int      last, same;  // stuffing state
+} CanGen;
+
+static void can_g_raw(CanGen *g, int bit)
+{
+  // recessive (1) is the resting level; on CAN_H that is the low one
+  int level = g->inv ? !bit : bit;
+  int end = (int)((g->pos / g->bit_samples + 1) * g->bit_samples + 0.5);
+
+  for (; g->pos < end && g->pos < g->size; g->pos++)
+    g->buf[g->pos] = level ? 200 : 56;
+}
+
+// One frame bit: stuffed, and folded into the CRC when asked
+static void can_g_bit(CanGen *g, int bit, int crc_it)
+{
+  if (g->same >= 5)
+  {
+    can_g_raw(g, !g->last);          // the stuff bit the receiver must drop
+    g->last = !g->last;
+    g->same = 1;
+  }
+
+  if (crc_it)
+  {
+    uint16_t inv = (uint16_t)(((g->crc >> 14) & 1) ^ (bit & 1));
+
+    g->crc = (uint16_t)((g->crc << 1) & 0x7FFF);
+    if (inv) g->crc ^= 0x4599;
+  }
+
+  can_g_raw(g, bit);
+
+  if (bit == g->last) g->same++;
+  else { g->last = bit; g->same = 1; }
+}
+
+static void can_g_field(CanGen *g, uint32_t v, int bits, int crc_it)
+{
+  for (int i = bits - 1; i >= 0; i--)
+    can_g_bit(g, (int)((v >> i) & 1), crc_it);
+}
+
+static void can_g_idle(CanGen *g, int bits)
+{
+  for (int i = 0; i < bits; i++)
+    can_g_raw(g, 1);
+
+  g->last = 1;
+  g->same = 0;
+}
+
+// A whole frame, ACK slot included: ack=1 is a bus where somebody heard it
+static void can_g_frame(CanGen *g, uint32_t id, int ext, int rtr,
+    const uint8_t *data, int dlc, int ack)
+{
+  g->crc = 0;
+  g->last = 1;
+  g->same = 0;
+
+  can_g_bit(g, 0, 1);                       // SOF
+
+  if (ext)
+  {
+    can_g_field(g, id >> 18, 11, 1);        // base id
+    can_g_bit(g, 1, 1);                     // SRR
+    can_g_bit(g, 1, 1);                     // IDE
+    can_g_field(g, id & 0x3FFFF, 18, 1);    // extended id
+    can_g_bit(g, rtr, 1);                   // RTR
+    can_g_bit(g, 0, 1);                     // r1
+  }
+  else
+  {
+    can_g_field(g, id, 11, 1);
+    can_g_bit(g, rtr, 1);                   // RTR
+    can_g_bit(g, 0, 1);                     // IDE
+  }
+
+  can_g_bit(g, 0, 1);                       // r0
+  can_g_field(g, (uint32_t)dlc, 4, 1);
+
+  if (!rtr)
+  {
+    for (int i = 0; i < dlc && i < 8; i++)
+      can_g_field(g, data[i], 8, 1);
+  }
+
+  uint16_t crc = (uint16_t)(g->crc ^ g->crc_xor);
+
+  can_g_field(g, crc, 15, 0);
+  can_g_bit(g, 1, 0);                       // CRC delimiter
+  g->same = 0;                              // fixed form: no stuffing past here
+  can_g_raw(g, ack ? 0 : 1);                // ACK slot
+  can_g_raw(g, 1);                          // ACK delimiter
+  can_g_idle(g, 7 + 3);                     // EOF + interframe space
+}
+
+// DHT11 / DHT22 onto a wire at 1 us per sample: the host's start pulse, the
+// sensor's 80/80 answer, then forty bit slots whose HIGH carries the value
+typedef struct { uint8_t *buf; int size; int pos; } DhtGen;
+
+static void dht_g_level(DhtGen *g, int level, int us)
+{
+  int end = g->pos + us;
+
+  for (; g->pos < end && g->pos < g->size; g->pos++)
+    g->buf[g->pos] = level ? 200 : 56;
+}
+
+// start_us = 0 leaves the host's pulse and the response out, for a record
+// that only caught the data
+static void dht_g_frame(DhtGen *g, const uint8_t *by, int start_us)
+{
+  if (start_us > 0)
+  {
+    dht_g_level(g, 1, 100);
+    dht_g_level(g, 0, start_us);   // 18 ms for a DHT11, about 1 for a DHT22
+    dht_g_level(g, 1, 30);
+    dht_g_level(g, 0, 80);         // the sensor answers
+    dht_g_level(g, 1, 80);
+  }
+  else
+  {
+    dht_g_level(g, 1, 400);
+  }
+
+  for (int i = 0; i < 40; i++)
+  {
+    int bit = (by[i / 8] >> (7 - (i % 8))) & 1;
+
+    dht_g_level(g, 0, 50);
+    dht_g_level(g, 1, bit ? 70 : 26);
+  }
+
+  dht_g_level(g, 0, 50);           // the sensor lets go
+}
+
+// SENT (SAE J2716): every pulse is a falling edge, five ticks low and high
+// for the rest, and the whole value is the time from one falling edge to the
+// next. `inv` swaps the levels, for a probe behind an inverting buffer.
+typedef struct
+{
+  uint8_t *buf;
+  int      size;
+  int      pos;
+  double   tick;     // samples per tick
+  int      inv;
+} SentGen;
+
+static void sent_g_level(SentGen *g, int level, double ticks)
+{
+  int end = (int)(g->pos + ticks * g->tick + 0.5);
+  int v = g->inv ? !level : level;
+
+  for (; g->pos < end && g->pos < g->size; g->pos++)
+    g->buf[g->pos] = v ? 200 : 56;
+}
+
+// One pulse of `ticks` total: five low, the remainder high
+static void sent_g_pulse(SentGen *g, int ticks)
+{
+  sent_g_level(g, 0, 5);
+  sent_g_level(g, 1, ticks - 5);
+}
+
+static uint8_t sent_t_crc(const uint8_t *nib, int n, int recommended)
+{
+  static const uint8_t tab[16] =
+      { 0, 13, 7, 10, 14, 3, 9, 4, 1, 12, 6, 11, 15, 2, 8, 5 };
+  uint8_t crc = 5;
+
+  for (int i = 0; i < n; i++)
+    crc = (uint8_t)(tab[crc] ^ (nib[i] & 0xF));
+
+  return recommended ? tab[crc] : crc;
+}
+
+// sync, status, data nibbles, CRC, then a pause long enough to be one
+static void sent_g_frame(SentGen *g, uint8_t status, const uint8_t *nib,
+    int n, int crc)
+{
+  sent_g_pulse(g, 56);
+  sent_g_pulse(g, 12 + status);
+
+  for (int i = 0; i < n; i++)
+    sent_g_pulse(g, 12 + (nib[i] & 0xF));
+
+  sent_g_pulse(g, 12 + (crc & 0xF));
+  sent_g_pulse(g, 90);          // pause: longer than any nibble
+}
+
+// A servo line: `n` pulses of `width_us` on a grid of `frame_us`, idle low,
+// with a lead-in so the first pulse is not the run the record's start cut
+static void servo_g(uint8_t *buf, int size, int period_ns, int width_us,
+    int frame_us, int n)
+{
+  int lead = 500;
+  int w = (int)((int64_t)width_us * 1000 / period_ns);
+  int f = (int)((int64_t)frame_us * 1000 / period_ns);
+
+  memset(buf, 56, size);
+
+  for (int k = 0; k < n; k++)
+  {
+    int s = lead + k * f;
+
+    for (int i = 0; i < w && s + i < size; i++)
+      buf[s + i] = 200;
+  }
+}
+
+// MIDI on the wire: 8N1 at 31250 baud, idle high, LSB first - a UART, and
+// the position is kept in fractional samples so the bit grid does not drift
+// over a record the way integer stepping would
+typedef struct { uint8_t *buf; int size; double t; double sps_bit; int inv; } MidiGen;
+
+static void midi_g_run(MidiGen *g, int level, double bits)
+{
+  int a = (int)(g->t + 0.5);
+
+  g->t += bits * g->sps_bit;
+
+  int b = (int)(g->t + 0.5);
+  int v = ((level ^ g->inv) & 1) ? 200 : 56;
+
+  for (int i = a; i < b && i < g->size; i++)
+    g->buf[i] = (uint8_t)v;
+}
+
+static void midi_g_byte(MidiGen *g, uint8_t v)
+{
+  midi_g_run(g, 0, 1);                    // start bit
+
+  for (int b = 0; b < 8; b++)
+    midi_g_run(g, (v >> b) & 1, 1);       // data, LSB first
+
+  midi_g_run(g, 1, 1);                    // stop bit
+}
+
+static void midi_g(MidiGen *g, uint8_t *buf, int size, double period_ns, int inv)
+{
+  g->buf = buf;
+  g->size = size;
+  g->t = 0;
+  g->sps_bit = 1e9 / 31250.0 / period_ns;
+  g->inv = inv;
+
+  memset(buf, inv ? 56 : 200, (size_t)size);
+
+  midi_g_run(g, 1, 20);                   // the line at rest before the first
+}
+
+static void midi_g_bytes(MidiGen *g, const uint8_t *d, int n)
+{
+  for (int i = 0; i < n; i++)
+    midi_g_byte(g, d[i]);
+}
+
+// LIN: a break, a 0x55 sync byte, a protected identifier and a response.
+// 8N1 like the rest, but the rate comes off the sync byte rather than being
+// agreed in advance, so the generator states it and the decoder must find it.
+typedef struct { uint8_t *buf; int size; double t; double sps_bit; int inv; } LinGen;
+
+static void lin_g_run(LinGen *g, int recessive, double bits)
+{
+  int a = (int)(g->t + 0.5);
+
+  g->t += bits * g->sps_bit;
+
+  int b = (int)(g->t + 0.5);
+  int v = ((recessive ^ g->inv) & 1) ? 200 : 56;
+
+  for (int i = a; i < b && i < g->size; i++)
+    g->buf[i] = (uint8_t)v;
+}
+
+static void lin_g_byte(LinGen *g, uint8_t v)
+{
+  lin_g_run(g, 0, 1);                     // start bit: dominant
+
+  for (int b = 0; b < 8; b++)
+    lin_g_run(g, (v >> b) & 1, 1);        // LSB first, recessive is a one
+
+  lin_g_run(g, 1, 1);                     // stop bit
+}
+
+static void lin_g(LinGen *g, uint8_t *buf, int size, double period_ns,
+    double baud, int inv)
+{
+  g->buf = buf;
+  g->size = size;
+  g->t = 0;
+  g->sps_bit = 1e9 / baud / period_ns;
+  g->inv = inv;
+
+  memset(buf, inv ? 56 : 200, (size_t)size);
+
+  lin_g_run(g, 1, 20);                    // the bus at rest
+}
+
+static uint8_t lin_g_pid(uint8_t id)
+{
+  int b0 = (id >> 0) & 1, b1 = (id >> 1) & 1, b2 = (id >> 2) & 1;
+  int b3 = (id >> 3) & 1, b4 = (id >> 4) & 1, b5 = (id >> 5) & 1;
+  int p0 = b0 ^ b1 ^ b2 ^ b4;
+  int p1 = !(b1 ^ b3 ^ b4 ^ b5);
+
+  return (uint8_t)((id & 0x3F) | (p0 << 6) | (p1 << 7));
+}
+
+static uint8_t lin_g_csum(const uint8_t *d, int n, uint8_t pid, int enhanced)
+{
+  unsigned sum = enhanced ? pid : 0u;
+
+  for (int i = 0; i < n; i++)
+  {
+    sum += d[i];
+
+    if (sum > 0xFF)
+      sum -= 0xFF;
+  }
+
+  return (uint8_t)(~sum);
+}
+
+// The header: 13 dominant bits, a delimiter, the sync byte and the identifier
+static void lin_g_header(LinGen *g, uint8_t id)
+{
+  lin_g_run(g, 0, 13);                    // break
+  lin_g_run(g, 1, 1);                     // break delimiter
+  lin_g_byte(g, 0x55);
+  lin_g_byte(g, lin_g_pid(id));
+}
+
+static void lin_g_frame(LinGen *g, uint8_t id, const uint8_t *d, int n,
+    int enhanced)
+{
+  lin_g_header(g, id);
+
+  for (int i = 0; i < n; i++)
+    lin_g_byte(g, d[i]);
+
+  lin_g_byte(g, lin_g_csum(d, n, lin_g_pid(id), enhanced));
+  lin_g_run(g, 1, 8);                     // inter-frame space
 }
 
 static double fn_sine(double ph, void *arg)     { (void)arg; return sin(2 * M_PI * ph); }
@@ -594,40 +1052,510 @@ int main(void)
       }
     }
 
+    // ----- a console line, back to back frames, at four sample rates -----
+    //
+    // The message a board under test actually sends. Two things about it
+    // broke the first decoder: the frames follow each other with no gap, and
+    // 45 bytes at 115200 is 3.9 ms, which does not fit a 24576-sample record
+    // until 256 ns/sample. At 128 ns both ends of the record cut a run in
+    // half, and a bit time taken from the shortest run - which is what the
+    // first version did - reads one of those halves as a bit, gets the rate
+    // wrong, fails every stop bit, and hands the record to the raw decoder
+    // at a rate that changes with every acquisition.
+    {
+      const char *line = "UUUU MILKV-UART-TEST 115200-8N1 #0123456789\r\n";
+      const int period[] = { 128, 256, 512, 2048 };
+      int full = (int)strlen(line);
+
+      printf("uart: console line, frames back to back:\n");
+
+      for (unsigned p = 0; p < sizeof(period)/sizeof(period[0]); p++)
+      {
+        // How much of the message the record can hold at this sample rate
+        double bit_ns = 1e9 / 115200.0;
+        int fits = (int)(((double)SIZE * period[p] - 100000.0) / (bit_ns * 10));
+        int want = (fits < full) ? fits : full;
+        char name[40];
+
+        synth_uart(buf, SIZE, period[p], 115200.0, line, 100000.0);
+
+        int n = logic_decode(buf, SIZE, 0, period[p], PROTO_AUTO, &scratch, &lr);
+
+        snprintf(name, sizeof(name), "%d ns: proto uart", period[p]);
+        check_near(name, lr.proto, PROTO_UART, 0);
+        snprintf(name, sizeof(name), "%d ns: baud", period[p]);
+        check_near(name, lr.rate, 115200, 0);
+        snprintf(name, sizeof(name), "%d ns: framing errors", period[p]);
+        check_near(name, lr.errors, 0, 0);
+        snprintf(name, sizeof(name), "%d ns: bytes (fits %d)", period[p], want);
+        check_near(name, n, want, 0);
+        snprintf(name, sizeof(name), "%d ns: at message start", period[p]);
+        check_near(name, lr.burst_start, 1, 0);
+
+        bool match = (n > 0);
+
+        for (int i = 0; i < n && match; i++)
+          match = (lr.bytes[i] == (uint8_t)line[i]);
+
+        snprintf(name, sizeof(name), "%d ns: payload prefix", period[p]);
+        check_near(name, match, 1, 0);
+      }
+
+      // A record that opens in the middle of a message decodes just the same,
+      // but it is not the head of one - which is what "stop at message start"
+      // waits for, and the only thing that tells the two apart
+      printf("uart: record opening mid-message:\n");
+      synth_uart(buf, SIZE, 512.0, 115200.0, line, -1000000.0);
+      check_near("bytes decoded", logic_decode(buf, SIZE, 0, 512, PROTO_AUTO,
+          &scratch, &lr) > 0, 1, 0);
+      check_near("baud", lr.rate, 115200, 0);
+      check_near("not at message start", lr.burst_start, 0, 0);
+
+      // More traffic than a result can hold, flagged rather than silently cut
+      printf("uart: more bytes than fit a result:\n");
+      {
+        char big[LOGIC_MAX_BYTES + 20];
+
+        for (unsigned i = 0; i < sizeof(big) - 1; i++)
+          big[i] = (char)('a' + i % 26);
+
+        big[sizeof(big) - 1] = 0;
+
+        synth_uart(buf, SIZE, 512.0, 115200.0, big, 100000.0);
+        check_near("bytes", logic_decode(buf, SIZE, 0, 512, PROTO_AUTO,
+            &scratch, &lr), LOGIC_MAX_BYTES, 0);
+        check_near("truncated flag", lr.truncated, 1, 0);
+      }
+
+      // What a fast timebase gives: 32 ns/sample is a 0.79 ms record, so a
+      // 3.9 ms message comes out as its first few bytes. That is not a decode
+      // failure and must not read as one - the frames are right, the record
+      // is short, and overrun is what says so.
+      printf("uart: fast timebase, message cut off:\n");
+      synth_uart(buf, SIZE, 32.0, 115200.0, line, 100000.0);
+      check_near("decodes what fits", logic_decode(buf, SIZE, 0, 32, PROTO_AUTO,
+          &scratch, &lr) >= 4, 1, 0);
+      check_near("baud", lr.rate, 115200, 0);
+      check_near("errors", lr.errors, 0, 0);
+      check_near("at message start", lr.burst_start, 1, 0);
+      check_near("overrun flagged", lr.overrun, 1, 0);
+      check_near("prefix is UUUU", memcmp(lr.bytes, "UUUU", 4), 0, 0);
+
+      // Deeper into the same preamble there is no idle left in the record,
+      // and 0x55 back to back IS a square wave - nothing in those samples
+      // says which. Reported, not decided: the caller settles it.
+      printf("uart: inside the 0x55 preamble:\n");
+      synth_uart(buf, SIZE, 32.0, 115200.0, "UUUUUUUUUUUU", -200000.0);
+      uart_decode(buf, SIZE, 0, 32, &scratch, &lr);
+      check_near("ambiguous", lr.ambiguous, 1, 0);
+      check_near("auto keeps off it", logic_decode(buf, SIZE, 0, 32, PROTO_AUTO,
+          &scratch, &lr) > 0 && lr.proto == PROTO_UART, 0, 0);
+      check_near("named, it decodes", logic_decode(buf, SIZE, 0, 32, PROTO_UART,
+          &scratch, &lr) > 0, 1, 0);
+
+      // Being told the rate overrides the search; being told the wrong one
+      // decodes nothing rather than something plausible
+      printf("uart: forced baud:\n");
+      synth_uart(buf, SIZE, 512.0, 115200.0, line, 100000.0);
+
+      uart_decode_set_baud(115200);
+      check_near("forced right: bytes", uart_decode(buf, SIZE, 0, 512,
+          &scratch, &lr), full, 0);
+      check_near("forced right: baud", lr.rate, 115200, 0);
+
+      uart_decode_set_baud(9600);
+      check_near("forced wrong: nothing", uart_decode(buf, SIZE, 0, 512,
+          &scratch, &lr), 0, 0);
+
+      uart_decode_set_baud(0);
+    }
+
     // ----- 1-Wire: reset + presence + 0xCC 0x44, 1 us sample period -----
     printf("1-wire:\n");
     {
-      int pos = 0;
+      OwGen g = { buf, SIZE, 0 };
       memset(buf, 200, SIZE);
 
-      #define EMIT(level, us) do { \
-        int e = pos + (us); \
-        for (; pos < e && pos < SIZE; pos++) buf[pos] = (level) ? 200 : 56; \
-      } while (0)
-
-      EMIT(1, 300);
-      EMIT(0, 480);  /* reset */
-      EMIT(1, 70);
-      EMIT(0, 100);  /* presence */
-      EMIT(1, 300);
-
-      uint8_t ow_bytes[2] = { 0xCC, 0x44 };
-      for (int by = 0; by < 2; by++)
-      {
-        for (int b = 0; b < 8; b++)
-        {
-          int bit = (ow_bytes[by] >> b) & 1;
-          EMIT(0, bit ? 6 : 60);
-          EMIT(1, bit ? 64 : 10);
-        }
-      }
-      #undef EMIT
+      ow_reset(&g);
+      ow_byte(&g, 0xCC);
+      ow_byte(&g, 0x44);
 
       int n = logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
       check_near("proto 1-wire", lr.proto, PROTO_ONEWIRE, 0);
       check_near("bytes", n, 2, 0);
       check_near("byte0 = CC", lr.bytes[0], 0xCC, 0);
       check_near("byte1 = 44", lr.bytes[1], 0x44, 0);
+
+      // SKIP ROM + CONVERT T names no device - the family code was never
+      // sent - but the commands are a thermometer's, and saying "DS18x20?"
+      // is honest where saying nothing throws away what the bus did show
+      const OwAnalysis *a = onewire_analysis();
+      check_near("SKIP is a ROM cmd", a->role[0], OW_R_ROMCMD, 0);
+      check_near("CONVERT is a fn cmd", a->role[1], OW_R_FNCMD, 0);
+      check_near("guessed a thermometer", a->thermometer, 1, 0);
+      check_near("but not certain", a->sure, 0, 0);
+      check_near("no ROM seen", a->rom_seen, 0, 0);
+    }
+
+    // ----- 1-Wire: the DS18B20 read cycle, and telling it from a key -----
+    // Same bus, same bit slots, same decoder. What separates a thermometer
+    // from the iButton in a door intercom is the transaction: a family code
+    // under a CRC, and a scratchpad with a temperature in it.
+    printf("1-wire ds18b20:\n");
+    {
+      OwGen g = { buf, SIZE, 0 };
+      // +25.0625 C at 12 bits: 401 sixteenths
+      uint8_t sp[9] = { 0x91, 0x01, 0x4B, 0x46, 0x7F, 0xFF, 0x0C, 0x10, 0 };
+
+      sp[8] = ow_crc(sp, 8);
+      memset(buf, 200, SIZE);
+
+      ow_reset(&g);
+      ow_byte(&g, 0xCC);          // SKIP ROM
+      ow_byte(&g, 0x44);          // CONVERT T
+      ow_reset(&g);
+      ow_byte(&g, 0xCC);
+      ow_byte(&g, 0xBE);          // READ SCRATCHPAD
+      ow_bytes(&g, sp, 9);
+
+      int n = logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const OwAnalysis *a = onewire_analysis();
+
+      check_near("bytes", n, 13, 0);
+      check_near("scratchpad CRC ok", a->sp_valid, 1, 0);
+      check_near("named without a ROM", a->device &&
+          !strcmp(a->device, "DS18B20"), 1, 0);
+      // ...but named from behaviour, not from a family code: DS1822 and
+      // DS1825 answer byte for byte the same way, so the name wears a '?'
+      check_near("not from a ROM", a->sure, 0, 0);
+      check_near("temp 25.0625 C", a->temp_mc, 25062, 0);
+      check_near("12-bit conversion", a->bits, 12, 0);
+      // Bytes 0..1 are the convert cycle, 2..3 the SKIP+READ SP that opens
+      // the second one, so the scratchpad starts at 4
+      check_near("temp byte roles", a->role[4] == OW_R_TEMPL &&
+          a->role[5] == OW_R_TEMPH, 1, 0);
+      check_near("header", !strcmp(lr.info, "DS18B20? +25.06C 12b"), 1, 0);
+
+      // The reading is written on the trace at the byte that completes it
+      char lab[16];
+      onewire_byte_label(a, 5, lr.bytes[5], lab, sizeof(lab));
+      check_near("label +25.06C", !strcmp(lab, "+25.06C"), 1, 0);
+      onewire_byte_label(a, 8, lr.bytes[8], lab, sizeof(lab));
+      check_near("label 12bit", !strcmp(lab, "12bit"), 1, 0);
+
+      // The three reserved bytes hold their place with a name rather than a
+      // pair of dots: a byte with nothing written under it reads as a byte
+      // the decoder could not account for
+      onewire_byte_label(a, 9, lr.bytes[9], lab, sizeof(lab));
+      check_near("label RSV (FF)", !strcmp(lab, "RSV"), 1, 0);
+      onewire_byte_label(a, 10, lr.bytes[10], lab, sizeof(lab));
+      check_near("label RSV (0C)", !strcmp(lab, "RSV"), 1, 0);
+      onewire_byte_label(a, 11, lr.bytes[11], lab, sizeof(lab));
+      check_near("label RSV (10)", !strcmp(lab, "RSV"), 1, 0);
+      onewire_byte_label(a, 12, lr.bytes[12], lab, sizeof(lab));
+      check_near("label CRC", !strcmp(lab, "CRC"), 1, 0);
+
+      // The two temperature bytes are one reading and are shown as one, but
+      // each is still a byte with a place in the scratchpad
+      int gs, gl;
+
+      onewire_group_at(a, 4, &gs, &gl);
+      check_near("temperature groups", gs == 4 && gl == 2, 1, 0);
+      onewire_group_at(a, 8, &gs, &gl);
+      check_near("the config byte does not", gs == 8 && gl == 1, 1, 0);
+      onewire_field_label(a, 4, lr.bytes[4], lab, sizeof(lab));
+      check_near("field T-LO", !strcmp(lab, "T-LO"), 1, 0);
+      onewire_field_label(a, 5, lr.bytes[5], lab, sizeof(lab));
+      check_near("field T-HI, not the reading", !strcmp(lab, "T-HI"), 1, 0);
+    }
+
+    // A reserved byte is still a byte with a value a working part returns.
+    // The CRC says the read was clean, so one that comes back different is
+    // the part differing - which is what a counterfeit does.
+    printf("1-wire scratchpad with odd reserved bytes:\n");
+    {
+      OwGen g = { buf, SIZE, 0 };
+      uint8_t sp[9] = { 0x91, 0x01, 0x4B, 0x46, 0x7F, 0xFF, 0x0C, 0x00, 0 };
+
+      sp[8] = ow_crc(sp, 8);
+      memset(buf, 200, SIZE);
+
+      ow_reset(&g);
+      ow_byte(&g, 0xCC);
+      ow_byte(&g, 0xBE);
+      ow_bytes(&g, sp, 9);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const OwAnalysis *a = onewire_analysis();
+      char lab[16];
+
+      check_near("still decodes", a->sp_valid, 1, 0);
+      check_near("still a DS18B20", a->device &&
+          !strcmp(a->device, "DS18B20"), 1, 0);
+      onewire_byte_label(a, 9, lr.bytes[9], lab, sizeof(lab));
+      check_near("byte 7 flagged", !strcmp(lab, "RSV!"), 1, 0);
+    }
+
+    printf("1-wire ds18b20 below zero:\n");
+    {
+      OwGen g = { buf, SIZE, 0 };
+      uint8_t sp[9] = { 0x5E, 0xFF, 0x4B, 0x46, 0x7F, 0xFF, 0x0C, 0x10, 0 };
+
+      sp[8] = ow_crc(sp, 8);
+      memset(buf, 200, SIZE);
+
+      ow_reset(&g);
+      ow_byte(&g, 0xCC);
+      ow_byte(&g, 0xBE);
+      ow_bytes(&g, sp, 9);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const OwAnalysis *a = onewire_analysis();
+
+      check_near("temp -10.125 C", a->temp_mc, -10125, 0);
+      check_near("header", !strcmp(lr.info, "DS18B20? -10.12C 12b"), 1, 0);
+    }
+
+    printf("1-wire ds18b20 at 9 bits:\n");
+    {
+      OwGen g = { buf, SIZE, 0 };
+      // Same 401 sixteenths, but at 9 bits the low three are undefined and
+      // the sensor only ever meant the 400 above them
+      uint8_t sp[9] = { 0x91, 0x01, 0x4B, 0x46, 0x1F, 0xFF, 0x0C, 0x10, 0 };
+
+      sp[8] = ow_crc(sp, 8);
+      memset(buf, 200, SIZE);
+
+      ow_reset(&g);
+      ow_byte(&g, 0xCC);
+      ow_byte(&g, 0xBE);
+      ow_bytes(&g, sp, 9);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const OwAnalysis *a = onewire_analysis();
+
+      check_near("9-bit conversion", a->bits, 9, 0);
+      check_near("undefined bits dropped", a->temp_mc, 25000, 0);
+    }
+
+    // The older part is told apart by byte 4: a DS18B20 keeps its
+    // configuration register there and its undefined bits read as ones, so
+    // it is 1F, 3F, 5F or 7F. A DS18S20 has nothing there and reads FF.
+    printf("1-wire ds18s20:\n");
+    {
+      OwGen g = { buf, SIZE, 0 };
+      // 25.0 C: half-degree count of 50, and the count registers that turn
+      // it into sixteenths - COUNT REMAIN 0x0C out of COUNT PER C 0x10
+      uint8_t sp[9] = { 0x32, 0x00, 0x4B, 0x46, 0xFF, 0xFF, 0x0C, 0x10, 0 };
+
+      sp[8] = ow_crc(sp, 8);
+      memset(buf, 200, SIZE);
+
+      ow_reset(&g);
+      ow_byte(&g, 0xCC);
+      ow_byte(&g, 0xBE);
+      ow_bytes(&g, sp, 9);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const OwAnalysis *a = onewire_analysis();
+      char lab[16];
+
+      check_near("DS18S20 by scratchpad", a->device &&
+          !strcmp(a->device, "DS18S20"), 1, 0);
+      check_near("marked as the old part", a->s20, 1, 0);
+      check_near("no config register", a->bits, 0, 0);
+      check_near("extended resolution", a->ext_res, 1, 0);
+      check_near("25.0 C", a->temp_mc, 25000, 0);
+      check_near("header", !strcmp(lr.info, "DS18S20? +25.00C ext"), 1, 0);
+
+      // Byte 4 is reserved here, and bytes 6 and 7 are the count registers
+      // rather than reserved - the labels have to follow the part
+      onewire_byte_label(a, 6, lr.bytes[6], lab, sizeof(lab));
+      check_near("byte 4 is RSV", !strcmp(lab, "RSV"), 1, 0);
+      onewire_byte_label(a, 8, lr.bytes[8], lab, sizeof(lab));
+      check_near("byte 6 is CNTR", !strcmp(lab, "CNTR"), 1, 0);
+      onewire_byte_label(a, 9, lr.bytes[9], lab, sizeof(lab));
+      check_near("byte 7 is CNT/C", !strcmp(lab, "CNT/C"), 1, 0);
+    }
+
+    // The same arithmetic below zero, where dropping the half-degree bit is
+    // a floor and not a truncation: -0.5 C is count -1, and -1 >> 1 is -1
+    printf("1-wire ds18s20 below zero:\n");
+    {
+      OwGen g = { buf, SIZE, 0 };
+      uint8_t sp[9] = { 0xFF, 0xFF, 0x4B, 0x46, 0xFF, 0xFF, 0x04, 0x10, 0 };
+
+      sp[8] = ow_crc(sp, 8);
+      memset(buf, 200, SIZE);
+
+      ow_reset(&g);
+      ow_byte(&g, 0xCC);
+      ow_byte(&g, 0xBE);
+      ow_bytes(&g, sp, 9);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const OwAnalysis *a = onewire_analysis();
+
+      check_near("-0.5 C", a->temp_mc, -500, 0);
+      check_near("header", !strcmp(lr.info, "DS18S20? -0.50C ext"), 1, 0);
+    }
+
+    // A byte 4 that is neither a configuration register nor FF names no
+    // part: "not a DS18B20" is not the same statement as "a DS18S20"
+    printf("1-wire scratchpad from something else:\n");
+    {
+      OwGen g = { buf, SIZE, 0 };
+      uint8_t sp[9] = { 0x91, 0x01, 0x4B, 0x46, 0x33, 0xFF, 0x0C, 0x10, 0 };
+
+      sp[8] = ow_crc(sp, 8);
+      memset(buf, 200, SIZE);
+
+      ow_reset(&g);
+      ow_byte(&g, 0xCC);
+      ow_byte(&g, 0xBE);
+      ow_bytes(&g, sp, 9);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const OwAnalysis *a = onewire_analysis();
+
+      check_near("class only", a->device &&
+          !strcmp(a->device, "DS18x20"), 1, 0);
+      check_near("not called the old part", a->s20, 0, 0);
+    }
+
+    printf("1-wire ibutton key:\n");
+    {
+      OwGen g = { buf, SIZE, 0 };
+      uint8_t rom[8] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0 };
+
+      rom[7] = ow_crc(rom, 7);
+      memset(buf, 200, SIZE);
+
+      ow_reset(&g);
+      ow_byte(&g, 0x33);          // READ ROM - all a DS1990A can do
+      ow_bytes(&g, rom, 8);
+
+      int n = logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const OwAnalysis *a = onewire_analysis();
+
+      check_near("bytes", n, 9, 0);
+      check_near("ROM CRC ok", a->rom_valid, 1, 0);
+      check_near("family 01", a->family, 0x01, 0);
+      check_near("named a key", a->device &&
+          !strcmp(a->device, "DS1990 key"), 1, 0);
+      check_near("not a thermometer", a->thermometer, 0, 0);
+      check_near("no temperature", a->temp_valid, 0, 0);
+      check_near("header", !strcmp(lr.info, "DS1990 key ROM ok"), 1, 0);
+
+      char lab[16];
+      onewire_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("family byte labelled", !strcmp(lab, "DS1990 key"), 1, 0);
+      onewire_byte_label(a, 8, lr.bytes[8], lab, sizeof(lab));
+      check_near("CRC byte labelled", !strcmp(lab, "CRC"), 1, 0);
+    }
+
+    printf("1-wire ds18b20 by ROM:\n");
+    {
+      OwGen g = { buf, SIZE, 0 };
+      uint8_t rom[8] = { 0x28, 0xFF, 0x64, 0x1E, 0x0C, 0x27, 0x9A, 0 };
+
+      rom[7] = ow_crc(rom, 7);
+      memset(buf, 200, SIZE);
+
+      ow_reset(&g);
+      ow_byte(&g, 0x33);
+      ow_bytes(&g, rom, 8);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const OwAnalysis *a = onewire_analysis();
+
+      check_near("family 28", a->family, 0x28, 0);
+      check_near("DS18B20", a->device && !strcmp(a->device, "DS18B20"), 1, 0);
+      check_near("thermometer", a->thermometer, 1, 0);
+      check_near("header", !strcmp(lr.info, "DS18B20 ROM ok"), 1, 0);
+    }
+
+    printf("1-wire bad ROM CRC:\n");
+    {
+      OwGen g = { buf, SIZE, 0 };
+      uint8_t rom[8] = { 0x28, 0xFF, 0x64, 0x1E, 0x0C, 0x27, 0x9A, 0 };
+
+      rom[7] = (uint8_t)(ow_crc(rom, 7) ^ 0x55);
+      memset(buf, 200, SIZE);
+
+      ow_reset(&g);
+      ow_byte(&g, 0x33);
+      ow_bytes(&g, rom, 8);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const OwAnalysis *a = onewire_analysis();
+
+      // Eight bytes that do not check out are not a device to name: a wrong
+      // family code is exactly what a misread bit looks like
+      check_near("ROM seen", a->rom_seen, 1, 0);
+      check_near("CRC refused", a->rom_valid, 0, 0);
+      check_near("nothing named", a->device == NULL, 1, 0);
+      check_near("header", !strcmp(lr.info, "1-Wire ROM CRC bad"), 1, 0);
+
+      char lab[16];
+      onewire_byte_label(a, 8, lr.bytes[8], lab, sizeof(lab));
+      check_near("CRC byte flagged", !strcmp(lab, "CRC!"), 1, 0);
+    }
+
+    printf("1-wire search rom:\n");
+    {
+      OwGen g = { buf, SIZE, 0 };
+      uint8_t rom[8] = { 0x28, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0 };
+
+      rom[7] = ow_crc(rom, 7);
+      memset(buf, 200, SIZE);
+
+      ow_reset(&g);
+      ow_byte(&g, 0xF0);          // SEARCH ROM
+
+      // Three slots per ROM bit: the device sends the bit, then its
+      // complement, then the master writes the branch it takes
+      for (int j = 0; j < 64; j++)
+      {
+        int bit = (rom[j / 8] >> (j % 8)) & 1;
+
+        ow_bit(&g, bit);
+        ow_bit(&g, !bit);
+        ow_bit(&g, bit);
+      }
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const OwAnalysis *a = onewire_analysis();
+
+      check_near("ROM out of the triplets", a->rom_valid, 1, 0);
+      check_near("family 28", a->family, 0x28, 0);
+      check_near("serial", a->rom[3], 0x33, 0);
+      check_near("search labelled once", a->role[1] == OW_R_SEARCH &&
+          a->role[2] == OW_R_NONE, 1, 0);
+    }
+
+    printf("1-wire aborted scratchpad read:\n");
+    {
+      OwGen g = { buf, SIZE, 0 };
+      memset(buf, 200, SIZE);
+
+      // Plenty of libraries read the two temperature bytes and reset: there
+      // is no CRC to check, so the reading is believed only because it lands
+      // in the range the part can report, and the naming stays a guess
+      ow_reset(&g);
+      ow_byte(&g, 0xCC);
+      ow_byte(&g, 0xBE);
+      ow_byte(&g, 0x91);
+      ow_byte(&g, 0x01);
+      ow_reset(&g);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const OwAnalysis *a = onewire_analysis();
+
+      check_near("temp 25.0625 C", a->temp_mc, 25062, 0);
+      check_near("no scratchpad CRC", a->sp_valid, 0, 0);
+      check_near("named as a guess", a->device &&
+          !strcmp(a->device, "DS18x20") && !a->sure, 1, 0);
     }
 
     // ----- WS2812: 2 LEDs GRB, 40 ns sample period -----
@@ -693,6 +1621,51 @@ int main(void)
       check_near("addr", lr.bytes[0], 0x04, 0);
       check_near("cmd", lr.bytes[2], 0x08, 0);
       check_near("no errors", lr.errors, 0, 0);
+      check_near("whole frame, not cut", lr.overrun, 0, 0);
+
+      // A NEC frame is 67.5 ms end to end and a record usually is not, so
+      // the frame that arrives cut off is the normal case, not the odd one.
+      // The lead plus whole bytes is still a decode; the rest is reported
+      // missing rather than thrown away.
+      //
+      // And whatever happens, this must not come out as UART. NEC's 560 us
+      // element IS a valid bit time - 1795 baud - and the bytes it frames
+      // decode into something. What says it is not UART is the 9 ms lead:
+      // 8N1 holds the line down for nine bit times at the very most, so a
+      // mark sixteen long is proof of another protocol, and the scope used
+      // to report "UART 1795 8N1" for a remote control because of it.
+      printf("nec: frame cut off by the end of the record:\n");
+
+      // The record ending is the record being SHORT, not the line going
+      // quiet: the decoders are handed the first `cut` samples and nothing
+      // after them, which is what a timebase too fast for a 67.5 ms frame
+      // actually produces.
+      for (int keep_bits = 8; keep_bits <= 24; keep_bits += 8)
+      {
+        int cut = (5000 + 9000 + 4500) / 10;
+        char name[44];
+
+        for (int b = 0; b < keep_bits; b++)
+          cut += (560 + (((word >> b) & 1) ? 1690 : 560)) / 10;
+
+        int cn = logic_decode(buf, cut, 0, 10000, PROTO_AUTO, &scratch, &lr);
+
+        snprintf(name, sizeof(name), "%d bits: proto nec", keep_bits);
+        check_near(name, lr.proto, PROTO_NEC, 0);
+        snprintf(name, sizeof(name), "%d bits: bytes", keep_bits);
+        check_near(name, cn, keep_bits / 8, 0);
+        snprintf(name, sizeof(name), "%d bits: addr", keep_bits);
+        check_near(name, lr.bytes[0], 0x04, 0);
+        snprintf(name, sizeof(name), "%d bits: flagged cut", keep_bits);
+        check_near(name, lr.overrun, 1, 0);
+
+        // The same record through the UART decoder: it finds frames, because
+        // 560 us is a real bit time and the bits do frame - and marks them
+        // ambiguous, because the 9 ms lead cannot happen in 8N1
+        uart_decode(buf, cut, 0, 10000, &scratch, &lr);
+        snprintf(name, sizeof(name), "%d bits: uart ambiguous", keep_bits);
+        check_near(name, lr.ambiguous, 1, 0);
+      }
     }
 
     // ----- RAW fallback: 100 kHz square looks like a clock -----
@@ -707,9 +1680,1790 @@ int main(void)
       check_near("pattern AA/55", lr.bytes[0] == 0xAA || lr.bytes[0] == 0x55, 1, 0);
     }
 
+    // ----- Servo / RC PWM: 1.5 ms in a 20 ms frame -----
+    //
+    // The signal the UART decoder used to claim: a 1.5 ms pulse frames bytes
+    // at 667 baud as well as any other pulse does. What says servo is the
+    // CADENCE - a fixed frame rate whether the value moves or not - and that
+    // is what this checks, including that a train whose rate wanders is
+    // refused rather than averaged into something plausible.
+    printf("servo pwm:\n");
+    {
+      // 10 us per sample: a 20 ms frame is 2000 samples, so a 24576 sample
+      // record holds twelve of them
+      const int width_us[] = { 1500, 1500, 1000, 2000, 1500 };
+      const int lead = 500; // idle ahead of the first pulse, so that pulse is
+                            // not the run the start of the record cut through
+      int pos = 0;
+
+      memset(buf, 56, SIZE); // idle low
+
+      for (unsigned f = 0; f < sizeof(width_us)/sizeof(width_us[0]); f++)
+      {
+        int start = lead + (int)f * 2000; // frames on the 20 ms grid
+
+        for (int i = 0; i < width_us[f] / 10 && start + i < SIZE; i++)
+          buf[start + i] = 200;
+      }
+
+      int n = logic_decode(buf, SIZE, 0, 10000, PROTO_AUTO, &scratch, &lr);
+
+      check_near("proto servo", lr.proto, PROTO_SERVO, 0);
+      check_near("pulses", n, 5, 0);
+      check_near("first 1.50 ms", lr.bytes[0], 150, 0);
+      check_near("third 1.00 ms", lr.bytes[2], 100, 0);
+      check_near("fourth 2.00 ms", lr.bytes[3], 200, 0);
+      check_near("frame 20 ms", lr.rate, 20000000, 0);
+      check_near("idle low", lr.idle_high, 0, 0);
+      check_near("pulse marked at its start", lr.pos[0], lead, 0);
+      // The frame is what gets marked out on the trace, pulse to pulse, so
+      // the label has room to sit in; the pulse itself is on the waveform
+      check_near("frame marked pulse to pulse", lr.end[0] - lr.pos[0], 2000, 0);
+
+      // A pulse the start of the record cut through is a fact about the
+      // buffer, not about the signal: its width is whatever survived
+      pos = 0;
+
+      for (; pos < 80; pos++)
+        buf[pos] = 200; // the tail of a pulse that began before the record
+
+      check_near("cut pulse not counted",
+          logic_decode(buf, SIZE, 0, 10000, PROTO_AUTO, &scratch, &lr), 5, 0);
+      check_near("...and the rest still fine", lr.bytes[0], 150, 0);
+
+      // The angle is the width in the units a servo is thought about in:
+      // 1000 us is -90 degrees, 2000 is +90, 1500 is straight ahead
+      servo_g(buf, SIZE, 10000, 1500, 20000, 8);
+      logic_decode(buf, SIZE, 0, 10000, PROTO_AUTO, &scratch, &lr);
+      check_near("centred", !strcmp(lr.info, "Servo 1.50ms +0d 50Hz"), 1, 0);
+
+      servo_g(buf, SIZE, 10000, 1000, 20000, 8);
+      logic_decode(buf, SIZE, 0, 10000, PROTO_AUTO, &scratch, &lr);
+      check_near("hard over one way",
+          !strcmp(lr.info, "Servo 1.00ms -90d 50Hz"), 1, 0);
+
+      servo_g(buf, SIZE, 10000, 2000, 20000, 8);
+      logic_decode(buf, SIZE, 0, 10000, PROTO_AUTO, &scratch, &lr);
+      check_near("and the other",
+          !strcmp(lr.info, "Servo 2.00ms +90d 50Hz"), 1, 0);
+    }
+
+    // The swing a servo makes going from stop to stop, one width at a time.
+    // Every one of them has to stay a servo: a single low pulse is a start
+    // bit and eight zeros to a UART decoder, and the only thing that says
+    // otherwise is the cadence around it - which does not change as the pulse
+    // moves. This is the regression that matters, because the width sweeps
+    // through everything on the way.
+    printf("servo: the whole sweep, 1.00 to 2.00 ms:\n");
+    {
+      int bad_proto = 0, bad_width = 0, bad_rate = 0;
+
+      for (int us = 1000; us <= 2000; us += 50)
+      {
+        servo_g(buf, SIZE, 10000, us, 20000, 8);
+        logic_decode(buf, SIZE, 0, 10000, PROTO_AUTO, &scratch, &lr);
+
+        if (lr.proto != PROTO_SERVO)
+          bad_proto++;
+
+        if (lr.bytes[0] * 10 < us - 10 || lr.bytes[0] * 10 > us + 10)
+          bad_width++;
+
+        if (lr.rate != 20000000)
+          bad_rate++;
+      }
+
+      check_near("never anything but servo", bad_proto, 0, 0);
+      check_near("width follows", bad_width, 0, 0);
+      check_near("rate stays put", bad_rate, 0, 0);
+    }
+
+    // A digital servo updates at 333 Hz, which is a 3 ms frame with the same
+    // 1 to 2 ms pulse inside it. Nothing about the pulse changed; only the
+    // cadence did, and the cadence is what is being measured.
+    printf("servo at 333 Hz:\n");
+    {
+      servo_g(buf, SIZE, 10000, 1500, 3000, 20);
+      logic_decode(buf, SIZE, 0, 10000, PROTO_AUTO, &scratch, &lr);
+
+      check_near("proto servo", lr.proto, PROTO_SERVO, 0);
+      check_near("1.50 ms", lr.bytes[0], 150, 0);
+      check_near("header", !strcmp(lr.info, "Servo 1.50ms +0d 333Hz"), 1, 0);
+    }
+
+    // 2.5 ms is past the end of the 1000..2000 the angle is defined over.
+    // It is still a pulse train at a fixed rate and still gets reported as
+    // one - receivers do send 2.2 ms, and an ESC reads the same line as
+    // throttle - but the angle beside it is an extrapolation and says so.
+    printf("servo past its travel:\n");
+    {
+      servo_g(buf, SIZE, 10000, 2500, 20000, 8);
+      logic_decode(buf, SIZE, 0, 10000, PROTO_AUTO, &scratch, &lr);
+
+      check_near("still a pulse train", lr.proto, PROTO_SERVO, 0);
+      check_near("width is what it is", lr.bytes[0], 250, 0);
+      check_near("angle marked as off the end",
+          !strcmp(lr.info, "Servo 2.50ms +180d! 50Hz"), 1, 0);
+
+      // A pulse train whose rate wanders is not a servo line, however servo
+      // its pulses look: the receiver's clock is the whole point
+      int pos = 0;
+
+      memset(buf, 56, SIZE);
+
+      for (int f = 0; f < 5; f++)
+      {
+        int hi = pos + 150;
+
+        for (; pos < hi && pos < SIZE; pos++)
+          buf[pos] = 200;
+
+        pos += 400 + f * 900; // 5.5, 14.5, 23.5... ms apart
+      }
+
+      check_near("wandering rate refused",
+          servo_decode(buf, SIZE, 0, 10000, &scratch, &lr), 0, 0);
+
+      // And a 115200 UART line is not one either - its pulses are 60 times
+      // too narrow, which the width window catches before the rate is asked
+      synth_uart(buf, SIZE, 512.0, 115200.0, "servo?", 100000.0);
+      check_near("uart is not servo",
+          servo_decode(buf, SIZE, 0, 512, &scratch, &lr), 0, 0);
+    }
+
+    // ----- CAN 2.0A/2.0B: 500 kbit/s, 500 ns sample period (4 samples/bit) --
+    printf("can:\n");
+    {
+      uint8_t data[8] = { 0x01, 0x02, 0x03, 0x04, 0xDE, 0xAD, 0xBE, 0xEF };
+      CanGen g = { .buf = buf, .size = SIZE, .bit_samples = 4.0 };
+
+      memset(buf, 200, SIZE);   // the bus rests recessive
+      can_g_idle(&g, 20);
+      can_g_frame(&g, 0x123, 0, 0, data, 8, 1);
+
+      int n = logic_decode(buf, SIZE, 0, 500, PROTO_AUTO, &scratch, &lr);
+      const CanAnalysis *a = can_analysis();
+
+      check_near("proto can", lr.proto, PROTO_CAN, 0);
+      check_near("bit rate", lr.rate, 500000, 0);
+      check_near("frames", a->frames, 1, 0);
+      check_near("crc checked out", a->frame[0].crc_ok, 1, 0);
+      check_near("id 123", a->frame[0].id, 0x123, 0);
+      check_near("dlc 8", a->frame[0].dlc, 8, 0);
+      check_near("acknowledged", a->frame[0].ack, 1, 0);
+      // two identifier bytes, the length code, eight data, two of CRC
+      check_near("bytes", n, 13, 0);
+      check_near("id high", lr.bytes[0], 0x01, 0);
+      check_near("id low", lr.bytes[1], 0x23, 0);
+      check_near("data[4]", lr.bytes[7], 0xDE, 0);
+      check_near("header", !strcmp(lr.info, "CAN 500k ID 123 8B"), 1, 0);
+
+      // Two bytes carry eleven bits of identifier, so neither of them is the
+      // identifier: the name opens the field and the number closes it
+      char lab[16];
+      can_byte_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("label ID", !strcmp(lab, "ID"), 1, 0);
+      can_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("label ID=123", !strcmp(lab, "ID=123"), 1, 0);
+
+      // ...and both of them are one identifier, shown as one
+      int gs, gl;
+
+      can_group_at(a, 0, &gs, &gl);
+      check_near("id groups", gs == 0 && gl == 2, 1, 0);
+      can_group_at(a, 1, &gs, &gl);
+      check_near("from either byte", gs == 0 && gl == 2, 1, 0);
+      // The CRC's two bytes are not a group: one says whether it checked out
+      // and the other whether anyone acknowledged the frame
+      can_group_at(a, 11, &gs, &gl);
+      check_near("crc stands alone", gs == 11 && gl == 1, 1, 0);
+
+      can_field_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("field is ID, not ID=123", !strcmp(lab, "ID"), 1, 0);
+      can_field_label(a, 7, lr.bytes[7], lab, sizeof(lab));
+      check_near("field D4", !strcmp(lab, "D4"), 1, 0);
+      can_byte_label(a, 7, lr.bytes[7], lab, sizeof(lab));
+      check_near("label D4", !strcmp(lab, "D4"), 1, 0);
+      can_byte_label(a, 12, lr.bytes[12], lab, sizeof(lab));
+      check_near("label ACK", !strcmp(lab, "ACK"), 1, 0);
+    }
+
+    // The probe sits on one wire of a differential pair, and on CAN_H the
+    // dominant level is the high one. Same frame, upside down.
+    printf("can on CAN_H:\n");
+    {
+      uint8_t data[2] = { 0xAA, 0x55 };
+      CanGen g = { .buf = buf, .size = SIZE, .bit_samples = 4.0, .inv = 1 };
+
+      memset(buf, 56, SIZE);
+      can_g_idle(&g, 20);
+      can_g_frame(&g, 0x7FF, 0, 0, data, 2, 1);
+
+      logic_decode(buf, SIZE, 0, 500, PROTO_AUTO, &scratch, &lr);
+      const CanAnalysis *a = can_analysis();
+
+      check_near("proto can", lr.proto, PROTO_CAN, 0);
+      check_near("id 7FF", a->frame[0].id, 0x7FF, 0);
+      check_near("crc checked out", a->frame[0].crc_ok, 1, 0);
+      check_near("data", lr.bytes[3] == 0xAA && lr.bytes[4] == 0x55, 1, 0);
+    }
+
+    printf("can extended id:\n");
+    {
+      uint8_t data[8] = { 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17 };
+      CanGen g = { .buf = buf, .size = SIZE, .bit_samples = 4.0 };
+
+      memset(buf, 200, SIZE);
+      can_g_idle(&g, 20);
+      can_g_frame(&g, 0x18DAF110, 1, 0, data, 8, 1);
+
+      int n = logic_decode(buf, SIZE, 0, 500, PROTO_AUTO, &scratch, &lr);
+      const CanAnalysis *a = can_analysis();
+
+      check_near("29-bit id", a->frame[0].id, 0x18DAF110, 0);
+      check_near("marked extended", a->frame[0].ext, 1, 0);
+      check_near("bytes", n, 15, 0);   // four identifier bytes now
+      check_near("data[0]", lr.bytes[5], 0x10, 0);
+      check_near("header", !strcmp(lr.info, "CAN 500k ID 18DAF110 8B"), 1, 0);
+    }
+
+    printf("can remote frame:\n");
+    {
+      CanGen g = { .buf = buf, .size = SIZE, .bit_samples = 4.0 };
+
+      memset(buf, 200, SIZE);
+      can_g_idle(&g, 20);
+      can_g_frame(&g, 0x201, 0, 1, NULL, 8, 1);
+
+      int n = logic_decode(buf, SIZE, 0, 500, PROTO_AUTO, &scratch, &lr);
+      const CanAnalysis *a = can_analysis();
+
+      check_near("marked remote", a->frame[0].rtr, 1, 0);
+      check_near("no data bytes", n, 5, 0);
+      check_near("header", !strcmp(lr.info, "CAN 500k ID 201 RTR"), 1, 0);
+    }
+
+    // Nobody else on the bus: the frame is complete and correct, and no node
+    // pulled the acknowledge slot down. That is the single most useful thing
+    // this decoder can tell someone whose node "does not work".
+    printf("can with nobody listening:\n");
+    {
+      uint8_t data[1] = { 0x5A };
+      CanGen g = { .buf = buf, .size = SIZE, .bit_samples = 4.0 };
+
+      memset(buf, 200, SIZE);
+      can_g_idle(&g, 20);
+      can_g_frame(&g, 0x100, 0, 0, data, 1, 0);
+
+      logic_decode(buf, SIZE, 0, 500, PROTO_AUTO, &scratch, &lr);
+      const CanAnalysis *a = can_analysis();
+
+      check_near("crc still checks out", a->frame[0].crc_ok, 1, 0);
+      check_near("not acknowledged", a->frame[0].ack, 0, 0);
+      check_near("header says so", !strcmp(lr.info, "CAN 500k ID 100 1B NAK"),
+          1, 0);
+    }
+
+    printf("can several frames at 125k:\n");
+    {
+      uint8_t d1[3] = { 0x11, 0x22, 0x33 };
+      uint8_t d2[2] = { 0x44, 0x55 };
+      // 125 kbit/s at 2 us per sample is four samples a bit again
+      CanGen g = { .buf = buf, .size = SIZE, .bit_samples = 4.0 };
+
+      memset(buf, 200, SIZE);
+      can_g_idle(&g, 20);
+      can_g_frame(&g, 0x0A0, 0, 0, d1, 3, 1);
+      can_g_frame(&g, 0x0B0, 0, 0, d2, 2, 1);
+
+      logic_decode(buf, SIZE, 0, 2000, PROTO_AUTO, &scratch, &lr);
+      const CanAnalysis *a = can_analysis();
+
+      check_near("bit rate", lr.rate, 125000, 0);
+      check_near("frames", a->frames, 2, 0);
+      check_near("both check out", a->crc_ok, 2, 0);
+      check_near("second id", a->frame[1].id, 0x0B0, 0);
+      check_near("header", !strcmp(lr.info, "CAN 125k 2 frames"), 1, 0);
+    }
+
+    // A frame whose CRC does not agree is not proof of anything, and proof is
+    // the whole reason this decoder is allowed to run ahead of the others
+    printf("can with a corrupted CRC:\n");
+    {
+      uint8_t data[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
+      CanGen g = { .buf = buf, .size = SIZE, .bit_samples = 4.0,
+          .crc_xor = 0x0040 };
+
+      memset(buf, 200, SIZE);
+      can_g_idle(&g, 20);
+      can_g_frame(&g, 0x123, 0, 0, data, 4, 1);
+
+      check_near("refused", can_decode(buf, SIZE, 0, 500, &scratch, &lr), 0, 0);
+    }
+
+    // CAN FD says so in the bit classic CAN keeps dominant. Reading its data
+    // phase needs a second bit rate and a different CRC, so it is recognised
+    // and declined rather than half-decoded.
+    printf("can fd:\n");
+    {
+      CanGen g = { .buf = buf, .size = SIZE, .bit_samples = 4.0 };
+
+      memset(buf, 200, SIZE);
+      can_g_idle(&g, 20);
+      g.crc = 0; g.last = 1; g.same = 0;
+      can_g_bit(&g, 0, 1);                 // SOF
+      can_g_field(&g, 0x123, 11, 1);       // id
+      can_g_bit(&g, 0, 1);                 // RRS
+      can_g_bit(&g, 0, 1);                 // IDE
+      can_g_bit(&g, 1, 1);                 // FDF - recessive
+      can_g_field(&g, 0x5555, 16, 1);      // whatever the data phase looks like
+      can_g_idle(&g, 15);
+
+      check_near("not decoded", can_decode(buf, SIZE, 0, 500, &scratch, &lr),
+          0, 0);
+    }
+
+    // And the other direction: everything else on this bench must not come
+    // out as CAN
+    printf("can rejects the rest:\n");
+    {
+      synth_uart(buf, SIZE, 512.0, 115200.0, "CAN? no.", 100000.0);
+      check_near("uart is not can",
+          can_decode(buf, SIZE, 0, 512, &scratch, &lr), 0, 0);
+
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      check_near("sine is not can",
+          can_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      double duty = 0.075;
+      synth(buf, SIZE, 0, fn_square, &duty, 50.0, 10000.0, 90.0, ZERO_POINT);
+      check_near("servo is not can",
+          can_decode(buf, SIZE, 0, 10000, &scratch, &lr), 0, 0);
+    }
+
+    // ----- DHT22 / DHT11: forty bits, five bytes, the last one their sum ---
+    printf("dht22:\n");
+    {
+      // 45.3 %, +23.4 C - tenths across both bytes of each pair
+      uint8_t by[5] = { 0x01, 0xC5, 0x00, 0xEA, 0 };
+      DhtGen g = { buf, SIZE, 0 };
+
+      by[4] = (uint8_t)(by[0] + by[1] + by[2] + by[3]);
+      memset(buf, 200, SIZE);
+      dht_g_frame(&g, by, 1000);
+
+      int n = logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const DhtAnalysis *a = dht_analysis();
+
+      check_near("proto dht", lr.proto, PROTO_DHT, 0);
+      check_near("bytes", n, 5, 0);
+      // The sensor's 80/80 answer is a valid-looking bit slot itself, so a
+      // decoder that commits to the first slot it finds is one bit out
+      check_near("byte 0", lr.bytes[0], 0x01, 0);
+      check_near("byte 1", lr.bytes[1], 0xC5, 0);
+      check_near("read as a DHT22", a->dht22, 1, 0);
+      check_near("humidity 45.3%", a->rh_x10, 453, 0);
+      check_near("temperature 23.4C", a->t_x10, 234, 0);
+      check_near("no doubt about which", a->sure, 1, 0);
+      check_near("header", !strcmp(lr.info, "DHT22 45.3% +23.4C"), 1, 0);
+
+      // 0x01 is not 45.3 % - the pair is. The field name goes on the byte
+      // that opens it and the number on the byte that completes it.
+      char lab[16];
+      dht_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("label RH=45.3%", !strcmp(lab, "RH=45.3%"), 1, 0);
+      dht_byte_label(a, 3, lr.bytes[3], lab, sizeof(lab));
+      check_near("label T=+23.4C", !strcmp(lab, "T=+23.4C"), 1, 0);
+      dht_byte_label(a, 4, lr.bytes[4], lab, sizeof(lab));
+      check_near("label SUM", !strcmp(lab, "SUM"), 1, 0);
+
+      // Each reading is two bytes and one number, so it is one thing shown
+      int gs, gl;
+
+      dht_group_at(a, 0, &gs, &gl);
+      check_near("humidity groups", gs == 0 && gl == 2, 1, 0);
+      dht_group_at(a, 3, &gs, &gl);
+      check_near("temperature groups", gs == 2 && gl == 2, 1, 0);
+      dht_group_at(a, 4, &gs, &gl);
+      check_near("checksum is alone", gs == 4 && gl == 1, 1, 0);
+
+      dht_field_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("field RH-H", !strcmp(lab, "RH-H"), 1, 0);
+      dht_field_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("field RH-L, not the reading", !strcmp(lab, "RH-L"), 1, 0);
+      dht_field_label(a, 3, lr.bytes[3], lab, sizeof(lab));
+      check_near("field T-L", !strcmp(lab, "T-L"), 1, 0);
+    }
+
+    printf("dht22 below zero:\n");
+    {
+      // 65.4 %, -10.1 C: the sign is a bit, not a two's complement
+      uint8_t by[5] = { 0x02, 0x8E, 0x80, 0x65, 0 };
+      DhtGen g = { buf, SIZE, 0 };
+
+      by[4] = (uint8_t)(by[0] + by[1] + by[2] + by[3]);
+      memset(buf, 200, SIZE);
+      dht_g_frame(&g, by, 1000);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const DhtAnalysis *a = dht_analysis();
+
+      check_near("temperature -10.1C", a->t_x10, -101, 0);
+      check_near("header", !strcmp(lr.info, "DHT22 65.4% -10.1C"), 1, 0);
+    }
+
+    // Same forty bits on the same wire; only the meaning of the bytes
+    // differs. Read a DHT11's 45 % as a DHT22's would give 1152 % humidity,
+    // and that is what settles which part sent them.
+    printf("dht11:\n");
+    {
+      uint8_t by[5] = { 45, 0, 23, 0, 0 };
+      DhtGen g = { buf, SIZE, 0 };
+
+      by[4] = (uint8_t)(by[0] + by[1] + by[2] + by[3]);
+      memset(buf, 200, SIZE);
+      dht_g_frame(&g, by, 18000);   // 18 ms, which is how a DHT11 is asked
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const DhtAnalysis *a = dht_analysis();
+
+      check_near("read as a DHT11", a->dht22, 0, 0);
+      check_near("humidity 45%", a->rh_x10, 450, 0);
+      check_near("temperature 23C", a->t_x10, 230, 0);
+      check_near("header", !strcmp(lr.info, "DHT11 45% +23C"), 1, 0);
+    }
+
+    // A record that only caught the data - the start pulse is 18 ms wide and
+    // a fast timebase does not reach back that far
+    printf("dht22 without the start pulse:\n");
+    {
+      uint8_t by[5] = { 0x01, 0xC5, 0x00, 0xEA, 0 };
+      DhtGen g = { buf, SIZE, 0 };
+
+      by[4] = (uint8_t)(by[0] + by[1] + by[2] + by[3]);
+      memset(buf, 200, SIZE);
+      dht_g_frame(&g, by, 0);
+
+      check_near("still decodes",
+          dht_decode(buf, SIZE, 0, 1000, &scratch, &lr), 5, 0);
+      check_near("humidity", dht_analysis()->rh_x10, 453, 0);
+    }
+
+    printf("dht with a broken checksum:\n");
+    {
+      uint8_t by[5] = { 0x01, 0xC5, 0x00, 0xEA, 0x42 };
+      DhtGen g = { buf, SIZE, 0 };
+
+      memset(buf, 200, SIZE);
+      dht_g_frame(&g, by, 1000);
+
+      check_near("refused", dht_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+    }
+
+    printf("dht rejects the rest:\n");
+    {
+      // A 1-Wire zero slot is a 60 us low and a short high, which is the
+      // shape of a DHT bit - hence 1-Wire ahead of it in the cascade, and
+      // hence this check
+      OwGen og = { buf, SIZE, 0 };
+      uint8_t sp[9] = { 0x91, 0x01, 0x4B, 0x46, 0x7F, 0xFF, 0x0C, 0x10, 0 };
+
+      sp[8] = ow_crc(sp, 8);
+      memset(buf, 200, SIZE);
+      ow_reset(&og);
+      ow_byte(&og, 0xCC);
+      ow_byte(&og, 0xBE);
+      ow_bytes(&og, sp, 9);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      check_near("1-wire stays 1-wire", lr.proto, PROTO_ONEWIRE, 0);
+
+      synth_uart(buf, SIZE, 512.0, 115200.0, "humidity?", 100000.0);
+      check_near("uart is not dht",
+          dht_decode(buf, SIZE, 0, 512, &scratch, &lr), 0, 0);
+
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      check_near("sine is not dht",
+          dht_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+    }
+
+    // ----- SENT / SAE J2716: 3 us tick, 100 ns sample period -------------
+    printf("sent:\n");
+    {
+      // Two 12-bit signals, 0x7A3 and 0x85C, the layout nearly every sensor
+      // sends: three nibbles each, most significant first
+      uint8_t nib[6] = { 0x7, 0xA, 0x3, 0x8, 0x5, 0xC };
+      SentGen g = { buf, SIZE, 0, 30.0, 0 };   // 3 us at 100 ns per sample
+
+      memset(buf, 200, SIZE);
+      sent_g_level(&g, 1, 20);                 // the tail of an earlier pause
+      sent_g_frame(&g, 0x1, nib, 6, sent_t_crc(nib, 6, 1));
+
+      int n = logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      const SentAnalysis *a = sent_analysis();
+
+      check_near("proto sent", lr.proto, PROTO_SENT, 0);
+      // status + six data + CRC
+      check_near("nibbles", n, 8, 0);
+      // The tick is not agreed in advance - it is read off the frame's own
+      // 56-tick sync pulse, which is what lets a drifting sensor still decode
+      check_near("tick 3 us", a->tick_ns, 3000, 3);
+      check_near("frames", a->frames, 1, 0);
+      check_near("crc checked out", a->frame[0].crc_ok, 1, 0);
+      check_near("status", a->frame[0].status, 1, 0);
+      check_near("data nibbles", a->frame[0].ndata, 6, 0);
+      check_near("signal 1", a->frame[0].s1, 0x7A3, 0);
+      check_near("signal 2", a->frame[0].s2, 0x85C, 0);
+      check_near("nibble 3", lr.bytes[3], 0x3, 0);
+      check_near("header", !strcmp(lr.info, "SENT 3.0us 7A3 85C"), 1, 0);
+
+      char lab[16];
+      sent_byte_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("label STAT", !strcmp(lab, "STAT"), 1, 0);
+      sent_byte_label(a, 3, lr.bytes[3], lab, sizeof(lab));
+      check_near("label S1=7A3", !strcmp(lab, "S1=7A3"), 1, 0);
+
+      // Three nibbles are one number, so they are one thing on the screen:
+      // the signal is written once across all three rather than "D1 D2
+      // S1=7A3", which leaves the reader to work out that the first two
+      // belong to the third
+      int gs, gl;
+
+      sent_group_at(a, 1, &gs, &gl);
+      check_near("D1 is in signal 1", gs == 1 && gl == 3, 1, 0);
+      sent_group_at(a, 3, &gs, &gl);
+      check_near("so is the third nibble", gs == 1 && gl == 3, 1, 0);
+      sent_group_at(a, 5, &gs, &gl);
+      check_near("signal 2 groups too", gs == 4 && gl == 3, 1, 0);
+      sent_group_at(a, 0, &gs, &gl);
+      check_near("status is alone", gs == 0 && gl == 1, 1, 0);
+      sent_group_at(a, 7, &gs, &gl);
+      check_near("and so is the CRC", gs == 7 && gl == 1, 1, 0);
+
+      // ...and the group answering "these three are 0x7A3" still leaves
+      // "which of the three is this" to answer, which is a different row
+      sent_field_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("field D1", !strcmp(lab, "D1"), 1, 0);
+      sent_field_label(a, 3, lr.bytes[3], lab, sizeof(lab));
+      check_near("field D3, not the signal", !strcmp(lab, "D3"), 1, 0);
+      sent_field_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("field STAT", !strcmp(lab, "STAT"), 1, 0);
+      sent_field_label(a, 7, lr.bytes[7], lab, sizeof(lab));
+      check_near("field CRC", !strcmp(lab, "CRC"), 1, 0);
+      sent_byte_label(a, 6, lr.bytes[6], lab, sizeof(lab));
+      check_near("label S2=85C", !strcmp(lab, "S2=85C"), 1, 0);
+      sent_byte_label(a, 7, lr.bytes[7], lab, sizeof(lab));
+      check_near("label CRC", !strcmp(lab, "CRC"), 1, 0);
+    }
+
+    // A frame off the bench, kept as it came: status 0, channel 1 = 0x394,
+    // channel 2 = 0xABC, CRC 0xF. The three things every SENT CRC gets wrong
+    // are all in this one vector - the status nibble is NOT in the sum, the
+    // seed is 5 and not 0, and the table is applied once more after the last
+    // data nibble. Get any of them wrong and 0xF does not come out.
+    printf("sent, a frame off the bench:\n");
+    {
+      uint8_t nib[6] = { 0x3, 0x9, 0x4, 0xA, 0xB, 0xC };
+      SentGen g = { buf, SIZE, 0, 30.0, 0 };
+
+      check_near("crc is F", sent_t_crc(nib, 6, 1), 0xF, 0);
+
+      memset(buf, 200, SIZE);
+      sent_g_level(&g, 1, 20);
+      sent_g_frame(&g, 0x0, nib, 6, 0xF);
+
+      int n = logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      const SentAnalysis *a = sent_analysis();
+
+      check_near("proto sent", lr.proto, PROTO_SENT, 0);
+      check_near("nibbles", n, 8, 0);
+      check_near("status", a->frame[0].status, 0x0, 0);
+      check_near("channel 1", a->frame[0].s1, 0x394, 0);
+      check_near("channel 2", a->frame[0].s2, 0xABC, 0);
+      check_near("crc as received", a->frame[0].crc, 0xF, 0);
+      check_near("crc checks out", a->frame[0].crc_ok, 1, 0);
+      check_near("the 2010 one", a->frame[0].legacy, 0, 0);
+      check_near("not ambiguous", lr.ambiguous, 0, 0);
+      check_near("nothing cut", lr.overrun, 0, 0);
+      check_near("header", !strcmp(lr.info, "SENT 3.0us 394 ABC"), 1, 0);
+    }
+
+    // J2716 blessed two CRCs - the 2008 one and the 2010 version with an
+    // extra zero nibble - and parts in the field use both
+    printf("sent with the 2008 crc:\n");
+    {
+      uint8_t nib[6] = { 0x7, 0xA, 0x3, 0x8, 0x5, 0xC };
+      SentGen g = { buf, SIZE, 0, 30.0, 0 };
+
+      memset(buf, 200, SIZE);
+      sent_g_level(&g, 1, 20);
+      sent_g_frame(&g, 0x1, nib, 6, sent_t_crc(nib, 6, 0));
+
+      logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      const SentAnalysis *a = sent_analysis();
+
+      check_near("accepted", a->frame[0].crc_ok, 1, 0);
+      check_near("noted as the older one", a->frame[0].legacy, 1, 0);
+    }
+
+    // The tick is whatever the sync says it is: same frame, sensor running
+    // at 6 us, and nothing in the decoder is told about it
+    printf("sent at another tick:\n");
+    {
+      uint8_t nib[3] = { 0x1, 0xF, 0x0 };
+      SentGen g = { buf, SIZE, 0, 60.0, 0 };
+
+      memset(buf, 200, SIZE);
+      sent_g_level(&g, 1, 20);
+      sent_g_frame(&g, 0x0, nib, 3, sent_t_crc(nib, 3, 1));
+
+      logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      const SentAnalysis *a = sent_analysis();
+
+      check_near("tick 6 us", a->tick_ns, 6000, 3);
+      check_near("one signal", a->frame[0].s1, 0x1F0, 0);
+      check_near("header", !strcmp(lr.info, "SENT 6.0us 1F0"), 1, 0);
+    }
+
+    printf("sent inverted:\n");
+    {
+      uint8_t nib[6] = { 0x0, 0x0, 0x1, 0xF, 0xF, 0xE };
+      SentGen g = { buf, SIZE, 0, 30.0, 1 };
+
+      memset(buf, 56, SIZE);
+      sent_g_level(&g, 1, 20);
+      sent_g_frame(&g, 0x3, nib, 6, sent_t_crc(nib, 6, 1));
+
+      logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      const SentAnalysis *a = sent_analysis();
+
+      check_near("still decodes", a->frames, 1, 0);
+      check_near("signal 1", a->frame[0].s1, 0x001, 0);
+      check_near("signal 2", a->frame[0].s2, 0xFFE, 0);
+    }
+
+    printf("sent, several frames:\n");
+    {
+      uint8_t n1[6] = { 0x7, 0xA, 0x3, 0x8, 0x5, 0xC };
+      uint8_t n2[6] = { 0x1, 0x2, 0x3, 0x4, 0x5, 0x6 };
+      SentGen g = { buf, SIZE, 0, 30.0, 0 };
+
+      memset(buf, 200, SIZE);
+      sent_g_level(&g, 1, 20);
+      sent_g_frame(&g, 0x1, n1, 6, sent_t_crc(n1, 6, 1));
+      sent_g_frame(&g, 0x2, n2, 6, sent_t_crc(n2, 6, 1));
+
+      logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      const SentAnalysis *a = sent_analysis();
+
+      check_near("frames", a->frames, 2, 0);
+      check_near("both check out", a->crc_ok, 2, 0);
+      check_near("second signal 1", a->frame[1].s1, 0x123, 0);
+      check_near("header", !strcmp(lr.info, "SENT 3.0us 2 frames"), 1, 0);
+    }
+
+    // Shape without a CRC behind it is a strong hint and not a proof: the
+    // cascade keeps looking, and a user who picked SENT by name still gets
+    // the nibbles
+    printf("sent with a broken crc:\n");
+    {
+      uint8_t nib[6] = { 0x7, 0xA, 0x3, 0x8, 0x5, 0xC };
+      SentGen g = { buf, SIZE, 0, 30.0, 0 };
+
+      memset(buf, 200, SIZE);
+      sent_g_level(&g, 1, 20);
+      sent_g_frame(&g, 0x1, nib, 6, (sent_t_crc(nib, 6, 1) + 1) & 0xF);
+
+      check_near("decodes", sent_decode(buf, SIZE, 0, 100, &scratch, &lr), 8, 0);
+      check_near("marked ambiguous", lr.ambiguous, 1, 0);
+      check_near("auto keeps off it", logic_decode(buf, SIZE, 0, 100,
+          PROTO_AUTO, &scratch, &lr) > 0 && lr.proto == PROTO_SENT, 0, 0);
+      check_near("named, it decodes", logic_decode(buf, SIZE, 0, 100,
+          PROTO_SENT, &scratch, &lr), 8, 0);
+      check_near("crc flagged", sent_analysis()->frame[0].crc_ok, 0, 0);
+    }
+
+    // A nibble is the distance between two falling edges, so the LAST pulse
+    // of a frame needs a closing edge to have a value at all - on a real bus
+    // that is the pause pulse or the next frame's sync. A record that ends
+    // before it leaves that pulse unmeasurable, and the frame then has no CRC
+    // in it at all. What must not happen is the last MEASURED nibble being
+    // called the CRC: that puts a data nibble under the word and shifts every
+    // label in the frame.
+    //
+    // Taken alone such a frame is genuinely undecidable - "status + 5 data +
+    // CRC with the pause cut" and "status + 6 data with the CRC cut" are the
+    // same waveform, and a four-bit CRC agrees with the wrong one of them
+    // once in sixteen. What settles it is the frame BEFORE it: a sensor sends
+    // one frame length, so a shorter one that runs into the end of the record
+    // is a cut frame, and its CRC is not worth testing at all.
+    printf("sent, whole frame then a cut one:\n");
+    {
+      uint8_t nib[6] = { 0x2, 0xC, 0xF, 0xA, 0xB, 0xC };
+      SentGen g = { buf, SIZE, 0, 30.0, 0 };
+
+      memset(buf, 200, SIZE);
+      sent_g_level(&g, 1, 20);
+      sent_g_frame(&g, 0x0, nib, 6, sent_t_crc(nib, 6, 1));
+
+      // ...and a second one whose CRC pulse never gets its closing edge,
+      // exactly as a capture that ends mid-frame leaves it
+      sent_g_pulse(&g, 56);
+      sent_g_pulse(&g, 12 + 0x0);
+
+      for (int i = 0; i < 6; i++)
+        sent_g_pulse(&g, 12 + nib[i]);
+
+      sent_g_pulse(&g, 12 + sent_t_crc(nib, 6, 1));
+
+      int n = sent_decode(buf, SIZE, 0, 100, &scratch, &lr);
+      const SentAnalysis *a = sent_analysis();
+
+      check_near("frames", a->frames, 2, 0);
+      check_near("first checked out", a->frame[0].crc_ok, 1, 0);
+      check_near("second has no CRC here", a->frame[1].no_crc, 1, 0);
+      check_near("second not called broken", a->frame[1].crc_ok, 0, 0);
+      // status + six data, and the CRC pulse that has no value here
+      check_near("its data survives", a->frame[1].s1, 0x2CF, 0);
+      check_near("and the rest of it", a->frame[1].s2, 0xABC, 0);
+      check_near("nibbles", n, 8 + 7, 0);
+      check_near("marked cut", lr.overrun, 1, 0);
+
+      // and the last nibble of it is labelled as the data it is
+      char lab[16];
+      sent_byte_label(a, 14, lr.bytes[14], lab, sizeof(lab));
+      check_near("last is S2, not CRC", !strcmp(lab, "S2=ABC"), 1, 0);
+
+      // The first frame is whole and checked, so the record is SENT even
+      // though the second one is a stub
+      logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      check_near("auto takes it", lr.proto, PROTO_SENT, 0);
+    }
+
+    printf("sent rejects the rest:\n");
+    {
+      // A console line at a fast timebase very nearly IS a SENT frame: pick
+      // a seven-bit interval as the sync and the tick comes out at exactly
+      // an eighth of a bit, so every falling edge afterwards lands on the
+      // tick grid and intervals of two and three bits sit inside the nibble
+      // window. What it cannot fake is the low time - a UART start bit holds
+      // low for whole bit periods, which is eight ticks, and every SENT pulse
+      // holds low for five.
+      const char *line = "MILKV-UART-TEST 115200-8N1 #0123456789";
+
+      synth_uart(buf, SIZE, 128.0, 115200.0, line, 100000.0);
+      check_near("uart at 128 ns is not sent",
+          sent_decode(buf, SIZE, 0, 128, &scratch, &lr), 0, 0);
+
+      synth_uart(buf, SIZE, 256.0, 115200.0, line, 100000.0);
+      check_near("uart at 256 ns is not sent",
+          sent_decode(buf, SIZE, 0, 256, &scratch, &lr), 0, 0);
+
+      synth_uart(buf, SIZE, 512.0, 115200.0, "not a sensor", 100000.0);
+      check_near("uart is not sent",
+          sent_decode(buf, SIZE, 0, 512, &scratch, &lr), 0, 0);
+
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      check_near("sine is not sent",
+          sent_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      double duty = 0.075;
+      synth(buf, SIZE, 0, fn_square, &duty, 50.0, 10000.0, 90.0, ZERO_POINT);
+      check_near("servo is not sent",
+          sent_decode(buf, SIZE, 0, 10000, &scratch, &lr), 0, 0);
+    }
+
+    // ============================ MIDI decoder ============================
+    //
+    // On the wire it is a UART, so the framing is not what identifies it: the
+    // rate is 31250 and nothing else, and the bytes obey a grammar. Both are
+    // asked for, because either alone is a coincidence.
+    printf("midi, notes on and off:\n");
+    {
+      const uint8_t s[] = { 0x90, 0x3C, 0x64, 0x80, 0x3C, 0x40 };
+      MidiGen g;
+      char lab[16];
+
+      midi_g(&g, buf, SIZE, 1000.0, 0);
+      midi_g_bytes(&g, s, sizeof(s));
+
+      int n = logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const MidiAnalysis *a = midi_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_MIDI, 0);
+      check_near("bytes", n, 6, 0);
+      check_near("messages", a->msgs, 2, 0);
+      check_near("both whole", a->full, 2, 0);
+      check_near("grammar clean", a->bad, 0, 0);
+      check_near("rate", lr.rate, 31250, 0);
+      check_near("header", !strcmp(lr.info, "MIDI 2 msgs ch1"), 1, 0);
+
+      // Three bytes, one message: they light together and the reading is
+      // written once across them
+      int gs, gl;
+      midi_group_at(a, 1, &gs, &gl);
+      check_near("group start", gs, 0, 0);
+      check_near("group length", gl, 3, 0);
+
+      midi_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("note on reads", !strcmp(lab, "On C4 v100"), 1, 0);
+      midi_byte_label(a, 5, lr.bytes[5], lab, sizeof(lab));
+      check_near("note off reads", !strcmp(lab, "Off C4"), 1, 0);
+
+      // ...and each byte still says which part of it it is
+      midi_field_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("status names the channel", !strcmp(lab, "On ch1"), 1, 0);
+      midi_field_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("first data is the note", !strcmp(lab, "NOTE"), 1, 0);
+      midi_field_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("second is the velocity", !strcmp(lab, "VEL"), 1, 0);
+    }
+
+    // A note on at velocity zero IS a note off, and every sequencer sends it
+    // that way so that running status can cover a whole phrase
+    printf("midi, running status:\n");
+    {
+      const uint8_t s[] = { 0x93, 0x3C, 0x64, 0x3E, 0x50, 0x3C, 0x00 };
+      MidiGen g;
+      char lab[16];
+
+      midi_g(&g, buf, SIZE, 1000.0, 0);
+      midi_g_bytes(&g, s, sizeof(s));
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const MidiAnalysis *a = midi_analysis();
+
+      check_near("three messages", a->msgs, 3, 0);
+      check_near("all whole", a->full, 3, 0);
+      check_near("grammar clean", a->bad, 0, 0);
+      check_near("channel", a->chan, 4, 0);
+
+      int gs, gl;
+      midi_group_at(a, 4, &gs, &gl);
+      check_near("second group start", gs, 3, 0);
+      check_near("...is two bytes", gl, 2, 0);
+
+      midi_byte_label(a, 4, lr.bytes[4], lab, sizeof(lab));
+      check_near("second note reads", !strcmp(lab, "On D4 v80"), 1, 0);
+      midi_byte_label(a, 6, lr.bytes[6], lab, sizeof(lab));
+      check_near("velocity 0 is note off", !strcmp(lab, "Off C4"), 1, 0);
+      midi_field_label(a, 3, lr.bytes[3], lab, sizeof(lab));
+      check_near("running data is the note", !strcmp(lab, "NOTE"), 1, 0);
+    }
+
+    // A real-time byte may land between any two bytes of another message and
+    // disturbs neither it nor running status. The interrupted message carries
+    // on in a record of its own, because a group on the screen is a run of
+    // ADJACENT bytes and a clock byte in the middle of a note is exactly the
+    // case that would otherwise break that.
+    printf("midi, a clock inside a note:\n");
+    {
+      const uint8_t s[] = { 0x90, 0x3C, 0xF8, 0x64 };
+      MidiGen g;
+      char lab[16];
+
+      midi_g(&g, buf, SIZE, 1000.0, 0);
+      midi_g_bytes(&g, s, sizeof(s));
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const MidiAnalysis *a = midi_analysis();
+
+      check_near("nothing is broken", a->bad, 0, 0);
+      check_near("the note is whole", a->full, 1, 0);
+      check_near("one real-time byte", a->rt, 1, 0);
+
+      // The groups tile: walking from 0 by the length returned always lands
+      // on the next group's first byte
+      int gs, gl, walk = 0, groups = 0;
+
+      while (walk < lr.count)
+      {
+        midi_group_at(a, walk, &gs, &gl);
+        check_near("group starts where we are", gs, walk, 0);
+        walk += gl;
+        groups++;
+      }
+
+      check_near("three groups", groups, 3, 0);
+
+      midi_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("the clock is named", !strcmp(lab, "Clock"), 1, 0);
+      midi_byte_label(a, 3, lr.bytes[3], lab, sizeof(lab));
+      check_near("the note finishes", !strcmp(lab, "On C4 v100"), 1, 0);
+      midi_field_label(a, 3, lr.bytes[3], lab, sizeof(lab));
+      check_near("...on its velocity byte", !strcmp(lab, "VEL"), 1, 0);
+    }
+
+    printf("midi, the rest of the messages:\n");
+    {
+      // Control change, channel mode, pitch bend, program change - and a
+      // system-exclusive with a manufacturer in it
+      const uint8_t s[] =
+      {
+        0xB2, 0x07, 0x64,              // CC7 = 100 on channel 3
+        0xB2, 0x7B, 0x00,              // controller 123: all notes off
+        0xE2, 0x00, 0x40,              // pitch bend at centre
+        0xC2, 0x05,                    // program change
+        0xF0, 0x41, 0x10, 0x42, 0xF7,  // Roland system exclusive
+      };
+      MidiGen g;
+      char lab[16];
+
+      midi_g(&g, buf, SIZE, 1000.0, 0);
+      midi_g_bytes(&g, s, sizeof(s));
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const MidiAnalysis *a = midi_analysis();
+
+      check_near("bytes", lr.count, (int)sizeof(s), 0);
+      check_near("messages", a->msgs, 5, 0);
+      check_near("all whole", a->full, 5, 0);
+      check_near("grammar clean", a->bad, 0, 0);
+
+      midi_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("control change", !strcmp(lab, "CC7=100"), 1, 0);
+      midi_byte_label(a, 5, lr.bytes[5], lab, sizeof(lab));
+      check_near("channel mode is named", !strcmp(lab, "AllOff"), 1, 0);
+      midi_byte_label(a, 8, lr.bytes[8], lab, sizeof(lab));
+      check_near("bend is signed from centre", !strcmp(lab, "Bend +0"), 1, 0);
+      midi_byte_label(a, 10, lr.bytes[10], lab, sizeof(lab));
+      check_near("program change", !strcmp(lab, "Prog 5"), 1, 0);
+
+      // The whole exclusive is one message, from 0xF0 to the 0xF7
+      int gs, gl;
+      midi_group_at(a, 13, &gs, &gl);
+      check_near("sysex starts at F0", gs, 11, 0);
+      check_near("...and runs to the EOX", gl, 5, 0);
+
+      midi_byte_label(a, 15, lr.bytes[15], lab, sizeof(lab));
+      check_near("sysex names the maker", !strcmp(lab, "SysEx Roland"), 1, 0);
+      midi_field_label(a, 12, lr.bytes[12], lab, sizeof(lab));
+      check_near("its first byte is the id", !strcmp(lab, "MFR"), 1, 0);
+      midi_field_label(a, 15, lr.bytes[15], lab, sizeof(lab));
+      check_near("its last is the EOX", !strcmp(lab, "EOX"), 1, 0);
+
+      // The band walks the record a GROUP at a time, so the groups have to
+      // tile it: stepping from zero by the length returned must land on the
+      // next group's first byte every time, right to the end
+      int walk = 0, groups = 0;
+
+      while (walk < lr.count && groups <= lr.count)
+      {
+        midi_group_at(a, walk, &gs, &gl);
+        check_near("group starts where we are", gs, walk, 0);
+        walk += gl;
+        groups++;
+      }
+
+      check_near("groups tile the record", groups, 5, 0);
+    }
+
+    printf("midi, notes across the keyboard:\n");
+    {
+      const uint8_t s[] = { 0x90, 0x00, 0x40, 0x3D, 0x40, 0x7F, 0x40 };
+      MidiGen g;
+      char lab[16];
+
+      midi_g(&g, buf, SIZE, 1000.0, 0);
+      midi_g_bytes(&g, s, sizeof(s));
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const MidiAnalysis *a = midi_analysis();
+
+      // 60 is C4 because 69 is A440, which is A4
+      midi_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("note 0", !strcmp(lab, "On C-1 v64"), 1, 0);
+      midi_byte_label(a, 4, lr.bytes[4], lab, sizeof(lab));
+      check_near("note 61", !strcmp(lab, "On C#4 v64"), 1, 0);
+      midi_byte_label(a, 6, lr.bytes[6], lab, sizeof(lab));
+      check_near("note 127", !strcmp(lab, "On G9 v64"), 1, 0);
+    }
+
+    // Half a message is not a message. What must never happen is a value
+    // written under a field that has not arrived - the byte after 0x3C could
+    // be anything, and printing a velocity for it would invent one.
+    printf("midi, a message the record cut:\n");
+    {
+      const uint8_t s[] = { 0x80, 0x3C, 0x40, 0x90, 0x3C };
+      MidiGen g;
+      char lab[16];
+
+      midi_g(&g, buf, SIZE, 1000.0, 0);
+      midi_g_bytes(&g, s, sizeof(s));
+
+      int n = midi_decode(buf, SIZE, 0, 1000, &scratch, &lr);
+      const MidiAnalysis *a = midi_analysis();
+
+      check_near("bytes", n, 5, 0);
+      check_near("not counted as broken", a->bad, 0, 0);
+      check_near("one whole message", a->full, 1, 0);
+      check_near("the other is marked cut", a->msg[1].partial, 1, 0);
+
+      midi_byte_label(a, 4, lr.bytes[4], lab, sizeof(lab));
+      check_near("named, not valued", !strcmp(lab, "NoteOn"), 1, 0);
+    }
+
+    // The optocoupler on the receiving end leaves the line idle high, but an
+    // inverting buffer between it and the probe is somebody's design
+    printf("midi, inverted:\n");
+    {
+      const uint8_t s[] = { 0x90, 0x40, 0x7F, 0x80, 0x40, 0x00 };
+      MidiGen g;
+      char lab[16];
+
+      midi_g(&g, buf, SIZE, 1000.0, 1);
+      midi_g_bytes(&g, s, sizeof(s));
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const MidiAnalysis *a = midi_analysis();
+
+      check_near("still MIDI", lr.proto, PROTO_MIDI, 0);
+      check_near("and says so", lr.idle_high, 0, 0);
+      check_near("messages", a->msgs, 2, 0);
+      midi_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("reads the same", !strcmp(lab, "On E4 v127"), 1, 0);
+    }
+
+    // A clock line carries nothing but real-time bytes, so no message with
+    // data ever completes on it. What says it is MIDI and not a bit pattern
+    // is the line RESTING between the bytes: a clock at 120 BPM is one byte
+    // every 20 ms and the byte is a third of a millisecond long. A square
+    // wave has no rest in it anywhere.
+    printf("midi, a clock line:\n");
+    {
+      MidiGen g;
+      char lab[16];
+
+      midi_g(&g, buf, SIZE, 1000.0, 0);
+
+      for (int i = 0; i < 4; i++)
+      {
+        midi_g_byte(&g, 0xF8);
+        midi_g_run(&g, 1, 60);
+      }
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const MidiAnalysis *a = midi_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_MIDI, 0);
+      check_near("bytes", lr.count, 4, 0);
+      check_near("real-time bytes", a->rt, 4, 0);
+      check_near("grammar clean", a->bad, 0, 0);
+      check_near("not ambiguous", lr.ambiguous, 0, 0);
+      check_near("header", !strcmp(lr.info, "MIDI 4 msgs"), 1, 0);
+
+      midi_byte_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("named", !strcmp(lab, "Clock"), 1, 0);
+    }
+
+    // 0xF4, 0xF5, 0xF9 and 0xFD are the codes the standard leaves undefined.
+    // Nothing transmits them, so a record holding one is a fault in the
+    // traffic - which is REPORTED. It is not a reason to hand the record to
+    // the UART decoder, which would read the same byte as an ordinary one and
+    // say nothing about it: the messages around it are unmistakably MIDI, and
+    // the fault is the thing worth seeing.
+    printf("midi, a byte that is not a message:\n");
+    {
+      const uint8_t s[] = { 0x90, 0x3C, 0x64, 0xF4, 0x90, 0x40, 0x64 };
+      MidiGen g;
+
+      midi_g(&g, buf, SIZE, 1000.0, 0);
+      midi_g_bytes(&g, s, sizeof(s));
+
+      int n = midi_decode(buf, SIZE, 0, 1000, &scratch, &lr);
+
+      check_near("still decodes", n, 7, 0);
+      check_near("and counts the fault", midi_analysis()->bad, 1, 0);
+      check_near("the header says so", strstr(lr.info, "err") != NULL, 1, 0);
+      check_near("identification stands", lr.ambiguous, 0, 0);
+      check_near("auto still takes it", logic_decode(buf, SIZE, 0, 1000,
+          PROTO_AUTO, &scratch, &lr) > 0 && lr.proto == PROTO_MIDI, 1, 0);
+    }
+
+    // More messages than there is room to describe. The byte list has to be
+    // cut where the descriptions run out: a byte with no message behind it
+    // would take the group and the label of some other message, and a record
+    // that says plainly it held more beats one that quietly mislabels its end.
+    printf("midi, more messages than fit:\n");
+    {
+      MidiGen g;
+      int gs, gl;
+
+      midi_g(&g, buf, SIZE, 1000.0, 0);
+      midi_g_byte(&g, 0xC0);              // program change...
+
+      for (int i = 0; i < 50; i++)
+        midi_g_byte(&g, (uint8_t)(i & 0x7F));   // ...and 50 under running status
+
+      int n = midi_decode(buf, SIZE, 0, 1000, &scratch, &lr);
+      const MidiAnalysis *a = midi_analysis();
+
+      check_near("messages stop at the limit", a->msgs, MIDI_MAX_MSGS, 0);
+      check_near("bytes stop with them", n, MIDI_MAX_MSGS + 1, 0);
+      check_near("and it says so", lr.truncated, 1, 0);
+
+      // Every byte that IS reported still belongs to a message of its own
+      int walk = 0, groups = 0;
+
+      while (walk < n && groups <= n)
+      {
+        midi_group_at(a, walk, &gs, &gl);
+        check_near("group starts where we are", gs, walk, 0);
+        walk += gl;
+        groups++;
+      }
+
+      check_near("groups tile what was kept", groups, MIDI_MAX_MSGS, 0);
+    }
+
+    // ---- the bench generator's obstacle course, phase by phase ----
+    //
+    // Six phases, each aimed at a place where a first-version MIDI decoder
+    // falls over. Run as separate records because that is what the scope
+    // actually catches: the generator's cycle is seconds long and a record is
+    // tens of milliseconds.
+    {
+      MidiGen g;
+      char lab[16];
+      int gs, gl;
+
+      printf("obstacle 1, the warm-up:\n");
+      {
+        const uint8_t s[] = { 0x90, 0x3C, 0x64, 0x80, 0x3C, 0x40 };
+
+        midi_g(&g, buf, SIZE, 1000.0, 0);
+        midi_g_bytes(&g, s, sizeof(s));
+        logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+        const MidiAnalysis *a = midi_analysis();
+
+        check_near("is MIDI", lr.proto, PROTO_MIDI, 0);
+        check_near("clean", a->bad, 0, 0);
+        midi_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+        check_near("note on", !strcmp(lab, "On C4 v100"), 1, 0);
+        midi_byte_label(a, 5, lr.bytes[5], lab, sizeof(lab));
+        check_near("note off", !strcmp(lab, "Off C4"), 1, 0);
+      }
+
+      // A C major chord under running status, then the same three notes
+      // released with note-on at velocity zero - which is what keeps the
+      // running status unbroken, and is exactly why it is sent that way
+      printf("obstacle 2, running status:\n");
+      {
+        const uint8_t s[] =
+        {
+          0x90, 0x3C, 0x64, 0x40, 0x64, 0x43, 0x64,
+          0x3C, 0x00, 0x40, 0x00, 0x43, 0x00,
+        };
+
+        midi_g(&g, buf, SIZE, 1000.0, 0);
+        midi_g_bytes(&g, s, sizeof(s));
+        logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+        const MidiAnalysis *a = midi_analysis();
+
+        check_near("is MIDI", lr.proto, PROTO_MIDI, 0);
+        check_near("six messages", a->msgs, 6, 0);
+        check_near("all whole", a->full, 6, 0);
+        check_near("clean", a->bad, 0, 0);
+
+        midi_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+        check_near("root", !strcmp(lab, "On C4 v100"), 1, 0);
+        midi_byte_label(a, 4, lr.bytes[4], lab, sizeof(lab));
+        check_near("third", !strcmp(lab, "On E4 v100"), 1, 0);
+        midi_byte_label(a, 6, lr.bytes[6], lab, sizeof(lab));
+        check_near("fifth", !strcmp(lab, "On G4 v100"), 1, 0);
+        midi_byte_label(a, 8, lr.bytes[8], lab, sizeof(lab));
+        check_near("root released", !strcmp(lab, "Off C4"), 1, 0);
+        midi_byte_label(a, 12, lr.bytes[12], lab, sizeof(lab));
+        check_near("fifth released", !strcmp(lab, "Off G4"), 1, 0);
+
+        // The chord's second and third notes have no status byte on the wire
+        midi_group_at(a, 3, &gs, &gl);
+        check_near("second note groups its pair", gs, 3, 0);
+        check_near("...and only its pair", gl, 2, 0);
+      }
+
+      // Two data bytes, then one, then one, then two again. A decoder that
+      // expects two of everything comes off the rails at the program change
+      // and never gets back on.
+      printf("obstacle 3, the zoo of lengths:\n");
+      {
+        const uint8_t s[] =
+        {
+          0xB0, 0x07, 0x64, 0xC0, 0x05, 0xD0, 0x30,
+          0xE0, 0x00, 0x40, 0xE0, 0x7F, 0x7F,
+        };
+
+        midi_g(&g, buf, SIZE, 1000.0, 0);
+        midi_g_bytes(&g, s, sizeof(s));
+        logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+        const MidiAnalysis *a = midi_analysis();
+
+        check_near("is MIDI", lr.proto, PROTO_MIDI, 0);
+        check_near("five messages", a->msgs, 5, 0);
+        check_near("all whole", a->full, 5, 0);
+        check_near("clean", a->bad, 0, 0);
+
+        midi_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+        check_near("control change", !strcmp(lab, "CC7=100"), 1, 0);
+        midi_byte_label(a, 4, lr.bytes[4], lab, sizeof(lab));
+        check_near("program change", !strcmp(lab, "Prog 5"), 1, 0);
+        midi_byte_label(a, 6, lr.bytes[6], lab, sizeof(lab));
+        check_near("channel pressure", !strcmp(lab, "Press 48"), 1, 0);
+        // Fourteen bits, LSB first, centre 8192 - shown as the offset from it
+        midi_byte_label(a, 9, lr.bytes[9], lab, sizeof(lab));
+        check_near("bend at centre", !strcmp(lab, "Bend +0"), 1, 0);
+        midi_byte_label(a, 12, lr.bytes[12], lab, sizeof(lab));
+        check_near("bend at the top", !strcmp(lab, "Bend +8191"), 1, 0);
+      }
+
+      printf("obstacle 4, real-time barging in:\n");
+      {
+        const uint8_t s[] = { 0xF8, 0x90, 0x3C, 0xF8, 0x64, 0xFE };
+
+        midi_g(&g, buf, SIZE, 1000.0, 0);
+        midi_g_bytes(&g, s, sizeof(s));
+        logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+        const MidiAnalysis *a = midi_analysis();
+
+        check_near("is MIDI", lr.proto, PROTO_MIDI, 0);
+        check_near("clean", a->bad, 0, 0);
+        check_near("the note is whole", a->full, 1, 0);
+        check_near("three real-time bytes", a->rt, 3, 0);
+
+        midi_byte_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+        check_near("clock on its own", !strcmp(lab, "Clock"), 1, 0);
+        midi_byte_label(a, 3, lr.bytes[3], lab, sizeof(lab));
+        check_near("clock inside the note", !strcmp(lab, "Clock"), 1, 0);
+        midi_byte_label(a, 4, lr.bytes[4], lab, sizeof(lab));
+        check_near("the note finishes", !strcmp(lab, "On C4 v100"), 1, 0);
+        midi_byte_label(a, 5, lr.bytes[5], lab, sizeof(lab));
+        check_near("active sensing", !strcmp(lab, "Sense"), 1, 0);
+
+        // The interrupted note is two groups, not one broken one
+        midi_group_at(a, 2, &gs, &gl);
+        check_near("first half groups", gs, 1, 0);
+        check_near("...up to the clock", gl, 2, 0);
+        midi_group_at(a, 4, &gs, &gl);
+        check_near("the rest is its own group", gs, 4, 0);
+        check_near("...of one byte", gl, 1, 0);
+      }
+
+      printf("obstacle 5, system exclusive:\n");
+      {
+        const uint8_t s[] =
+        {
+          0xF0, 0x7D, 0x01, 0x02, 0x03, 0xF7,
+          0xF0, 0x7D, 0x11, 0xF8, 0x22, 0xF7,
+        };
+
+        midi_g(&g, buf, SIZE, 1000.0, 0);
+        midi_g_bytes(&g, s, sizeof(s));
+        logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+        const MidiAnalysis *a = midi_analysis();
+
+        check_near("is MIDI", lr.proto, PROTO_MIDI, 0);
+        check_near("clean", a->bad, 0, 0);
+        check_near("both closed", a->full, 2, 0);
+        check_near("one clock", a->rt, 1, 0);
+
+        // The first is one group from F0 to F7
+        midi_group_at(a, 3, &gs, &gl);
+        check_near("plain sysex groups whole", gs, 0, 0);
+        check_near("...F0 to F7", gl, 6, 0);
+
+        midi_byte_label(a, 5, lr.bytes[5], lab, sizeof(lab));
+        check_near("named by its maker id", !strcmp(lab, "SysEx Test"), 1, 0);
+
+        // The second is split by the clock and carries on afterwards
+        midi_group_at(a, 7, &gs, &gl);
+        check_near("second sysex starts", gs, 6, 0);
+        check_near("...and stops at the clock", gl, 3, 0);
+        midi_byte_label(a, 9, lr.bytes[9], lab, sizeof(lab));
+        check_near("clock shown", !strcmp(lab, "Clock"), 1, 0);
+        midi_group_at(a, 10, &gs, &gl);
+        check_near("and resumes after it", gs, 10, 0);
+        check_near("...to its EOX", gl, 2, 0);
+        midi_byte_label(a, 11, lr.bytes[11], lab, sizeof(lab));
+        check_near("still the same sysex", !strcmp(lab, "SysEx Test"), 1, 0);
+        midi_field_label(a, 11, lr.bytes[11], lab, sizeof(lab));
+        check_near("closed by its EOX", !strcmp(lab, "EOX"), 1, 0);
+      }
+
+      // Faults, and the decoder has to survive them AND say so. Being turned
+      // down over them is the wrong answer: the UART decoder would take the
+      // record and read every one of these bytes as an ordinary byte.
+      printf("obstacle 6a, a message cut off by the next status:\n");
+      {
+        const uint8_t s[] = { 0x90, 0x3C, 0xB0, 0x07, 0x64 };
+
+        midi_g(&g, buf, SIZE, 1000.0, 0);
+        midi_g_bytes(&g, s, sizeof(s));
+        logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+        const MidiAnalysis *a = midi_analysis();
+
+        check_near("still MIDI", lr.proto, PROTO_MIDI, 0);
+        check_near("the fault is counted", a->bad, 1, 0);
+        check_near("the header says so", strstr(lr.info, "err") != NULL, 1, 0);
+
+        // The half-sent note is named and NOT valued: the byte after 0x3C
+        // could have been anything, and a velocity here would be invented
+        midi_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+        check_near("half a note is not a note", !strcmp(lab, "NoteOn"), 1, 0);
+        midi_byte_label(a, 4, lr.bytes[4], lab, sizeof(lab));
+        check_near("the CC is taken", !strcmp(lab, "CC7=100"), 1, 0);
+      }
+
+      // System common cancels running status, so the two bytes after it have
+      // no status in front of them at all. Applying the old 0x90 is the naive
+      // answer and the wrong one - 0xF3 killed it.
+      printf("obstacle 6b, orphans after a system common:\n");
+      {
+        const uint8_t s[] = { 0x90, 0x3C, 0x64, 0xF3, 0x01, 0x3C, 0x64 };
+
+        midi_g(&g, buf, SIZE, 1000.0, 0);
+        midi_g_bytes(&g, s, sizeof(s));
+        logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+        const MidiAnalysis *a = midi_analysis();
+
+        check_near("still MIDI", lr.proto, PROTO_MIDI, 0);
+        check_near("both orphans counted", a->bad, 2, 0);
+        check_near("the header says so", strstr(lr.info, "err") != NULL, 1, 0);
+
+        midi_byte_label(a, 4, lr.bytes[4], lab, sizeof(lab));
+        check_near("song select read", !strcmp(lab, "Song 1"), 1, 0);
+        // ...and NOT read as another note on channel 1
+        midi_byte_label(a, 6, lr.bytes[6], lab, sizeof(lab));
+        check_near("orphan not made a note", !strcmp(lab, "data"), 1, 0);
+        midi_group_at(a, 5, &gs, &gl);
+        check_near("orphan stands alone", gl, 1, 0);
+      }
+
+      // No timeouts in MIDI: a data byte 50 ms behind its status byte is
+      // legal, and the message must not be thrown away. 4 us a sample puts
+      // the whole 98 ms of it in one record.
+      printf("obstacle 6c, a data byte 50 ms late:\n");
+      {
+        midi_g(&g, buf, SIZE, 4000.0, 0);
+        midi_g_byte(&g, 0x90);
+        midi_g_byte(&g, 0x40);
+        midi_g_run(&g, 1, 50000.0 / 32.0);   // 50 ms of idle, in bit times
+        midi_g_byte(&g, 0x64);
+
+        logic_decode(buf, SIZE, 0, 4000, PROTO_AUTO, &scratch, &lr);
+        const MidiAnalysis *a = midi_analysis();
+
+        check_near("still MIDI", lr.proto, PROTO_MIDI, 0);
+        check_near("bytes", lr.count, 3, 0);
+        check_near("no fault", a->bad, 0, 0);
+        check_near("the message is whole", a->full, 1, 0);
+        midi_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+        check_near("waited for it", !strcmp(lab, "On E4 v100"), 1, 0);
+      }
+    }
+
+    printf("midi rejects the rest:\n");
+    {
+      // A serial link at 31250 baud carrying text: the framing is perfect and
+      // there is no grammar in it at all, because every ASCII byte is a data
+      // byte and not one of them is a status. That is the case the rate alone
+      // would get wrong.
+      synth_uart(buf, SIZE, 1000.0, 31250.0, "Hello, world!", 20000.0);
+      check_near("text at 31250 is refused",
+          midi_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+      check_near("...and auto reads it as UART", logic_decode(buf, SIZE, 0,
+          1000, PROTO_AUTO, &scratch, &lr) > 0 && lr.proto == PROTO_UART, 1, 0);
+
+      // ...and a link at any other rate is not MIDI at all: every run in the
+      // record is a whole number of bit times, and at 31250 one bit is wider
+      // than the shortest run here
+      synth_uart(buf, SIZE, 1000.0, 115200.0, "MILKV-UART-TEST", 20000.0);
+      check_near("115200 is not midi",
+          midi_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      synth_uart(buf, SIZE, 1000.0, 9600.0, "MILKV-UART-TEST", 20000.0);
+      check_near("9600 is not midi",
+          midi_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      check_near("sine is not midi",
+          midi_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      double duty = 0.075;
+      synth(buf, SIZE, 0, fn_square, &duty, 50.0, 10000.0, 90.0, ZERO_POINT);
+      check_near("servo is not midi",
+          midi_decode(buf, SIZE, 0, 10000, &scratch, &lr), 0, 0);
+
+      // Undersampled: at 100 us a bit is a third of a sample and the stop bit
+      // cannot be placed at all
+      check_near("undersampled is refused",
+          midi_decode(buf, SIZE, 0, 100000, &scratch, &lr), 0, 0);
+    }
+
+    // ============================ LIN decoder =============================
+    //
+    // The break is what identifies it: at least ten dominant bits, and 8N1
+    // tops out at nine. The sync byte is what clocks it: nine runs of exactly
+    // one bit, and eight bit times between the first falling edge and the
+    // last. Neither is a guess, so there is no rate search here at all.
+    printf("lin, one frame:\n");
+    {
+      const uint8_t d[4] = { 0x11, 0x22, 0x33, 0x44 };
+      LinGen g;
+      char lab[16];
+
+      lin_g(&g, buf, SIZE, 1000.0, 19200.0, 0);
+      lin_g_frame(&g, 0x2A, d, 4, 1);
+
+      int n = logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const LinAnalysis *a = lin_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_LIN, 0);
+      check_near("sync, pid, data, checksum", n, 2 + 5, 0);
+      check_near("rate off the sync byte", lr.rate, 19200, 0);
+      check_near("one frame", a->frames, 1, 0);
+      check_near("identifier", a->frame[0].id, 0x2A, 0);
+      check_near("parity checks", a->frame[0].parity_ok, 1, 0);
+      check_near("checksum checks", a->frame[0].csum_ok, 1, 0);
+      check_near("enhanced", a->frame[0].enhanced, 1, 0);
+      check_near("four data bytes", a->frame[0].ndata, 4, 0);
+      check_near("header", !strcmp(lr.info, "LIN 19200 ID=2A 4B enh"), 1, 0);
+
+      lin_byte_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("sync named", !strcmp(lab, "SYNC"), 1, 0);
+      lin_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("identifier under its parity", !strcmp(lab, "ID=2A"), 1, 0);
+      lin_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("first data byte", !strcmp(lab, "D1"), 1, 0);
+      lin_byte_label(a, 6, lr.bytes[6], lab, sizeof(lab));
+      check_near("checksum", !strcmp(lab, "CHK"), 1, 0);
+    }
+
+    // The rate is not searched for and not assumed - it comes out of the sync
+    // byte's own edges every frame, which is how a slave does it
+    printf("lin at the rates a car uses:\n");
+    {
+      const double baud[] = { 2400.0, 9600.0, 19200.0 };
+      const uint8_t d[2] = { 0xAB, 0xCD };
+
+      for (int i = 0; i < 3; i++)
+      {
+        LinGen g;
+
+        lin_g(&g, buf, SIZE, 4000.0, baud[i], 0);
+        lin_g_frame(&g, 0x05, d, 2, 1);
+
+        logic_decode(buf, SIZE, 0, 4000, PROTO_AUTO, &scratch, &lr);
+
+        check_near("found without being told", lr.rate, baud[i], 0);
+        check_near("and it is LIN", lr.proto, PROTO_LIN, 0);
+      }
+    }
+
+    printf("lin, several frames and the classic checksum:\n");
+    {
+      const uint8_t d1[2] = { 0x01, 0x02 };
+      const uint8_t d2[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+      LinGen g;
+
+      // LIN 1.3: the checksum covers the data and not the identifier
+      lin_g(&g, buf, SIZE, 1000.0, 9600.0, 0);
+      lin_g_frame(&g, 0x11, d1, 2, 0);
+      lin_g_frame(&g, 0x32, d2, 8, 0);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const LinAnalysis *a = lin_analysis();
+
+      check_near("two frames", a->frames, 2, 0);
+      check_near("both check out", a->csum_ok, 2, 0);
+      check_near("second is eight bytes", a->frame[1].ndata, 8, 0);
+      check_near("classic, not enhanced", a->frame[1].enhanced, 0, 0);
+      check_near("header says so",
+          !strcmp(lr.info, "LIN 9600 2 frames cls"), 1, 0);
+    }
+
+    // A header nobody answered. The master asked for that identifier and no
+    // slave on the bus owns it - which is what an unplugged module looks like
+    // and is the most useful thing the decoder can say about it.
+    printf("lin, a header with no response:\n");
+    {
+      LinGen g;
+
+      lin_g(&g, buf, SIZE, 1000.0, 19200.0, 0);
+      lin_g_header(&g, 0x14);
+      lin_g_run(&g, 1, 200);              // ...and nothing comes back
+
+      int n = logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const LinAnalysis *a = lin_analysis();
+
+      check_near("still LIN", lr.proto, PROTO_LIN, 0);
+      check_near("the header is there", n, 2, 0);
+      check_near("and it is empty", a->frame[0].no_resp, 1, 0);
+      check_near("parity still checks", a->frame[0].parity_ok, 1, 0);
+      check_near("header", !strcmp(lr.info, "LIN 19200 ID=14 no resp"), 1, 0);
+    }
+
+    // The two diagnostic identifiers are the transport layer, and their first
+    // three bytes have names rather than numbers
+    printf("lin, a diagnostic frame:\n");
+    {
+      // NAD 0x01, PCI 0x06, SID 0xB2 (read by identifier), then its arguments
+      const uint8_t d[8] = { 0x01, 0x06, 0xB2, 0x00, 0x01, 0x02, 0x03, 0xFF };
+      LinGen g;
+      char lab[16];
+
+      lin_g(&g, buf, SIZE, 1000.0, 19200.0, 0);
+      lin_g_frame(&g, 0x3C, d, 8, 0);     // classic even on a 2.x bus
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const LinAnalysis *a = lin_analysis();
+
+      check_near("checksum checks", a->frame[0].csum_ok, 1, 0);
+      check_near("...the classic one", a->frame[0].enhanced, 0, 0);
+      // ...and that is mandatory here, so it says nothing about the bus
+      check_near("not called out as classic",
+          strstr(lr.info, "cls") == NULL, 1, 0);
+
+      lin_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("node address", !strcmp(lab, "NAD 01"), 1, 0);
+      lin_byte_label(a, 3, lr.bytes[3], lab, sizeof(lab));
+      check_near("frame control", !strcmp(lab, "PCI 06"), 1, 0);
+      lin_byte_label(a, 4, lr.bytes[4], lab, sizeof(lab));
+      check_near("service named", !strcmp(lab, "ReadById"), 1, 0);
+      lin_byte_label(a, 5, lr.bytes[5], lab, sizeof(lab));
+      check_near("...and its arguments numbered", !strcmp(lab, "D1"), 1, 0);
+    }
+
+    // Faults are reported. The break and the sync have already identified the
+    // bus by the time either of these is checked.
+    printf("lin, a broken checksum and a broken parity:\n");
+    {
+      const uint8_t d[2] = { 0x55, 0xAA };
+      LinGen g;
+      char lab[16];
+
+      lin_g(&g, buf, SIZE, 1000.0, 19200.0, 0);
+      lin_g_header(&g, 0x0B);
+      lin_g_byte(&g, d[0]);
+      lin_g_byte(&g, d[1]);
+      lin_g_byte(&g, (uint8_t)(lin_g_csum(d, 2, lin_g_pid(0x0B), 1) ^ 0x01));
+      lin_g_run(&g, 1, 20);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const LinAnalysis *a = lin_analysis();
+
+      check_near("still LIN", lr.proto, PROTO_LIN, 0);
+      check_near("checksum flagged", a->frame[0].csum_ok, 0, 0);
+      check_near("parity still fine", a->frame[0].parity_ok, 1, 0);
+      check_near("counted as an error", lr.errors, 1, 0);
+      check_near("header says so", strstr(lr.info, "CHK!") != NULL, 1, 0);
+      lin_byte_label(a, 4, lr.bytes[4], lab, sizeof(lab));
+      check_near("and the byte says so", !strcmp(lab, "CHK!"), 1, 0);
+
+      // A protected identifier whose parity does not hold is not an
+      // identifier, so the six bits under it are shown with a '!'
+      lin_g(&g, buf, SIZE, 1000.0, 19200.0, 0);
+      lin_g_run(&g, 0, 13);
+      lin_g_run(&g, 1, 1);
+      lin_g_byte(&g, 0x55);
+      lin_g_byte(&g, (uint8_t)(lin_g_pid(0x0B) ^ 0x40));   // one parity bit off
+      lin_g_byte(&g, d[0]);
+      lin_g_byte(&g, d[1]);
+      lin_g_byte(&g, lin_g_csum(d, 2, (uint8_t)(lin_g_pid(0x0B) ^ 0x40), 1));
+      lin_g_run(&g, 1, 20);
+
+      int n = lin_decode(buf, SIZE, 0, 1000, &scratch, &lr);
+      const LinAnalysis *b = lin_analysis();
+
+      check_near("still decodes", n, 5, 0);
+      check_near("parity flagged", b->frame[0].parity_ok, 0, 0);
+      check_near("marked ambiguous", lr.ambiguous, 1, 0);
+      lin_byte_label(b, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("identifier marked", !strcmp(lab, "ID=0B!"), 1, 0);
+    }
+
+    printf("lin, inverted:\n");
+    {
+      const uint8_t d[2] = { 0x12, 0x34 };
+      LinGen g;
+
+      lin_g(&g, buf, SIZE, 1000.0, 19200.0, 1);
+      lin_g_frame(&g, 0x2A, d, 2, 1);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const LinAnalysis *a = lin_analysis();
+
+      check_near("still LIN", lr.proto, PROTO_LIN, 0);
+      check_near("and says so", lr.idle_high, 0, 0);
+      check_near("identifier", a->frame[0].id, 0x2A, 0);
+      check_near("checksum checks", a->frame[0].csum_ok, 1, 0);
+    }
+
+    // A frame that came off the bench generator and was read on the device,
+    // reproduced byte for byte. Its break is not a real break at all - it is
+    // a 0x00 byte sent at half the frame's rate, which is the usual way to
+    // make one out of a plain UART, and it lands at 18 bit times.
+    //
+    //   55 | 50 | 70 A5 | E9
+    //   PID 0x50 = id 0x10, P0 = 0^0^0^1 = 1, P1 = !(0^0^1^0) = 0
+    //   CHK classic: 0x70 + 0xA5 = 0x115 -> carry back -> 0x16 -> ~ -> 0xE9
+    printf("lin, the frame the bench generator sent:\n");
+    {
+      const uint8_t d[2] = { 0x70, 0xA5 };
+      LinGen g;
+      char lab[16];
+
+      check_near("its PID is 0x50", lin_g_pid(0x10), 0x50, 0);
+      check_near("its classic checksum is 0xE9",
+          lin_g_csum(d, 2, 0x50, 0), 0xE9, 0);
+
+      lin_g(&g, buf, SIZE, 1000.0, 9600.0, 0);
+      lin_g_run(&g, 0, 18);               // 0x00 at half rate: 18 bit times
+      lin_g_run(&g, 1, 2);
+      lin_g_byte(&g, 0x55);
+      lin_g_byte(&g, 0x50);
+      lin_g_byte(&g, d[0]);
+      lin_g_byte(&g, d[1]);
+      lin_g_byte(&g, 0xE9);
+      lin_g_run(&g, 1, 40);
+
+      int n = logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const LinAnalysis *a = lin_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_LIN, 0);
+      check_near("five bytes", n, 5, 0);
+      check_near("rate", lr.rate, 9600, 0);
+      check_near("identifier", a->frame[0].id, 0x10, 0);
+      check_near("parity checks", a->frame[0].parity_ok, 1, 0);
+      check_near("checksum checks", a->frame[0].csum_ok, 1, 0);
+      check_near("and it is the classic one", a->frame[0].enhanced, 0, 0);
+      check_near("no errors", lr.errors, 0, 0);
+      // Which checksum the bus uses is said out loud, not left to be inferred
+      // from the absence of the other word
+      check_near("header", !strcmp(lr.info, "LIN 9600 ID=10 2B cls"), 1, 0);
+
+      lin_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("identifier read", !strcmp(lab, "ID=10"), 1, 0);
+      lin_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("counter byte", !strcmp(lab, "D1"), 1, 0);
+      check_near("...and its value", lr.bytes[2], 0x70, 0);
+      lin_byte_label(a, 4, lr.bytes[4], lab, sizeof(lab));
+      check_near("checksum", !strcmp(lab, "CHK"), 1, 0);
+
+      // The same data under the enhanced checksum is a DIFFERENT byte, which
+      // is what makes telling the two apart worth doing rather than guessing
+      check_near("enhanced would be another byte",
+          lin_g_csum(d, 2, 0x50, 1) != 0xE9, 1, 0);
+    }
+
+    printf("lin rejects the rest:\n");
+    {
+      // 8N1 cannot send a break: nine dominant bits is the most it has, and
+      // the stop bit is obliged to let the line up after them. This is the
+      // whole identification, so it is the one thing worth testing hardest.
+      synth_uart(buf, SIZE, 1000.0, 19200.0, "\x00\x00\x00\x00 break?", 20000.0);
+      check_near("a run of zero bytes is not a break",
+          lin_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      synth_uart(buf, SIZE, 1000.0, 9600.0, "MILKV-UART-TEST 9600", 20000.0);
+      check_near("uart is not lin",
+          lin_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      check_near("sine is not lin",
+          lin_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      double duty = 0.075;
+      synth(buf, SIZE, 0, fn_square, &duty, 50.0, 10000.0, 90.0, ZERO_POINT);
+      check_near("servo is not lin",
+          lin_decode(buf, SIZE, 0, 10000, &scratch, &lr), 0, 0);
+
+      // ...and LIN does not take anyone else's records either. It runs ahead
+      // of 1-Wire, WS2812, DHT, SENT, MIDI, servo and UART in the cascade, so
+      // every one of those has to bounce off it - and the two that start with
+      // a long dominant pulse of their own are the ones that matter: a 1-Wire
+      // reset is 480 us of it and a DHT start pulse is 18 ms, and both are
+      // followed by something that has to pass for a sync byte and does not.
+      {
+        MidiGen mg;
+        const uint8_t s[] = { 0x90, 0x3C, 0x64, 0x80, 0x3C, 0x40 };
+
+        midi_g(&mg, buf, SIZE, 1000.0, 0);
+        midi_g_bytes(&mg, s, sizeof(s));
+        check_near("midi is not lin",
+            lin_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+      }
+
+      {
+        // A DS18B20 conversation: reset, SKIP ROM, CONVERT T, reset, READ
+        const uint8_t sp[9] =
+            { 0x50, 0x05, 0x4B, 0x46, 0x7F, 0xFF, 0x0C, 0x10, 0x00 };
+        uint8_t sp2[9];
+        OwGen g = { buf, SIZE, 0 };
+
+        memcpy(sp2, sp, 9);
+        sp2[8] = ow_crc(sp2, 8);
+
+        memset(buf, 200, SIZE);
+        ow_reset(&g);
+        ow_byte(&g, 0xCC);
+        ow_byte(&g, 0x44);
+        ow_reset(&g);
+        ow_byte(&g, 0xCC);
+        ow_byte(&g, 0xBE);
+        ow_bytes(&g, sp2, 9);
+
+        check_near("1-wire is not lin",
+            lin_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+        check_near("...and still decodes as 1-wire", logic_decode(buf, SIZE, 0,
+            1000, PROTO_AUTO, &scratch, &lr) > 0 &&
+            lr.proto == PROTO_ONEWIRE, 1, 0);
+      }
+
+      {
+        // The 18 ms start pulse of a DHT11 is a longer dominant field than
+        // any LIN break, and what follows it is not nine equal runs
+        const uint8_t by[5] = { 45, 0, 23, 0, 68 };
+        DhtGen g = { buf, SIZE, 0 };
+
+        memset(buf, 200, SIZE);
+        dht_g_frame(&g, by, 18000);
+
+        check_near("dht is not lin",
+            lin_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+        check_near("...and still decodes as dht", logic_decode(buf, SIZE, 0,
+            1000, PROTO_AUTO, &scratch, &lr) > 0 &&
+            lr.proto == PROTO_DHT, 1, 0);
+      }
+
+      {
+        uint8_t nib[6] = { 0x7, 0xA, 0x3, 0x8, 0x5, 0xC };
+        SentGen g = { buf, SIZE, 0, 30.0, 0 };
+
+        memset(buf, 200, SIZE);
+        sent_g_level(&g, 1, 20);
+        sent_g_frame(&g, 0x1, nib, 6, sent_t_crc(nib, 6, 1));
+        sent_g_frame(&g, 0x1, nib, 6, sent_t_crc(nib, 6, 1));
+
+        check_near("sent is not lin",
+            lin_decode(buf, SIZE, 0, 100, &scratch, &lr), 0, 0);
+        check_near("...and still decodes as sent", logic_decode(buf, SIZE, 0,
+            100, PROTO_AUTO, &scratch, &lr) > 0 && lr.proto == PROTO_SENT,
+            1, 0);
+      }
+    }
+
     // ----- structured decoders must all reject a sine -----
+    //
+    // UART rejects it one step later than the rest. Thresholded, a sine is a
+    // square wave, and a square wave IS a stream of 0x55 frames - there is no
+    // reading of the samples that separates the two. So uart_decode reports
+    // the frames it found and marks them ambiguous, and the dispatcher, which
+    // knows whether anyone asked for UART, is what turns them down.
     synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
-    check_near("sine not uart", uart_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+    uart_decode(buf, SIZE, 0, 1000, &scratch, &lr);
+    check_near("sine uart is ambiguous", lr.ambiguous, 1, 0);
+    check_near("sine not uart in auto", logic_decode(buf, SIZE, 0, 1000,
+        PROTO_AUTO, &scratch, &lr) > 0 && lr.proto == PROTO_UART, 0, 0);
     check_near("sine not 1-wire", onewire_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
     check_near("sine not ws2812", ws2812_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
     check_near("sine not nec", nec_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
@@ -931,6 +3685,127 @@ int main(void)
     fft_spectrum_decim(r, 24576, 0, 1, fmag);
     fft_analyze(fmag, 8, &an);
     check_near("F0 is 25, not 50", an.fundamental, 25000000, 1);
+  }
+
+  // ===== period jitter statistics =====
+  //
+  // FULL periods must alternate (195, 205, 195, ...) - alternating
+  // half-periods collapses into constant full periods and zero jitter.
+  {
+    static uint8_t jb[24000];
+    Measure m;
+    int idx = 0;
+
+    printf("jitter statistics:\n");
+
+    for (int k = 0; k < 120; k++)
+    {
+      int period = (k & 1) ? 205 : 195;
+
+      for (int i = 0; i < period; i++)
+        jb[idx++] = (i < period / 2) ? 190 : 66;
+    }
+
+    measure_run(jb, idx, 0, 1000, ZERO_POINT, &m);
+
+    check_near("period min", m.period_min_ns, 195000, 1);
+    check_near("period max", m.period_max_ns, 205000, 1);
+    check_near("jitter rms (sigma 5us)", m.jitter_rms_ps, 5000000, 3);
+    check_near("jitter pp (10us)", m.jitter_pp_ps, 10000000, 2);
+  }
+
+  // ===== glitch finder: narrowest complete pulse =====
+  {
+    static uint8_t gb[8000];
+    static uint8_t wb[1000];
+    int w = 0, cnt = 0, pos;
+    bool high = false;
+
+    printf("min pulse finder:\n");
+
+    // A clean 20/20 square: every complete run ties at 20 samples. The tie
+    // count is what tells the caller this is the signal itself, not a
+    // glitch. First complete run is the low at [20..39] (the leading high
+    // is partial); low runs complete = 199 of the 400 total.
+    for (int i = 0; i < 8000; i++)
+      gb[i] = ((i / 20) & 1) ? 66 : 190;
+
+    pos = measure_find_min_pulse(gb, 8000, 0, 100, 156, &w, &high, &cnt);
+    check_near("square: pos", pos, 30, 0);
+    check_near("square: width", w, 20, 0);
+    check_near("square: polarity low", high ? 1 : 0, 0, 0);
+    check_near("square: tie count", cnt, 199, 0);
+
+    // A 3-sample runt buried inside one low half-period, and the record
+    // read through a nonzero ring offset: array 2025 = time 3026's run
+    gb[2025] = gb[2026] = gb[2027] = 190;
+
+    pos = measure_find_min_pulse(gb, 8000, 7000, 100, 156, &w, &high, &cnt);
+    check_near("runt: pos", pos, 3026, 0);
+    check_near("runt: width", w, 3, 0);
+    check_near("runt: polarity high", high ? 1 : 0, 1, 0);
+    check_near("runt: count is 1", cnt, 1, 0);
+
+    // A pulse that physically wraps the array boundary must read as one
+    // contiguous 4-sample run through the ring seam
+    memset(wb, 66, sizeof(wb));
+    wb[998] = wb[999] = wb[0] = wb[1] = 190;
+
+    pos = measure_find_min_pulse(wb, 1000, 500, 100, 156, &w, &high, &cnt);
+    check_near("wrap: pos", pos, 500, 0);
+    check_near("wrap: width", w, 4, 0);
+
+    // A flat record never completes two transitions
+    memset(wb, 128, sizeof(wb));
+    check_near("flat: -1",
+        measure_find_min_pulse(wb, 1000, 0, 100, 156, NULL, NULL, NULL), -1, 0);
+  }
+
+  // ===== trend logger ring =====
+  {
+    const TrendPoint *pts;
+
+    printf("trend logger:\n");
+    trend_reset();
+
+    // Plain appends: one point per push while the span is 1
+    for (int i = 0; i < 10; i++)
+      trend_push(1000 + i, 100 + i, (i & 1) ? -1 : 500);
+
+    pts = trend_data();
+    check_near("append: count", trend_count(), 10, 0);
+    check_near("append: span", trend_seconds_per_point(), 1, 0);
+    check_near("append: freq[9]", pts[9].freq, 1009, 0);
+    check_near("append: duty n/a kept", pts[1].duty, -1, 0);
+    check_near("append: duty valid", pts[0].duty, 500, 0);
+
+    // Fill to the brim: the 300th push compresses 2:1 in place
+    for (int i = 10; i < 300; i++)
+      trend_push(1000 + i, 100, 500);
+
+    check_near("compress: count", trend_count(), 150, 0);
+    check_near("compress: span", trend_seconds_per_point(), 2, 0);
+    check_near("compress: pair mean", pts[5].freq, (1010 + 1011) / 2, 0);
+
+    // After compression a point needs span pushes: one push adds nothing,
+    // the second appends the bucket average
+    trend_push(2000, 100, 500);
+    check_near("bucket: not yet", trend_count(), 150, 0);
+    trend_push(2010, 100, 500);
+    check_near("bucket: appended", trend_count(), 151, 0);
+    check_near("bucket: averaged", pts[150].freq, 2005, 0);
+
+    // A -1 duty in a compressed pair must not poison the valid one
+    trend_reset();
+
+    for (int i = 0; i < 300; i++)
+      trend_push(100, 100, (i == 0) ? 400 : -1);
+
+    check_near("duty: survivor kept", trend_data()[0].duty, 400, 0);
+    check_near("duty: absent stays -1", trend_data()[1].duty, -1, 0);
+
+    trend_reset();
+    check_near("reset: empty", trend_count(), 0, 0);
   }
 
   printf("\n%s (%d failures)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
