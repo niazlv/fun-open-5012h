@@ -73,6 +73,7 @@ SRCS += \
   ../manchester_decode.c \
   ../rc5_decode.c \
   ../dali_decode.c \
+  ../knx_decode.c \
   ../cube3d.c \
   ../engine3d.c \
   ../ui.c \
