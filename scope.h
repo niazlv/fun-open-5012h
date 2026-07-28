@@ -53,6 +53,12 @@ extern bool scope_calibration_mode;
 extern const char *const decoder_baud_labels[DECODER_BAUD_COUNT];
 extern const int decoder_baud_values[DECODER_BAUD_COUNT];
 
+// Manchester carries no rate of its own that a record can always recover, so
+// the ones worth naming are listed. Index 0 is auto.
+#define DECODER_MAN_RATE_COUNT  10
+extern const char *const decoder_man_rate_labels[DECODER_MAN_RATE_COUNT];
+extern const int decoder_man_rate_values[DECODER_MAN_RATE_COUNT];
+
 /*- Prototypes --------------------------------------------------------------*/
 void scope_init(bool calibration_mode);
 void scope_buttons_handler(int buttons);
@@ -85,6 +91,7 @@ int scope_get_fps(void);
 // so it is safe to call from a menu.
 void scope_decode_catch_start(void);
 void scope_decode_redraw(void);
+void scope_spi_clock_capture(void);
 
 // Forget the accumulated persistence envelope and averaging state: the menu
 // calls it when it toggles either feature; the scope itself calls it on

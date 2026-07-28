@@ -528,6 +528,7 @@ static bool g_decode_hunt = false;
 // and the scope is not drawing while it is open, so a menu action leaves the
 // work here rather than doing it under the menu.
 static bool g_decode_hunt_request = false;
+static bool g_spi_clock_request = false;
 static LogicResult g_logic;
 // The protocol-level read of the same record - which device answered on the
 // 1-Wire bus, which CAN frames went past, what the MIDI link said. Kept next
@@ -546,7 +547,14 @@ static union
   DhtAnalysis  dht;    // ...the humidity/temperature one
   SentAnalysis sent;   // ...the automotive sensor one
   MidiAnalysis midi;   // ...the message read of a MIDI link
-  LinAnalysis  lin;    // ...and the frame read of the car's cheap bus
+  LinAnalysis  lin;    // ...the frame read of the car's cheap bus
+  Ev1527Analysis ev;   // ...which remote pressed which button
+  DshotAnalysis dshot; // ...what the flight controller told the motor
+  SpiAnalysis  spi;    // ...what one probe made of a bus it half sees
+  ManAnalysis  man;    // ...the bits under a self-clocking line code
+  Rc5Analysis  rc5;    // ...which key on a Philips remote went down
+  DaliAnalysis dali;   // ...which ballast was told what
+  KnxAnalysis  knx;    // ...and who told whom on a building's twisted pair
 } g_pana;
 static int g_decode_sel = 0;              // selected byte (jump target)
 static int g_decode_period_ns = 0;        // record metrics the decode ran on
@@ -565,6 +573,30 @@ const int decoder_baud_values[DECODER_BAUD_COUNT] =
 {
   0, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600,
 };
+
+//-----------------------------------------------------------------------------
+// Manchester bit rates worth having a name for: RC5 is 1.778 ms a bit, DALI
+// 833 us, an EM4100 tag 512 us at the usual RF/64. Index 0 is auto.
+const int decoder_man_rate_values[DECODER_MAN_RATE_COUNT] =
+{
+  0, 500, 562, 1000, 1200, 1953, 2400, 4800, 9600, 19200,
+};
+
+const char *const decoder_man_rate_labels[DECODER_MAN_RATE_COUNT] =
+{
+  "Auto", "500", "562 RC5", "1000", "1200 DALI", "1953 tag", "2400",
+  "4800", "9600", "19200",
+};
+
+static int decoder_man_rate_value(void)
+{
+  int i = config.man_rate;
+
+  if (i < 0 || i >= DECODER_MAN_RATE_COUNT)
+    return 0;
+
+  return decoder_man_rate_values[i];
+}
 
 //-----------------------------------------------------------------------------
 static int decoder_baud_value(void)
@@ -1691,6 +1723,13 @@ static void decode_group_at(int idx, int *start, int *len)
       case PROTO_DHT:     dht_group_at(&g_pana.dht, idx, start, len); break;
       case PROTO_ONEWIRE: onewire_group_at(&g_pana.ow, idx, start, len); break;
       case PROTO_MIDI:    midi_group_at(&g_pana.midi, idx, start, len); break;
+      case PROTO_EV1527:  ev1527_group_at(&g_pana.ev, idx, start, len); break;
+      case PROTO_DSHOT:   dshot_group_at(&g_pana.dshot, idx, start, len); break;
+      case PROTO_SPI:     spi_group_at(&g_pana.spi, idx, start, len); break;
+      case PROTO_MANCH:   manchester_group_at(&g_pana.man, idx, start, len); break;
+      case PROTO_RC5:     rc5_group_at(&g_pana.rc5, idx, start, len); break;
+      case PROTO_DALI:    dali_group_at(&g_pana.dali, idx, start, len); break;
+      case PROTO_KNX:     knx_group_at(&g_pana.knx, idx, start, len); break;
       default: break;
     }
   }
@@ -1807,6 +1846,50 @@ static void dband_meaning_text(char *buf, int size, int idx, uint8_t v)
       lin_byte_label(&g_pana.lin, idx, v, buf, size);
       break;
 
+    case PROTO_EV1527:
+      // Which remote and which button, written once across the three bytes
+      // its twenty-four bits packed into
+      ev1527_byte_label(&g_pana.ev, idx, v, buf, size);
+      break;
+
+    case PROTO_DSHOT:
+      // What the motor was told, written once across the two bytes the
+      // sixteen bits packed into
+      dshot_byte_label(&g_pana.dshot, idx, v, buf, size);
+      break;
+
+    case PROTO_SPI:
+      // A command, or the address it took - and only where a pause said a
+      // transaction began there. Everywhere else a byte is just a byte, and
+      // the character it stands for is as much as can honestly be said about
+      // it, exactly as on a serial line.
+      spi_byte_label(&g_pana.spi, idx, v, buf, size);
+
+      if (0 == buf[0])
+        dband_ascii_text(buf, size, v);
+      break;
+
+    case PROTO_MANCH:
+      // A frame is a bit count and a value; the bytes it packed into are
+      // where eight bits happened to land and are not a reading of anything
+      manchester_byte_label(&g_pana.man, idx, v, buf, size);
+      break;
+
+    case PROTO_RC5:
+      // Which key, on which device, and whether it was pressed again
+      rc5_byte_label(&g_pana.rc5, idx, v, buf, size);
+      break;
+
+    case PROTO_DALI:
+      // Which ballast, and what it was told to do
+      dali_byte_label(&g_pana.dali, idx, v, buf, size);
+      break;
+
+    case PROTO_KNX:
+      // Who told whom: both addresses are packed fields and not numbers
+      knx_byte_label(&g_pana.knx, idx, v, buf, size);
+      break;
+
     case PROTO_SERVO:
       // The byte IS the width, in tens of microseconds; put it back into the
       // units the servo is commanded in, which is the only form anyone reads
@@ -1834,6 +1917,31 @@ static void dband_field_text(char *buf, int size, int idx, uint8_t v)
     case PROTO_DHT:     dht_field_label(&g_pana.dht, idx, v, buf, size); break;
     case PROTO_ONEWIRE: onewire_field_label(&g_pana.ow, idx, v, buf, size); break;
     case PROTO_MIDI:    midi_field_label(&g_pana.midi, idx, v, buf, size); break;
+    case PROTO_EV1527:  ev1527_field_label(&g_pana.ev, idx, v, buf, size); break;
+    case PROTO_DSHOT:   dshot_field_label(&g_pana.dshot, idx, v, buf, size); break;
+
+    case PROTO_MANCH:
+      manchester_field_label(&g_pana.man, idx, v, buf, size);
+      break;
+
+    case PROTO_RC5:
+      rc5_field_label(&g_pana.rc5, idx, v, buf, size);
+      break;
+
+    case PROTO_DALI:
+      dali_field_label(&g_pana.dali, idx, v, buf, size);
+      break;
+
+    case PROTO_KNX:
+      knx_field_label(&g_pana.knx, idx, v, buf, size);
+      break;
+
+    case PROTO_SPI:
+      spi_field_label(&g_pana.spi, idx, v, buf, size);
+
+      if (0 == buf[0])
+        dband_ascii_text(buf, size, v);
+      break;
 
     // Everything else names its bytes one at a time already
     default: dband_meaning_text(buf, size, idx, v); break;
@@ -1931,6 +2039,15 @@ static int decode_bit_slots(int *data0, bool *msb_first)
     // through the byte.
     case PROTO_RAW:
       *msb_first = true;
+      return 8;
+
+    // ...and SPI belongs here more than anything else does, because a
+    // uniform bit grid is not an approximation of what it did - it IS what
+    // it did. The lines are the assumed clock edges drawn on the waveform,
+    // which is the one thing worth seeing on a reconstruction: if they do
+    // not land on the signal's own edges, the assumed rate is wrong.
+    case PROTO_SPI:
+      *msb_first = g_pana.spi.msb_first;
       return 8;
 
     default:
@@ -4086,6 +4203,20 @@ void scope_decode_redraw(void)
 }
 
 //-----------------------------------------------------------------------------
+// The first half of reading an SPI bus with one probe: while the probe is
+// still on SCK, write down the frequency the scope is already measuring. The
+// second half is moving the probe to MOSI, and by then this number is the
+// only thing that says how wide a bit is.
+//
+// Taken from the RAW measurement rather than from the decoder: the clock line
+// is a clock, the frequency counter is what reads clocks, and the decoder has
+// nothing to say about a signal it is not being pointed at.
+void scope_spi_clock_capture(void)
+{
+  g_spi_clock_request = true;
+}
+
+//-----------------------------------------------------------------------------
 void scope_decode_catch_start(void)
 {
   g_decode_hunt_request = true;
@@ -4123,6 +4254,10 @@ static void decode_update(void)
     return;
 
   uart_decode_set_baud(decoder_baud_value());
+  spi_decode_set_clock(config.spi_clock_hz);
+  spi_decode_set_order(config.spi_order);
+  manchester_decode_set_rate(decoder_man_rate_value());
+  manchester_decode_set_polarity(config.man_polarity);
 
   // Sticky protocol: once something matched, try it alone first and only
   // fall back to the full auto cascade when it stops matching
@@ -4226,6 +4361,20 @@ static void decode_update(void)
       g_pana.midi = *midi_analysis();
     else if (res.proto == PROTO_LIN)
       g_pana.lin = *lin_analysis();
+    else if (res.proto == PROTO_EV1527)
+      g_pana.ev = *ev1527_analysis();
+    else if (res.proto == PROTO_DSHOT)
+      g_pana.dshot = *dshot_analysis();
+    else if (res.proto == PROTO_SPI)
+      g_pana.spi = *spi_analysis();
+    else if (res.proto == PROTO_MANCH)
+      g_pana.man = *manchester_analysis();
+    else if (res.proto == PROTO_RC5)
+      g_pana.rc5 = *rc5_analysis();
+    else if (res.proto == PROTO_DALI)
+      g_pana.dali = *dali_analysis();
+    else if (res.proto == PROTO_KNX)
+      g_pana.knx = *knx_analysis();
 
     g_logic_have = true;
     g_decode_held = false;
@@ -6613,6 +6762,31 @@ void scope_task(void)
   //
   // Asked for from the menu, done here: the menu is a screen over the scope
   // and the scope does not draw while it is open
+  if (g_spi_clock_request)
+  {
+    Measure m;
+    char msg[48];
+
+    g_spi_clock_request = false;
+
+    // From the RAW measurement, not from the decoder: the probe is on a
+    // clock line, a frequency counter is what reads clocks, and the decoder
+    // has nothing to say about a signal nobody pointed it at.
+    if (capture_get_raw_measure(&m) && m.frequency > 0)
+    {
+      config.spi_clock_hz = m.frequency;
+      snprintf(msg, sizeof(msg), "SPI clock stored: %d Hz", m.frequency);
+    }
+    else
+    {
+      snprintf(msg, sizeof(msg), "SPI clock: nothing periodic to measure");
+    }
+
+    toast_show();
+    lcd_puts(GRID_LEFT, STATUS_LINE_Y, msg);
+    mpanel_invalidate();
+  }
+
   if (g_decode_hunt_request)
   {
     g_decode_hunt_request = false;
