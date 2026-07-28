@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2019-2020, Alex Taradov <alex@taradov.com>
+ * Copyright (c) 2026, Niaz Leushkin <niazlv03@gmail.com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -32,6 +33,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 #include "gd32f4xx.h"
 #include "hal_gpio.h"
 #include "utils.h"
@@ -46,6 +48,7 @@
 #include "fft.h"
 #include "classify.h"
 #include "logic_decode.h"
+#include "trend.h"
 #include "scope.h"
 
 /*- Definitions -------------------------------------------------------------*/
@@ -83,6 +86,18 @@
 #define TRACE_FILLED_COLOR     LCD_COLOR(0, 255, 0)
 #define TRACE_CLIP_COLOR       LCD_COLOR(255, 0, 0)
 #define TRACE_INVALID_COLOR    LCD_COLOR(255, 0, 0)
+
+// Persistence: the envelope accumulated across frames, drawn behind the
+// live trace in a dimmed tone so the current sweep stays readable over it
+#define TRACE_PERSIST_COLOR    LCD_COLOR(120, 120, 24)
+
+// Measurement cursors: the active one is solid, its partner dashed
+#define CURSOR_T_COLOR         LCD_COLOR(0, 200, 255)
+#define CURSOR_V_COLOR         LCD_COLOR(255, 120, 255)
+
+#define TREND_INTERVAL_MS      1000  // logger tick; the ring compresses 2:1
+                                     // when full, so the span only grows
+#define TREND_MARGIN_PX        12    // headroom above/below the plotted curve
 #define GRID_BG_COLOR          LCD_COLOR(0, 0, 0)
 #define GRID_FG_COLOR          LCD_COLOR(200, 200, 200)
 #define MV_FRAME_COLOR         LCD_COLOR(230, 230, 230)
@@ -142,6 +157,18 @@
 #define MPANEL_TEXT_MAX        50    // chars per line at 6 px/char
 #define MPANEL_HEARTBEAT       4     // forced repaints: every 4th update (~2 s)
 #define MPANEL_DIM(p)          (((p) >> 1) & 0x7BEF) // RGB565 half brightness
+
+// Small dim "rec <span>" tag in the top-right trace corner while the frozen
+// record is only the 24K storage snapshot (capture_stopped_on_snapshot):
+// zooming a stopped NORMAL/SINGLE catch is limited to that window, and the
+// tag says how much record there is. Same opaque-hole trick as the decode
+// panel, clear of it (the panel ends at column 181) and of the FFT panel
+// (the tag never shows in the spectrum view).
+#define SNAP_TAG_W             64    // 10 chars of the small font + margins
+#define SNAP_TAG_COL1          (GRID_WIDTH - 3)
+#define SNAP_TAG_COL0          (SNAP_TAG_COL1 - SNAP_TAG_W + 1)
+#define SNAP_TAG_H             10
+#define SNAP_TAG_COLOR         LCD_COLOR(110, 110, 110)
 
 #define FFT_DB_RANGE           60.0f // spectrum display dynamic range
 
@@ -304,6 +331,39 @@ static bool g_shadow_valid = false;
 static int g_shadow_marker_px = 0x7fffffff;
 static bool g_sweep_force = true;
 
+// The stopped-on-a-snapshot tag is on screen (and its columns are a hole in
+// the sweep). Owned by the state machine in scope_task().
+static bool g_snap_tag = false;
+
+// Persistence and averaging state, all in display (column) space: persist is
+// the accumulated envelope, avg the per-column EMA of the trace midpoint in
+// px*64 fixed point. Both forget everything on any pan/zoom/scale change -
+// the column-to-time mapping they accumulated under is gone.
+static uint8_t  g_persist_min[GRID_WIDTH];
+static uint8_t  g_persist_max[GRID_WIDTH];
+static uint8_t  g_persist_have[GRID_WIDTH];
+static uint16_t g_avg_acc[GRID_WIDTH];
+static uint8_t  g_avg_have[GRID_WIDTH];
+static uint32_t g_avg_gen;
+
+// Measurement cursors: SAVE cycles Off -> T1 -> T2 -> V1 -> V2 -> Off. Time
+// cursors live in trigger-relative ns and voltage cursors in absolute mV, so
+// both stay glued to the signal through pan and zoom exactly like the
+// trigger marker does.
+static int     g_cursor_sel = 0;
+static int64_t g_cursor_t[2];
+static int     g_cursor_v[2];
+static bool    g_cursor_dirty = false;
+
+// Trend view (SHIFT+SAVE): the 1 Hz logger runs regardless; the view plots
+// one metric of its ring. EDGE cycles the metric, MODE clears the ring.
+static bool g_trend_mode = false;
+static int  g_trend_metric = 0;   // 0 = frequency, 1 = Vrms, 2 = duty
+static int  g_trend_timer = TIMER_DISABLE;
+
+static int cursor_t_col(int64_t t_ns);
+static int cursor_v_row(int mv);
+
 typedef struct
 {
   int  x, y, w, h;
@@ -353,6 +413,18 @@ static bool g_fft_panel_pending = false;
 static bool g_fft_panel_on = true;  // MODE toggles the breakdown panel
 static uint16_t g_fft_grad[GRID_HEIGHT]; // heat ramp, indexed by curve height
 static bool g_fft_grad_ready = false;
+// Spectrum hold: EDGE cycles Off -> Max -> Avg. Max-hold pins anything that
+// ever appeared (intermittent interference, drifting tones); the exponential
+// average (1/8 per frame) sinks the noise floor ~9 dB and steadies weak
+// lines. The combined spectrum REPLACES g_fft_mag, so analysis, peaks and
+// the cursor all describe the picture actually on screen.
+enum { FFT_HOLD_OFF, FFT_HOLD_MAX, FFT_HOLD_AVG };
+static int g_fft_hold_mode = FFT_HOLD_OFF;
+static bool g_fft_hold_primed = false;
+static float g_fft_hold[FFT_BINS];
+static int g_fft_hold_decim = 0;   // bin scale the held data was taken at:
+static int g_fft_hold_period = 0;  // a change makes the bins mean new
+                                   // frequencies and the hold restarts
 static int g_fft_timer = TIMER_DISABLE;
 static bool g_fft_have = false;
 
@@ -437,11 +509,73 @@ static bool g_decode_mode = false;
 static bool g_decode_panel_pending = false;
 static bool g_decode_force = false;   // run the next decode past the throttle
 static bool g_logic_have = false;
+// The frames on the panel are older than the record on the screen: kept
+// because the records since then had nothing in them (see decode_update)
+static bool g_decode_held = false;
+// A record has proved this line really is a UART - it caught the line at
+// rest between frames, which no clock and no sine ever does. Until then,
+// records that decode as UART but are indistinguishable from a plain square
+// wave are not taken, however the protocol was selected.
+static bool g_uart_locked = false;
+// The timebase has been set from the decoded rate once; it is the user's
+// again after that, until the decoder view is re-entered
+static bool g_decode_fitted = false;
+// Hunting for the head of a message: every record is decoded, not one every
+// 250 ms, and the acquisition freezes on the first one that caught the line
+// resting before its first frame
+static bool g_decode_hunt = false;
+// Arm the hunt on the next scope tick. The menu is a screen over the scope
+// and the scope is not drawing while it is open, so a menu action leaves the
+// work here rather than doing it under the menu.
+static bool g_decode_hunt_request = false;
 static LogicResult g_logic;
+// The protocol-level read of the same record - which device answered on the
+// 1-Wire bus, which CAN frames went past, what the MIDI link said. Kept next
+// to the result and not fetched on demand: the decoder's own copy belongs to
+// whatever record it was last handed, and the panel can be holding frames
+// several records old.
+//
+// One union, because only one of them is ever live: the snapshot is taken for
+// the protocol the record decoded AS, and every reader switches on that same
+// protocol before it looks at anything. Five separate copies would hold a
+// kilobyte and a half of TCM for four protocols that are not on the screen.
+static union
+{
+  OwAnalysis   ow;
+  CanAnalysis  can;    // the CAN frame read, likewise
+  DhtAnalysis  dht;    // ...the humidity/temperature one
+  SentAnalysis sent;   // ...the automotive sensor one
+  MidiAnalysis midi;   // ...the message read of a MIDI link
+  LinAnalysis  lin;    // ...and the frame read of the car's cheap bus
+} g_pana;
 static int g_decode_sel = 0;              // selected byte (jump target)
 static int g_decode_period_ns = 0;        // record metrics the decode ran on
 static int g_decode_trig_pos = 0;
 static int g_decode_size = 0;             // record length the decode ran on
+
+// UART rate table shared with the decoder's menu entry. Index 0 is auto: the
+// decoder works the rate out of the record, which is right nearly always and
+// wrong exactly when the record holds too few frames to pin it down.
+const char *const decoder_baud_labels[DECODER_BAUD_COUNT] =
+{
+  "Auto", "9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600",
+};
+
+const int decoder_baud_values[DECODER_BAUD_COUNT] =
+{
+  0, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600,
+};
+
+//-----------------------------------------------------------------------------
+static int decoder_baud_value(void)
+{
+  int i = config.decoder_baud;
+
+  if (i < 0 || i >= DECODER_BAUD_COUNT)
+    return 0;
+
+  return decoder_baud_values[i];
+}
 
 // Last miniview geometry so it can repaint without a full update_sample_rate
 static int g_mv_trigger_px = 0;
@@ -456,6 +590,108 @@ _Static_assert(sizeof(LogicScratch) <= CAPTURE_SPARE_RAM_SIZE,
 #define DSTRIP_EVEN    LCD_COLOR(0, 150, 200)
 #define DSTRIP_ODD     LCD_COLOR(0, 90, 130)
 #define DSTRIP_SEL     LCD_COLOR(255, 255, 0)
+// The other bytes of the character the selected byte belongs to. Lit, but not
+// as the selection: "this one, and these came with it".
+#define DSTRIP_GROUP   LCD_COLOR(150, 150, 0)
+
+// ...and on the trace itself, in a band the sweep composites like the
+// measurements panel: where each byte begins and ends, and its value written
+// in where the byte is wide enough to hold the text. A byte list tells you
+// what was said; this tells you where on the waveform it was said.
+//
+// Two rows where the zoom allows it - the number, and under it what the
+// number means as text. Side by side in one row they run together into
+// something that has to be parsed rather than read.
+//
+// The band is bottom-aligned and only as tall as it needs to be: one row
+// where the bytes are too narrow to name, none at all where they are too
+// narrow even for the number. A band of empty pixels is trace it has taken
+// away for nothing.
+#define DBAND_BOTTOM   MPANEL_ROW0
+#define DBAND_H1       11   // tint, boundary ticks and one row of text
+#define DBAND_H2       20   // ...and the character under it
+// ...and a third for what the bytes add up to, where several of them do. The
+// rows go from the specific to the general as they get further from the
+// trace: the number that was on the wire, then what that byte is, then the
+// value its group makes - the way a protocol analyser puts bit0 bit1 bit2
+// over one bracket labelled "command".
+#define DBAND_H3       29
+#define DBAND_TEXT_Y0   1   // text rows inside the band
+#define DBAND_TEXT_Y1  10
+#define DBAND_TEXT_Y2  19
+
+// The bit grid: a hairline straight across the trace at every bit boundary of
+// a decoded byte, and in each cell the number of the bit that landed there.
+// The waveform already shows the LEVEL; what it cannot show is which bit of
+// which byte that level became, and that is the one thing needed to check a
+// decode by eye - especially the bit ORDER, which is the single most
+// confusing thing about reading a serial line off a screen.
+//
+// Drawn OVER everything, trace included: a boundary is a fact about that
+// column, and a line that stops at the waveform is a line you cannot follow
+// to the edge it is meant to line up with.
+//
+// But only as TALL as the signal. A hairline from the top of the grid to the
+// bottom is a ruler for a screen; a hairline that spans exactly what the
+// waveform spans is a ruler for the WAVEFORM, and that is the only thing it
+// is ever used to measure against. A two-volt square wave gets two volts of
+// line, and the rest of the grid is left alone.
+//
+// And blended rather than painted: half the column's own colour and half the
+// grey. Over black it comes out a whisper, over the trace it tints rather
+// than replaces, and nothing the line crosses is ever hidden by it.
+#define DBIT_BLEND(px, col)    (uint16_t)(MPANEL_DIM(px) + MPANEL_DIM(col))
+#define DBIT_TICK_COLOR        LCD_COLOR(120, 120, 140)
+#define DBIT_TEXT_COLOR        LCD_COLOR(140, 140, 150)
+
+// Under this the ticks are a grey wall rather than a grid, and the numbers
+// have nowhere to go. Both are checked separately: the ticks alone are worth
+// having at a zoom where a character is not.
+#define DBIT_MIN_PX            4
+
+static int g_dband_rows = 0;             // 0 = no band; bottom stays put
+static int g_dband_row0 = DBAND_BOTTOM;
+// The character the selection is inside, so its bytes light up together on
+// the trace exactly as they do in the panel
+static int g_dband_sel_start = 0;
+static int g_dband_sel_len = 1;
+static int8_t g_dband_byte[GRID_WIDTH];  // decoded byte under each column, -1 none
+static uint8_t g_dband_edge[(GRID_WIDTH + 7) / 8];             // frame starts
+static uint8_t g_dband_mask[DBAND_H3][(GRID_WIDTH + 7) / 8];   // the text
+
+// Column-major, one byte per screen column holding the eight pixels of the
+// bit-number row there: the sweep then reads ONE byte per column instead of
+// masking eight rows, and it costs the same memory either way.
+//
+// ...and that memory is the spare SRAM rather than TCM, next to the run
+// tables the decoder already keeps there. Both are the same KIND of thing -
+// derived from the current record, rebuilt whenever it changes, worthless
+// across a reset - and TCM is down to its last few hundred bytes with the
+// stack still to come out of it. The region is not linked into, so it holds
+// garbage at boot; nothing reads these until decode_band_build has cleared
+// them, which is also the only thing that sets g_dbit_on.
+typedef struct
+{
+  uint8_t glyph[GRID_WIDTH];
+  uint8_t edge[(GRID_WIDTH + 7) / 8];
+} DecodeBitGrid;
+
+#define DBIT ((DecodeBitGrid *)(CAPTURE_SPARE_RAM + sizeof(LogicScratch)))
+
+_Static_assert(sizeof(LogicScratch) + sizeof(DecodeBitGrid) <=
+    CAPTURE_SPARE_RAM_SIZE, "decoder scratch overruns the spare SRAM");
+
+static bool g_dbit_on = false;
+// The rows the grid lives between, and where the numbers sit inside them.
+// Recomputed every frame from the trace's own envelope, because that is what
+// they follow - the decode changes rarely, the signal's height every frame.
+static int g_dbit_top = 0;
+static int g_dbit_bot = -1;
+static int g_dbit_text_row = GRID_HEIGHT / 2 - 4;
+
+_Static_assert(LOGIC_MAX_BYTES <= 127, "byte index must fit g_dband_byte");
+_Static_assert(DBAND_TEXT_Y1 + 8 <= DBAND_H2, "second text row must fit the band");
+_Static_assert(DBAND_TEXT_Y2 + 8 <= DBAND_H3, "third text row must fit the band");
 
 /*- Implementations ---------------------------------------------------------*/
 
@@ -565,6 +801,15 @@ static void update_from_display_buffer(uint16_t *column, DisplayBuffer *db)
   bool clip_h = db->flags[g_trace_column] & SAMPLE_FLAG_CLIP_H;
   bool clip_l = db->flags[g_trace_column] & SAMPLE_FLAG_CLIP_L;
   int color;
+
+  // The accumulated envelope first, so the live trace paints over it. This
+  // is how a runt that fired once stays visible: the envelope holds every
+  // level any frame ever reached in this column.
+  if (config.display_persist && g_persist_have[g_trace_column])
+  {
+    for (int y = g_persist_min[g_trace_column]; y <= g_persist_max[g_trace_column]; y++)
+      column[y] = TRACE_PERSIST_COLOR;
+  }
 
   if (db->flags[g_trace_column] & SAMPLE_FLAG_VALID)
   {
@@ -676,8 +921,8 @@ static void build_trace_column(int c, uint16_t *column)
   else
     update_from_display_buffer(column, &g_display_buffer);
 
-  // The trigger-position overlay is meaningless on the spectrum view
-  if (!g_fft_mode)
+  // The trigger-position overlay is meaningless on the spectrum and trend views
+  if (!g_fft_mode && !g_trend_mode)
   {
     if (config.horizontal_position_px < -(GRID_WIDTH/2-1))
     {
@@ -691,6 +936,81 @@ static void build_trace_column(int c, uint16_t *column)
     {
       int pos = GRID_WIDTH/2 - config.horizontal_position_px;
       update_column_from_image(c, column, pos, 0, &image_trigger_offset);
+    }
+  }
+
+  // Measurement cursors ride the sweep like every other overlay: the pair of
+  // time hairlines and the pair of voltage lines, the active one solid, its
+  // partner dashed
+  if (g_cursor_sel && !g_fft_mode && !g_trend_mode)
+  {
+    for (int k = 0; k < 2; k++)
+    {
+      int row = cursor_v_row(g_cursor_v[k]);
+
+      if ((g_cursor_sel == 3 + k) || (c & 3) < 2)
+        column[row] = CURSOR_V_COLOR;
+    }
+
+    for (int k = 0; k < 2; k++)
+    {
+      if (c == cursor_t_col(g_cursor_t[k]))
+      {
+        bool solid = (g_cursor_sel == 1 + k);
+
+        for (int y = 0; y < GRID_HEIGHT-1; y++)
+        {
+          if (solid || (y & 3) < 2)
+            column[y] = CURSOR_T_COLOR;
+        }
+      }
+    }
+  }
+
+  // Bit grid: a hairline straight across at every bit boundary, and the bit's
+  // number in the cell. Over everything, waveform included - a boundary is a
+  // fact about that column, and a line broken wherever the trace crosses it
+  // is a line the eye cannot follow to the edge it is meant to line up with.
+  if (g_dbit_on && g_dbit_bot >= g_dbit_top)
+  {
+    if ((DBIT->edge[c / 8] >> (c % 8)) & 1)
+    {
+      for (int y = g_dbit_top; y <= g_dbit_bot; y++)
+        column[y] = DBIT_BLEND(column[y], DBIT_TICK_COLOR);
+    }
+
+    for (int y = 0; y < 8; y++)
+    {
+      if ((DBIT->glyph[c] >> y) & 1)
+        column[g_dbit_text_row + y] = DBIT_TEXT_COLOR;
+    }
+  }
+
+  // Decoder band: the same trick, a couple of rows of it. Under every column
+  // that a decoded byte covers the trace is dimmed and tinted in the byte's
+  // colour, the column where a frame starts gets a full-height tick, and the
+  // value is written in wherever it fits.
+  if (g_dband_rows && g_dband_byte[c] >= 0)
+  {
+    int b = g_dband_byte[c];
+    bool grouped = (g_dband_sel_len > 1 && b >= g_dband_sel_start &&
+        b < g_dband_sel_start + g_dband_sel_len);
+    uint16_t tint = (b == g_decode_sel) ? DSTRIP_SEL :
+        grouped ? DSTRIP_GROUP :
+        ((b & 1) ? DSTRIP_ODD : DSTRIP_EVEN);
+    bool edge = (g_dband_edge[c / 8] >> (c % 8)) & 1;
+
+    for (int y = 0; y < g_dband_rows; y++)
+    {
+      int row = g_dband_row0 + y;
+
+      if (edge || y == g_dband_rows - 1)
+        column[row] = tint;                    // frame boundary / baseline
+      else
+        column[row] = MPANEL_DIM(column[row]); // room for the text to read
+
+      if (g_dband_mask[y][c / 8] & (1 << (c % 8)))
+        column[row] = LCD_WHITE_COLOR;
     }
   }
 
@@ -744,6 +1064,8 @@ static void draw_trace(void)
     hole = DECODE_PANEL_H;
   else if (g_fft_mode && g_fft_panel_on && c >= FFT_PANEL_COL0 && c <= FFT_PANEL_COL1)
     hole = FFT_PANEL_H;
+  else if (g_snap_tag && c >= SNAP_TAG_COL0 && c <= SNAP_TAG_COL1)
+    hole = SNAP_TAG_H;
 
   if (hole)
     lcd_draw_buf(GRID_LEFT+1 + c, GRID_TOP+1 + hole, 1,
@@ -952,6 +1274,26 @@ static char *format_duty(int duty_x10)
 }
 
 //-----------------------------------------------------------------------------
+// Picoseconds into the shortest sensible unit. Jitter spans six orders of
+// magnitude here: 31 ps resolution at the fast end, milliseconds of spread
+// on a noisy slow record.
+static void format_ps(int ps, char *out, int size)
+{
+  if (ps < 0)
+    snprintf(out, size, "--");
+  else if (ps < 1000)
+    snprintf(out, size, "%dps", ps);
+  else if (ps < 100000)
+    snprintf(out, size, "%d.%dns", ps / 1000, (ps % 1000) / 100);
+  else if (ps < 1000000)
+    snprintf(out, size, "%dns", ps / 1000);
+  else if (ps < 1000000000)
+    snprintf(out, size, "%dus", ps / 1000000);
+  else
+    snprintf(out, size, "%dms", ps / 1000000000);
+}
+
+//-----------------------------------------------------------------------------
 // Classify the current record (type + THD), cached per acquisition. Runs the
 // FFT on a non-consuming sample copy so the display pipeline is unaffected.
 static void signal_info_update(void)
@@ -1024,6 +1366,21 @@ static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
       tag = "S"; label = ""; value = classify_name(g_signal_class.type);
       break;
 
+    case MEASURE_JITTER:
+    {
+      char sig[10], pp[10];
+
+      // sigma answers "how stable", p-p answers "how bad was the worst one";
+      // a runt cycle lives in p-p and would be invisible in sigma alone
+      format_ps(sm->jitter_rms_ps, sig, sizeof(sig));
+      format_ps(sm->jitter_pp_ps, pp, sizeof(pp));
+
+      tag = "J"; label = "jit";
+      snprintf(scratch, sizeof(scratch), "%s~%s", sig, pp);
+      value = scratch;
+      break;
+    }
+
     case MEASURE_THD:
       signal_info_update();
       tag = "T"; label = "t";
@@ -1056,7 +1413,7 @@ static int measure_build_items(const ScopeMeasure *sm, MeasureItem *it)
 {
   // A config saved before these flags existed reads all-false: default set
   bool any = config.show_vpp || config.show_freq || config.show_duty ||
-      config.show_vrms || config.show_vavg || config.show_type || config.show_thd;
+      config.show_vrms || config.show_vavg || config.show_type || config.show_thd || config.show_jitter;
 
   const bool shown[MEASURE_COUNT] =
   {
@@ -1067,6 +1424,7 @@ static int measure_build_items(const ScopeMeasure *sm, MeasureItem *it)
     [MEASURE_VAVG] = any && config.show_vavg,
     [MEASURE_TYPE] = any && config.show_type,
     [MEASURE_THD]  = any && config.show_thd,
+    [MEASURE_JITTER] = any && config.show_jitter,
   };
 
   int n = 0;
@@ -1135,14 +1493,757 @@ static void overlay_repaint_region(int row0, int rows)
 
   for (int c = 0; c < GRID_WIDTH - 1; c++)
   {
-    // Never paint into the opaque decode panel hole
+    // Never paint into the opaque decode panel or snapshot tag holes
     if (g_decode_mode && c >= DECODE_PANEL_COL0 && c <= DECODE_PANEL_COL1 &&
         row0 < DECODE_PANEL_H)
+      continue;
+
+    if (g_snap_tag && c >= SNAP_TAG_COL0 && c <= SNAP_TAG_COL1 &&
+        row0 < SNAP_TAG_H)
       continue;
 
     build_trace_column(c, column);
     lcd_draw_buf(GRID_LEFT+1 + c, GRID_TOP+1 + row0, 1, rows, &column[row0]);
   }
+}
+
+//-----------------------------------------------------------------------------
+// The frozen record is only the storage snapshot: a small dim "rec <span>"
+// in the trace corner says how much record there is to zoom into. Its
+// columns are a hole in the sweep (see draw_trace), so painting once at
+// activation - and again after anything that repaints the whole grid -
+// keeps it on screen without per-frame cost.
+static void snap_tag_paint(void)
+{
+  const uint8_t *data;
+  int size, offset, period_ns, trigger_timepos;
+  int64_t span;
+  char str[12];
+
+  if (!capture_get_record(&data, &size, &offset, &period_ns, &trigger_timepos))
+    return;
+
+  span = (int64_t)size * period_ns;
+
+  if (span < 1000000)
+    snprintf(str, sizeof(str), "rec %dus", (int)(span / 1000));
+  else if (span < 1000000000)
+    snprintf(str, sizeof(str), "rec %dms", (int)(span / 1000000));
+  else
+    snprintf(str, sizeof(str), "rec %ds", (int)(span / 1000000000));
+
+  lcd_fill_rect(GRID_LEFT+1 + SNAP_TAG_COL0, GRID_TOP+1, SNAP_TAG_W,
+      SNAP_TAG_H, BG_COLOR);
+
+  lcd_set_font(FONT_SMALL);
+  lcd_set_color(BG_COLOR, SNAP_TAG_COLOR);
+  lcd_puts(GRID_LEFT+1 + SNAP_TAG_COL1 - 1 - 6 * (int)strlen(str), GRID_TOP+2, str);
+  lcd_set_font(FONT_LARGE);
+}
+
+//-----------------------------------------------------------------------------
+// How many bytes the UTF-8 character starting here takes, 0 if this byte does
+// not start a valid one (a continuation byte, a bad lead, or a sequence the
+// record cut short). Only UTF-8: it is what serial ports carry, and it is the
+// one encoding that can be RECOGNISED rather than guessed - its lead and
+// continuation bytes are marked as such, so a valid sequence is evidence and
+// not a hunch. UTF-16 or a code page would have to be inferred from a byte
+// histogram, and being told the wrong language is worse than being told none.
+//
+// Nothing gets rendered from this - the font is 6x8 ASCII and always will be.
+// But "these two bytes are one character, U+0416" is most of what a reader
+// needs: it says the line is text in another language rather than a decode
+// that has gone wrong, which is exactly what a screen full of dots looks like.
+static int utf8_len(const uint8_t *b, int n)
+{
+  int len;
+
+  if (b[0] < 0x80)
+    return 1;
+  else if ((b[0] & 0xE0) == 0xC0)
+    len = 2;
+  else if ((b[0] & 0xF0) == 0xE0)
+    len = 3;
+  else if ((b[0] & 0xF8) == 0xF0)
+    len = 4;
+  else
+    return 0; // a continuation byte, or 0xFE/0xFF which UTF-8 never uses
+
+  if (len > n)
+    return 0; // the rest of it is past the end of what was decoded
+
+  for (int i = 1; i < len; i++)
+  {
+    if ((b[i] & 0xC0) != 0x80)
+      return 0;
+  }
+
+  return len;
+}
+
+//-----------------------------------------------------------------------------
+static uint32_t utf8_code_point(const uint8_t *b, int len)
+{
+  static const uint8_t lead_mask[5] = { 0, 0x7F, 0x1F, 0x0F, 0x07 };
+  uint32_t cp = b[0] & lead_mask[len];
+
+  for (int i = 1; i < len; i++)
+    cp = (cp << 6) | (b[i] & 0x3F);
+
+  return cp;
+}
+
+//-----------------------------------------------------------------------------
+// How many characters these bytes are. Fewer than there are bytes means the
+// text is not plain ASCII - which is the honest way to say it about a mixed
+// message: "UTF-8" alone claims the whole line is something other than ASCII
+// when nearly all of it usually is, and says nothing about how much is not.
+static int utf8_char_count(const uint8_t *bytes, int count)
+{
+  int chars = 0;
+
+  for (int i = 0; i < count; chars++)
+  {
+    int len = utf8_len(&bytes[i], count - i);
+
+    i += (len > 0) ? len : 1;
+  }
+
+  return chars;
+}
+
+//-----------------------------------------------------------------------------
+// Is what was decoded meant to be read as text? Two of the protocols carry
+// it and the rest do not, and UTF-8 grouping on the rest is not merely
+// useless but wrong: two WS2812 colour bytes are not one Cyrillic letter
+// because the first of them happens to begin with 110.
+static bool decode_proto_is_text(void)
+{
+  return (g_logic.proto == PROTO_UART || g_logic.proto == PROTO_RAW);
+}
+
+//-----------------------------------------------------------------------------
+// A serial line underneath: 8N1 frames with the line idle between them. MIDI
+// is one - it is a UART at 31250 baud with a grammar on top - and everything
+// that depends on there being an idle level applies to it unchanged: fitting
+// the window to the rate, triggering on the falling edge a start bit is, and
+// asking whether the record caught the line at REST before its first byte or
+// landed in the middle of a message.
+static bool decode_proto_is_serial(proto_t proto)
+{
+  return (proto == PROTO_UART || proto == PROTO_MIDI);
+}
+
+//-----------------------------------------------------------------------------
+// Which character does byte `idx` belong to: where that character starts and
+// how many bytes it takes. A byte that is part of no valid sequence is a
+// character of its own, so every byte has an answer.
+static void utf8_group_at(const uint8_t *bytes, int count, int idx,
+    int *start, int *len)
+{
+  *start = idx;
+  *len = 1;
+
+  for (int i = 0; i < count; )
+  {
+    int n = utf8_len(&bytes[i], count - i);
+
+    if (n < 1)
+      n = 1;
+
+    if (idx < i + n)
+    {
+      *start = i;
+      *len = n;
+      return;
+    }
+
+    i += n;
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Which bytes make up ONE value with byte `idx`. UTF-8 has been answering
+// this since it was added - two bytes, one letter, lit together with the code
+// point written once across them - and every protocol that assembles a number
+// out of several bytes needs the same answer: three SENT nibbles are one
+// signal, four CAN bytes are one identifier, two DHT bytes are one reading.
+// Numbering them D1 D2 D3 and putting the value under the last leaves the
+// reader to work out that the first two belong to it.
+static void decode_group_at(int idx, int *start, int *len)
+{
+  *start = idx;
+  *len = 1;
+
+  if (idx < 0 || idx >= g_logic.count)
+    return;
+
+  if (decode_proto_is_text())
+  {
+    utf8_group_at(g_logic.bytes, g_logic.count, idx, start, len);
+  }
+  else
+  {
+    switch (g_logic.proto)
+    {
+      case PROTO_SENT:    sent_group_at(&g_pana.sent, idx, start, len); break;
+      case PROTO_CAN:     can_group_at(&g_pana.can, idx, start, len); break;
+      case PROTO_DHT:     dht_group_at(&g_pana.dht, idx, start, len); break;
+      case PROTO_ONEWIRE: onewire_group_at(&g_pana.ow, idx, start, len); break;
+      case PROTO_MIDI:    midi_group_at(&g_pana.midi, idx, start, len); break;
+      default: break;
+    }
+  }
+
+  // The group belongs to the result, not past the end of it
+  if (*start < 0)
+    *start = 0;
+
+  if (*start > idx)
+    *start = idx;
+
+  if (*start + *len > g_logic.count)
+    *len = g_logic.count - *start;
+
+  if (*len < 1)
+  {
+    *start = idx;
+    *len = 1;
+  }
+}
+
+//-----------------------------------------------------------------------------
+// What a byte means as text, for the row under the number: the character
+// itself, or a name where it has no printable shape. A serial line is read as
+// text, and the bytes that decide how that text lays out - CR, LF, TAB - are
+// precisely the ones with nothing to show for themselves. SP is named too: a
+// blank under a number reads as a rendering fault, not as a space.
+//
+// An empty string for the rest. Inventing a look for byte 0x9B helps nobody,
+// and the number above it has already said everything there is to say.
+static void dband_ascii_text(char *buf, int size, uint8_t v)
+{
+  static const struct { uint8_t v; const char *name; } named[] =
+  {
+    { 0x00, "NUL" }, { 0x07, "BEL" }, { 0x08, "BS" },  { 0x09, "TAB" },
+    { 0x0A, "LF" },  { 0x0D, "CR" },  { 0x1B, "ESC" }, { 0x20, "SP" },
+    { 0x7F, "DEL" },
+  };
+
+  for (int i = 0; i < ARRAY_SIZE(named); i++)
+  {
+    if (named[i].v == v)
+    {
+      snprintf(buf, size, "%s", named[i].name);
+      return;
+    }
+  }
+
+  if (v > 32 && v < 127)
+    snprintf(buf, size, "%c", v);
+  else
+    buf[0] = 0;
+}
+
+//-----------------------------------------------------------------------------
+// What byte number `idx` MEANS in the protocol it came from, for the row
+// under the number. Every decoder puts bytes on the trace; what a byte is
+// worth saying about it depends entirely on which one.
+//
+// A character is the answer for the two protocols that carry text and for no
+// others: on a WS2812 strip byte 1 is how green the first pixel is, and
+// printing 'A' under it because 0x41 happens to be a letter is noise dressed
+// as information.
+static void dband_meaning_text(char *buf, int size, int idx, uint8_t v)
+{
+  static const char *const nec_field[4] = { "ADDR", "~ADDR", "CMD", "~CMD" };
+  static const char *const ws_field[3] = { "G", "R", "B" }; // WS2812 wire order
+
+  switch (g_logic.proto)
+  {
+    case PROTO_NEC:
+      snprintf(buf, size, "%s", nec_field[idx & 3]);
+      break;
+
+    case PROTO_WS2812:
+      snprintf(buf, size, "%s%d", ws_field[idx % 3], idx / 3);
+      break;
+
+    case PROTO_ONEWIRE:
+      // The commands, and what the device answered with: which family code
+      // came back, which byte of the ROM is its CRC, and the temperature
+      // itself at the byte that completes it
+      onewire_byte_label(&g_pana.ow, idx, v, buf, size);
+      break;
+
+    case PROTO_CAN:
+      // Which field of which frame: the identifier at the byte it starts on,
+      // the data bytes numbered, and at the end of the frame whether its CRC
+      // checked out and whether anyone acknowledged it
+      can_byte_label(&g_pana.can, idx, v, buf, size);
+      break;
+
+    case PROTO_DHT:
+      // Five bytes, and the reading written at the byte that completes each
+      // pair
+      dht_byte_label(&g_pana.dht, idx, v, buf, size);
+      break;
+
+    case PROTO_SENT:
+      // Nibbles: the status one, the data ones numbered, and the 12-bit
+      // signals written where their third nibble finishes them
+      sent_byte_label(&g_pana.sent, idx, v, buf, size);
+      break;
+
+    case PROTO_MIDI:
+      // What the message says, written once across the bytes it took: a
+      // note and its velocity, a controller and its value, a pitch bend
+      midi_byte_label(&g_pana.midi, idx, v, buf, size);
+      break;
+
+    case PROTO_LIN:
+      // Which field of the frame: the sync, the identifier under its parity
+      // bits, the data numbered, and whether the checksum agreed
+      lin_byte_label(&g_pana.lin, idx, v, buf, size);
+      break;
+
+    case PROTO_SERVO:
+      // The byte IS the width, in tens of microseconds; put it back into the
+      // units the servo is commanded in, which is the only form anyone reads
+      snprintf(buf, size, "%d.%02dms", v / 100, v % 100);
+      break;
+
+    default: // UART and the raw bit stream: text is what they usually carry
+      dband_ascii_text(buf, size, v);
+      break;
+  }
+}
+
+//-----------------------------------------------------------------------------
+// What byte `idx` is ON ITS OWN - the field it belongs to, never the value
+// its group adds up to. That value spans several bytes and is written once
+// across them a row lower; this is the row that still says which byte of the
+// three you are looking at, the way a protocol analyser numbers bit0 bit1
+// bit2 above the bracket labelled "command".
+static void dband_field_text(char *buf, int size, int idx, uint8_t v)
+{
+  switch (g_logic.proto)
+  {
+    case PROTO_SENT:    sent_field_label(&g_pana.sent, idx, v, buf, size); break;
+    case PROTO_CAN:     can_field_label(&g_pana.can, idx, v, buf, size); break;
+    case PROTO_DHT:     dht_field_label(&g_pana.dht, idx, v, buf, size); break;
+    case PROTO_ONEWIRE: onewire_field_label(&g_pana.ow, idx, v, buf, size); break;
+    case PROTO_MIDI:    midi_field_label(&g_pana.midi, idx, v, buf, size); break;
+
+    // Everything else names its bytes one at a time already
+    default: dband_meaning_text(buf, size, idx, v); break;
+  }
+}
+
+//-----------------------------------------------------------------------------
+// One string into the decoder band's text mask: left edge at x, top edge at y
+static void dband_render_text(int x, int y, const char *str)
+{
+  const Font *font = FONT_SMALL;
+
+  for (; *str; str++)
+  {
+    char ch = *str;
+
+    if (ch < FONT_FIRST_CHAR || ch > FONT_LAST_CHAR)
+      ch = ' ';
+
+    const uint8_t *bitmap = font->data + (ch - FONT_FIRST_CHAR) * font->pitch;
+    int size = font->width * font->height;
+
+    for (int i = 0; i < size; i++)
+    {
+      if ((bitmap[i / 8] >> (i % 8)) & 1)
+      {
+        int px = x + i % font->width;
+        int py = y + i / font->width;
+
+        if (px >= 0 && px < GRID_WIDTH && py >= 0 && py < DBAND_H3)
+          g_dband_mask[py][px / 8] |= (uint8_t)(1 << (px % 8));
+      }
+    }
+
+    x += font->width;
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Which screen column is this record sample under? Both are clocks on the
+// same event - the sample `g_decode_period_ns` apart in the record, the
+// column `horizontal_period` apart on the screen - pinned together at the
+// trigger. Saturated well outside the grid rather than wrapped: a record can
+// be half a second long and a column two nanoseconds wide, and that ratio
+// overflows an int long before it stops being simply "off the screen".
+static int band_column(int sample, int trig_col)
+{
+  int64_t col = trig_col + ((int64_t)(sample - g_decode_trig_pos) *
+      g_decode_period_ns) / config.horizontal_period;
+
+  if (col < -1)
+    return -1;
+
+  if (col > GRID_WIDTH)
+    return GRID_WIDTH;
+
+  return (int)col;
+}
+
+//-----------------------------------------------------------------------------
+// How a byte of this protocol is laid out in TIME: how many equal bit cells
+// it spans, which of them is the first data bit, and whether the data runs
+// most significant first.
+//
+// Only the protocols whose decoder itself worked on a uniform bit grid are
+// here, and that is the whole rule. UART, MIDI and LIN sample at start +
+// (1.5 + n) bit times and WS2812 and the raw reader step a fixed cell, so
+// dividing their bytes evenly reproduces exactly where they looked. NEC, DHT,
+// 1-Wire and SENT measure every bit on its own - their cells are not equal in
+// time at all - and CAN's are equal but its stuffing puts a varying number of
+// them in a byte. Drawing an even grid over any of those would put the lines
+// somewhere the decoder never looked, and a grid you cannot trust is worse
+// than no grid: the entire point of it is checking the decode against the
+// waveform.
+//
+// Returns 0 when this protocol has no such layout.
+static int decode_bit_slots(int *data0, bool *msb_first)
+{
+  *data0 = 0;
+  *msb_first = false;
+
+  switch (g_logic.proto)
+  {
+    case PROTO_UART:
+    case PROTO_MIDI:
+    case PROTO_LIN:
+      *data0 = 1;          // the start bit takes the first cell
+      return 10;           // ...and the stop bit the last
+
+    // The raw reader steps a fixed cell and packs eight of them, so its
+    // bytes divide exactly. WS2812 does NOT belong here even though its bit
+    // period is constant: a byte's recorded span runs from the first bit's
+    // rising edge to the LAST bit's falling one, which is seven periods and
+    // a fraction, and dividing that by eight would walk the lines backwards
+    // through the byte.
+    case PROTO_RAW:
+      *msb_first = true;
+      return 8;
+
+    default:
+      return 0;
+  }
+}
+
+//-----------------------------------------------------------------------------
+// The same map as band_column, without its saturation. The bit grid divides a
+// byte's SPAN, so both ends of that span have to be where they really are -
+// clamping the left edge to the screen first and dividing afterwards would
+// squeeze a whole byte's worth of cells into the visible part of it, and
+// lines drawn for checking a decode must never land anywhere but on the
+// boundary they name. Clipping happens per pixel, at the point of drawing.
+static int band_column_raw(int sample, int trig_col)
+{
+  int64_t col = trig_col + ((int64_t)(sample - g_decode_trig_pos) *
+      g_decode_period_ns) / config.horizontal_period;
+
+  if (col < -1000000)
+    col = -1000000;
+
+  if (col > 1000000)
+    col = 1000000;
+
+  return (int)col;
+}
+
+//-----------------------------------------------------------------------------
+// One character into the bit-number row, left edge at x
+static void dbit_render_char(int x, char ch)
+{
+  const Font *font = FONT_SMALL;
+
+  if (ch < FONT_FIRST_CHAR || ch > FONT_LAST_CHAR)
+    return;
+
+  const uint8_t *bitmap = font->data + (ch - FONT_FIRST_CHAR) * font->pitch;
+  int size = font->width * font->height;
+
+  for (int i = 0; i < size; i++)
+  {
+    if (!((bitmap[i / 8] >> (i % 8)) & 1))
+      continue;
+
+    int px = x + i % font->width;
+    int py = i / font->width;
+
+    if (px >= 0 && px < GRID_WIDTH && py < 8)
+      DBIT->glyph[px] |= (uint8_t)(1 << py);
+  }
+}
+
+//-----------------------------------------------------------------------------
+// The bit grid for one byte: a boundary at every cell edge, and the bit's
+// number in the middle of the cell where there is room for it.
+static void dbit_build_byte(int b, int trig_col)
+{
+  const Font *font = FONT_SMALL;
+  int data0;
+  bool msb;
+  int slots = decode_bit_slots(&data0, &msb);
+
+  if (slots < 1)
+    return;
+
+  int base = g_logic.pos[b];
+  int span = g_logic.end[b] - base;
+
+  // How wide one cell is on the screen, from the unclipped arithmetic - the
+  // byte may run off either edge and the answer must not change if it does
+  int64_t cell = ((int64_t)span * g_decode_period_ns) /
+      ((int64_t)config.horizontal_period * slots);
+
+  if (span <= 0 || cell < DBIT_MIN_PX)
+    return;
+
+  for (int k = 0; k <= slots; k++)
+  {
+    int cx = band_column_raw(base + (int)((int64_t)span * k / slots), trig_col);
+
+    if (cx >= 0 && cx < GRID_WIDTH)
+      DBIT->edge[cx / 8] |= (uint8_t)(1 << (cx % 8));
+  }
+
+  if (cell < font->width + 2)
+    return;                // the cells are there, the numbers do not fit them
+
+  for (int k = 0; k < slots; k++)
+  {
+    int a = band_column_raw(base + (int)((int64_t)span * k / slots), trig_col);
+    int e = band_column_raw(base + (int)((int64_t)span * (k + 1) / slots),
+        trig_col);
+    int d = k - data0;
+    char ch;
+
+    if (e <= 0 || a >= GRID_WIDTH)
+      continue;            // this cell is off the screen entirely
+
+    if (d < 0)
+      ch = 'S';            // the start bit: not data, and the byte begins here
+    else if (d >= 8)
+      ch = 'P';            // ...and the stop bit, which is where it ends
+    else
+      ch = (char)('0' + (msb ? 7 - d : d));
+
+    dbit_render_char(a + (e - a - font->width) / 2, ch);
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Map the decoded bytes onto trace columns, once per change, so the sweep
+// only has to look up an array. A record sample and a screen column are two
+// clocks on the same event: the sample is `period_ns` apart in the record,
+// the column is `horizontal_period` apart on the screen, and the trigger is
+// where the two are pinned together.
+//
+// Nothing is drawn from a held result: those positions belong to a record
+// that has since been overwritten, and drawing them over the current trace
+// would be pointing at the wrong place on the waveform.
+static void decode_band_build(void)
+{
+  const Font *font = FONT_SMALL;
+  int was_rows = g_dband_rows;
+  int trig_col = GRID_WIDTH/2 - config.horizontal_position_px;
+  int widest = 0;
+
+  memset(g_dband_byte, -1, sizeof(g_dband_byte));
+  memset(g_dband_edge, 0, sizeof(g_dband_edge));
+  memset(g_dband_mask, 0, sizeof(g_dband_mask));
+  memset(DBIT, 0, sizeof(*DBIT));
+  g_dband_rows = 0;
+  g_dbit_on = false;
+
+  g_dband_sel_start = g_decode_sel;
+  g_dband_sel_len = 1;
+
+  if (g_logic.count > 0)
+    decode_group_at(g_decode_sel, &g_dband_sel_start, &g_dband_sel_len);
+
+  if (g_decode_mode && !g_fft_mode && !g_trend_mode && g_logic_have &&
+      !g_decode_held && g_logic.count > 0 && g_decode_period_ns > 0 &&
+      config.horizontal_period > 0)
+  {
+    // First pass: where each byte sits, and how wide the widest of them is.
+    // The width decides the shape of the whole band, so it has to be known
+    // before any text is placed.
+    for (int b = 0; b < g_logic.count; b++)
+    {
+      int c0 = band_column(g_logic.pos[b], trig_col);
+      int c1 = band_column(g_logic.end[b], trig_col);
+      int lo = (c0 < 0) ? 0 : c0;
+      int hi = (c1 > GRID_WIDTH - 1) ? GRID_WIDTH - 1 : c1;
+
+      if (hi <= 0 || lo >= GRID_WIDTH - 1)
+        continue; // this byte is off the screen at this pan and timebase
+
+      for (int c = lo; c < hi; c++)
+        g_dband_byte[c] = (int8_t)b;
+
+      if (c0 >= 0 && c0 < GRID_WIDTH - 1)
+        g_dband_edge[c0 / 8] |= (uint8_t)(1 << (c0 % 8));
+
+      if (c1 - c0 > widest)
+        widest = c1 - c0;
+
+      g_dband_rows = DBAND_H1;
+
+      // The bit grid rides the same pass. It is per byte and not per record,
+      // because a byte is what has a known number of cells in it.
+      if (0 == config.decoder_bits_mode)
+      {
+        dbit_build_byte(b, trig_col);
+        g_dbit_on = true;
+      }
+    }
+  }
+
+  // Room for the number AND something under it: two rows. The number needs
+  // two characters plus a pixel of gutter at each end, and anything less than
+  // that has no first row to put a second one under.
+  int hex_px = 2 * font->width + 2;
+
+  if (g_dband_rows && widest >= hex_px)
+  {
+    // A third row only where there is something that spans several bytes to
+    // put in it. Every row is screen taken from the trace, and a protocol
+    // whose bytes each stand alone has nothing to say on it.
+    bool grouped = false;
+
+    for (int b = 0; b < g_logic.count && !grouped; )
+    {
+      int gs, gl;
+
+      decode_group_at(b, &gs, &gl);
+      gl -= b - gs;
+
+      if (gl < 1)
+        gl = 1;
+
+      grouped = (gl > 1);
+      b += gl;
+    }
+
+    g_dband_rows = grouped ? DBAND_H3 : DBAND_H2;
+  }
+
+  g_dband_row0 = DBAND_BOTTOM - g_dband_rows;
+
+  // Second pass, walked a CHARACTER at a time rather than a byte at a time.
+  // Numbers are per byte - a byte is what was on the wire - but what the
+  // numbers mean can span several of them, and a code point written once
+  // across the group says "these two bytes are one character" in a way that
+  // the same label repeated under each of them never would.
+  for (int b = 0; b < g_logic.count && g_dband_rows; )
+  {
+    int gs, glyph;
+
+    decode_group_at(b, &gs, &glyph);
+
+    // Walking forward from zero always lands on a group's first byte, but a
+    // decoder that ever answered otherwise would run this loop off the end
+    glyph -= b - gs;
+
+    if (glyph < 1)
+      glyph = 1;
+
+    int c0 = band_column(g_logic.pos[b], trig_col);
+    int gend = band_column(g_logic.end[b + glyph - 1], trig_col);
+    // Wide enough for the longest a decoder writes: "DS1990 key", "RH=45.3%",
+    // "SysEx Waldrf", "On C#-1 v127"
+    char text[16];
+
+    for (int i = 0; i < glyph; i++)
+    {
+      int bc0 = band_column(g_logic.pos[b + i], trig_col);
+      int bc1 = band_column(g_logic.end[b + i], trig_col);
+      int width = bc1 - bc0;
+      int room = width - 2; // a pixel of gutter at each end
+      uint8_t v = g_logic.bytes[b + i];
+
+      if (bc1 <= 0 || bc0 >= GRID_WIDTH - 1)
+        continue;
+
+      // Top row: the number, wherever it fits at all
+      if (2 * font->width <= room)
+      {
+        snprintf(text, sizeof(text), "%02X", v);
+        dband_render_text(bc0 + (width - 2 * font->width) / 2,
+            (g_dband_rows > DBAND_H1) ? DBAND_TEXT_Y0 :
+            (DBAND_H1 - font->height) / 2, text);
+      }
+      else if (g_dband_rows == DBAND_H1 && glyph == 1 && v > 32 && v < 127 &&
+          font->width <= room)
+      {
+        // One row only and the number did not fit: a bare character is still
+        // worth more than an empty box
+        snprintf(text, sizeof(text), "%c", v);
+        dband_render_text(bc0 + (width - font->width) / 2,
+            (DBAND_H1 - font->height) / 2, text);
+      }
+
+      // Middle row, where there is one: what THIS byte is, as opposed to what
+      // its group adds up to. Grouping alone answers "these three nibbles are
+      // 0x394" and leaves "which of the three am I looking at" unanswered.
+      if (g_dband_rows == DBAND_H3)
+      {
+        int need;
+
+        dband_field_text(text, sizeof(text), b + i, v);
+        need = (int)strlen(text) * font->width;
+
+        if (text[0] && need <= room)
+          dband_render_text(bc0 + (width - need) / 2, DBAND_TEXT_Y1, text);
+      }
+    }
+
+    b += glyph;
+
+    if (g_dband_rows < DBAND_H2 || gend <= 0 || c0 >= GRID_WIDTH - 1)
+      continue;
+
+    // Bottom row: what the bytes above mean, written once across however many
+    // of them it took to say it. For a protocol that is the label the group's
+    // last byte carries - the one that completes the value - so a three
+    // nibble SENT signal reads "S1=543" once across all three.
+    //
+    // With three rows a byte that is a group of its own has already had its
+    // say on the row above, and repeating it here would only widen the band
+    // to write the same word twice.
+    if (g_dband_rows == DBAND_H3 && glyph == 1)
+      continue;
+
+    if (glyph > 1 && decode_proto_is_text())
+      snprintf(text, sizeof(text), "U+%04X",
+          (unsigned)utf8_code_point(&g_logic.bytes[b - glyph], glyph));
+    else
+      dband_meaning_text(text, sizeof(text), b - 1, g_logic.bytes[b - 1]);
+
+    int span = gend - c0;
+    int need = (int)strlen(text) * font->width;
+
+    if (text[0] && need <= span - 2)
+      dband_render_text(c0 + (span - need) / 2,
+          (g_dband_rows == DBAND_H3) ? DBAND_TEXT_Y2 : DBAND_TEXT_Y1, text);
+  }
+
+  // Bottom-aligned, so a band that grew or shrank is repainted over the
+  // taller of the two
+  int rows = (g_dband_rows > was_rows) ? g_dband_rows : was_rows;
+
+  if (rows)
+    overlay_repaint_region(DBAND_BOTTOM - rows, rows);
 }
 
 //-----------------------------------------------------------------------------
@@ -1176,7 +2277,7 @@ static bool mpanel_wanted(void)
   if (scope_calibration_mode)
     return g_calib_hint;
 
-  return config.measure_display && !g_fft_mode &&
+  return config.measure_display && !g_fft_mode && !g_trend_mode &&
       config.measure_panel_mode == 0;
 }
 
@@ -1457,7 +2558,11 @@ static void draw_capture_state(void)
 // x = (p/size - 1/2) * MINIVIEW_WIDTH.
 static int miniview_byte_at(int x)
 {
-  if (!g_decode_mode || !g_logic_have || g_logic.count == 0 || g_decode_size <= 0)
+  // Held frames came out of a record that has already been overwritten, so
+  // their positions mean nothing on this one: the panel keeps them, the map
+  // does not
+  if (!g_decode_mode || !g_logic_have || g_decode_held ||
+      g_logic.count == 0 || g_decode_size <= 0)
     return -1;
 
   int64_t p = ((int64_t)x * g_decode_size) / MINIVIEW_WIDTH + g_decode_size / 2;
@@ -1570,6 +2675,11 @@ static void draw_sample_rates(int sample_rate_limit, int sample_rate)
 static void update_sample_rate(void)
 {
   int64_t hp_abs = (config.horizontal_position < 0) ? -config.horizontal_position : config.horizontal_position;
+
+  // Every path that re-times the acquisition or moves the view comes through
+  // here: whatever the envelope and the averages accumulated no longer maps
+  // onto these columns
+  scope_display_settings_changed();
   int64_t window_time = (int64_t)hs_div_value[config.horizontal_scale] * GRID_DIVS_H;
   int64_t period = BASE_SAMPLE_PERIOD;
   int64_t trigger_margin, trigger_offset;
@@ -1642,6 +2752,10 @@ static void update_sample_rate(void)
     sample_rate = (int)(1000000000ll / record_period);
 
   draw_sample_rates(sample_rate_limit, sample_rate);
+
+  // Every pan and every timebase step lands here, and both move the decoded
+  // bytes across the screen: the band is anchored in time, not in columns
+  decode_band_build();
 }
 
 //-----------------------------------------------------------------------------
@@ -1688,10 +2802,467 @@ static void close_gaps(DisplayBuffer *db)
   }
 }
 
+/*- Display post-processing, cursors and the trend view ---------------------*/
+static void draw_status_line(void);
+static void update_display(void);
+
+//-----------------------------------------------------------------------------
+// Forget the accumulated envelope and averages: called whenever the mapping
+// from column to time or voltage changes (pan, zoom, scale, coupling) and
+// when the menu toggles the features themselves
+void scope_display_settings_changed(void)
+{
+  memset(g_persist_have, 0, sizeof(g_persist_have));
+  memset(g_avg_have, 0, sizeof(g_avg_have));
+  g_shadow_valid = false;
+}
+
+//-----------------------------------------------------------------------------
+// Acquisition averaging, display space: an EMA of each column's midpoint
+// across trigger-aligned frames, drawn as a thin trace instead of the
+// min/max band. At fast timebases a column IS one sample, so this is
+// textbook average mode there (~sqrt(N) noise reduction); at slow timebases
+// it steadies the centre of the band. Only NEW frames advance the average -
+// a pan redraw of the same record must not multiply-count it.
+static void display_average(void)
+{
+  uint32_t gen = capture_get_generation();
+  int shift = config.average_mode + 1; // N = 2 << mode
+  bool fresh = (gen != g_avg_gen);
+
+  g_avg_gen = gen;
+
+  if (config.average_mode <= 0)
+    return;
+
+  for (int c = 0; c < GRID_WIDTH; c++)
+  {
+    int px;
+
+    if (!(g_display_buffer.flags[c] & SAMPLE_FLAG_VALID))
+    {
+      g_avg_have[c] = 0;
+      continue;
+    }
+
+    px = (g_display_buffer.min[c] + g_display_buffer.max[c]) * 32; // mid * 64
+
+    if (!g_avg_have[c])
+    {
+      g_avg_acc[c] = px;
+      g_avg_have[c] = 1;
+    }
+    else if (fresh)
+    {
+      int acc = g_avg_acc[c];
+
+      acc += (px - acc) >> shift;
+      g_avg_acc[c] = acc;
+    }
+
+    px = (g_avg_acc[c] + 32) / 64;
+
+    g_display_buffer.min[c] = px;
+    g_display_buffer.max[c] = px;
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Persistence: fold what is about to be displayed into the envelope
+static void display_persist_accum(void)
+{
+  if (!config.display_persist)
+    return;
+
+  for (int c = 0; c < GRID_WIDTH; c++)
+  {
+    if (!(g_display_buffer.flags[c] & SAMPLE_FLAG_VALID))
+      continue;
+
+    if (!g_persist_have[c])
+    {
+      g_persist_min[c] = g_display_buffer.min[c];
+      g_persist_max[c] = g_display_buffer.max[c];
+      g_persist_have[c] = 1;
+    }
+    else
+    {
+      if (g_display_buffer.min[c] < g_persist_min[c])
+        g_persist_min[c] = g_display_buffer.min[c];
+
+      if (g_display_buffer.max[c] > g_persist_max[c])
+        g_persist_max[c] = g_display_buffer.max[c];
+    }
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Measurement cursors. Both mappings are exactly the arithmetic the trace
+// itself is drawn with, so the cursors track pan and zoom.
+static int cursor_t_col(int64_t t_ns)
+{
+  return GRID_WIDTH/2 + (int)((t_ns - config.horizontal_position) /
+      hs_px_value[config.horizontal_scale]);
+}
+
+//-----------------------------------------------------------------------------
+static int cursor_v_row(int mv)
+{
+  int px = (mv - config.vertical_position_mv) / vs_px_value[config.vertical_scale] +
+      config.vertical_position;
+
+  return clip_for_display(px);
+}
+
+//-----------------------------------------------------------------------------
+static void format_ns(int64_t ns, char *out, int size)
+{
+  int64_t a = (ns < 0) ? -ns : ns;
+  const char *sign = (ns < 0) ? "-" : "";
+
+  if (a < 1000)
+    snprintf(out, size, "%s%dns", sign, (int)a);
+  else if (a < 1000000)
+    snprintf(out, size, "%s%d.%02dus", sign, (int)(a / 1000), (int)(a % 1000) / 10);
+  else if (a < 1000000000)
+    snprintf(out, size, "%s%d.%02dms", sign, (int)(a / 1000000), (int)(a % 1000000) / 10000);
+  else
+    snprintf(out, size, "%s%d.%02ds", sign, (int)(a / 1000000000),
+        (int)((a % 1000000000) / 10000000));
+}
+
+//-----------------------------------------------------------------------------
+// Frequency from milli-hertz: cursor spans run from sub-Hz (dt = 2 s) up to
+// tens of MHz (dt = 50 ns), so the input must not lose the fractional Hz
+static void format_hz_mhz(int64_t mhz, char *out, int size)
+{
+  if (mhz >= 1000000000)
+    snprintf(out, size, "%d.%03dM", (int)(mhz / 1000000000),
+        (int)(mhz % 1000000000) / 1000000);
+  else if (mhz >= 1000000)
+    snprintf(out, size, "%d.%02dk", (int)(mhz / 1000000), (int)(mhz % 1000000) / 10000);
+  else
+    snprintf(out, size, "%d.%02d", (int)(mhz / 1000), (int)(mhz % 1000) / 10);
+}
+
+//-----------------------------------------------------------------------------
+static void format_mv(int mv, char *out, int size)
+{
+  int a = (mv < 0) ? -mv : mv;
+  const char *sign = (mv < 0) ? "-" : "";
+
+  if (a < 1000)
+    snprintf(out, size, "%s%dmV", sign, a);
+  else
+    snprintf(out, size, "%s%d.%02dV", sign, a / 1000, (a % 1000) / 10);
+}
+
+//-----------------------------------------------------------------------------
+// The whole status line while cursors are up: both deltas and the implied
+// frequency, with the active cursor named so the arrows have an obvious
+// target
+static void cursor_readout(void)
+{
+  static const char *const names[] = { "", "T1", "T2", "V1", "V2" };
+  char dt[14], f[14], dv[14], buf[64];
+  int64_t d = g_cursor_t[1] - g_cursor_t[0];
+
+  if (g_toast_active)
+    return;
+
+  format_ns(d, dt, sizeof(dt));
+  format_mv(g_cursor_v[0] - g_cursor_v[1], dv, sizeof(dv));
+
+  if (d != 0)
+  {
+    int64_t ad = (d < 0) ? -d : d;
+
+    format_hz_mhz(1000000000000ll / ad, f, sizeof(f));
+  }
+  else
+  {
+    snprintf(f, sizeof(f), "-");
+  }
+
+  lcd_fill_rect(GRID_LEFT, GRID_BOTTOM+1, GRID_WIDTH+1, STATUS_LINE_HEIGHT, BG_COLOR);
+  lcd_set_color(BG_COLOR, CURSOR_T_COLOR);
+  snprintf(buf, sizeof(buf), "%s dT %s 1/dT %s dV %s",
+      names[g_cursor_sel], dt, f, dv);
+  lcd_puts(GRID_LEFT, STATUS_LINE_Y, buf);
+}
+
+//-----------------------------------------------------------------------------
+// Arrow keys while a cursor is active: LEFT/RIGHT drag a time cursor,
+// UP/DOWN drag a voltage cursor, one pixel per press, x10 with SHIFT.
+// Everything else falls through to the normal handlers.
+static bool cursor_buttons(int buttons, bool shift, bool repeat)
+{
+  int mul = shift ? 10 : 1;
+
+  if (repeat)
+    mul *= 4;
+
+  if (g_cursor_sel == 1 || g_cursor_sel == 2)
+  {
+    int64_t step = (int64_t)hs_px_value[config.horizontal_scale] * mul;
+    int64_t *t = &g_cursor_t[g_cursor_sel - 1];
+
+    if (buttons & BTN_LEFT)
+      *t -= step;
+    else if (buttons & BTN_RIGHT)
+      *t += step;
+    else
+      return false;
+  }
+  else
+  {
+    int step = vs_px_value[config.vertical_scale] * mul;
+    int *v = &g_cursor_v[g_cursor_sel - 3];
+
+    if (buttons & BTN_UP)
+      *v += step;
+    else if (buttons & BTN_DOWN)
+      *v -= step;
+    else
+      return false;
+  }
+
+  g_cursor_dirty = true;
+  cursor_readout();
+
+  return true;
+}
+
+//-----------------------------------------------------------------------------
+// Trend view: the logger ring plotted right-aligned (newest at the right
+// edge), auto-scaled to its own min..max with headroom. One metric at a
+// time; EDGE cycles them, MODE clears the ring.
+static int trend_value(const TrendPoint *p)
+{
+  if (g_trend_metric == 0)
+    return p->freq;
+
+  if (g_trend_metric == 1)
+    return p->vrms;
+
+  return p->duty;
+}
+
+//-----------------------------------------------------------------------------
+static void trend_view_update(void)
+{
+  const TrendPoint *pts = trend_data();
+  int n = trend_count();
+  int lo = INT_MAX, hi = INT_MIN;
+
+  for (int c = 0; c < GRID_WIDTH; c++)
+    g_display_buffer.flags[c] = SAMPLE_FLAG_NONE;
+
+  for (int i = 0; i < n; i++)
+  {
+    int v = trend_value(&pts[i]);
+
+    if (v < lo)
+      lo = v;
+
+    if (v > hi)
+      hi = v;
+  }
+
+  if (n > 0)
+  {
+    int span = hi - lo;
+    int y0 = TREND_MARGIN_PX, y1 = GRID_HEIGHT - 2 - TREND_MARGIN_PX;
+
+    for (int i = 0; i < n; i++)
+    {
+      int c = GRID_WIDTH - n + i;
+      int v = trend_value(&pts[i]);
+      int y = (span > 0) ?
+          y1 - (int)((int64_t)(v - lo) * (y1 - y0) / span) : (y0 + y1) / 2;
+
+      g_display_buffer.min[c]   = y;
+      g_display_buffer.max[c]   = y;
+      g_display_buffer.flags[c] = SAMPLE_FLAG_VALID;
+    }
+
+    close_gaps(&g_display_buffer);
+  }
+
+  g_shadow_valid = false;
+  redraw_trace();
+}
+
+//-----------------------------------------------------------------------------
+static void trend_readout(void)
+{
+  static const char *const metric_names[] = { "freq", "Vrms", "duty" };
+  const TrendPoint *pts = trend_data();
+  int n = trend_count();
+  char lo_s[14], hi_s[14], span_s[14], buf[64];
+  int lo = INT_MAX, hi = INT_MIN, secs;
+
+  if (g_toast_active)
+    return;
+
+  lcd_fill_rect(GRID_LEFT, GRID_BOTTOM+1, GRID_WIDTH+1, STATUS_LINE_HEIGHT, BG_COLOR);
+  lcd_set_color(BG_COLOR, SR_COLOR);
+
+  if (n == 0)
+  {
+    lcd_puts(GRID_LEFT, STATUS_LINE_Y, "Trend: no data yet (logs at 1 Hz)");
+    return;
+  }
+
+  for (int i = 0; i < n; i++)
+  {
+    int v = trend_value(&pts[i]);
+
+    if (v < lo)
+      lo = v;
+
+    if (v > hi)
+      hi = v;
+  }
+
+  if (g_trend_metric == 0)
+  {
+    format_hz_mhz((int64_t)lo * 1000, lo_s, sizeof(lo_s));
+    format_hz_mhz((int64_t)hi * 1000, hi_s, sizeof(hi_s));
+  }
+  else if (g_trend_metric == 1)
+  {
+    format_mv(lo, lo_s, sizeof(lo_s));
+    format_mv(hi, hi_s, sizeof(hi_s));
+  }
+  else
+  {
+    snprintf(lo_s, sizeof(lo_s), "%d.%d%%", lo / 10, (lo < 0) ? 0 : lo % 10);
+    snprintf(hi_s, sizeof(hi_s), "%d.%d%%", hi / 10, (hi < 0) ? 0 : hi % 10);
+  }
+
+  secs = n * trend_seconds_per_point();
+
+  if (secs < 60)
+    snprintf(span_s, sizeof(span_s), "%ds", secs);
+  else if (secs < 3600)
+    snprintf(span_s, sizeof(span_s), "%dm%02ds", secs / 60, secs % 60);
+  else
+    snprintf(span_s, sizeof(span_s), "%dh%02dm", secs / 3600, (secs % 3600) / 60);
+
+  snprintf(buf, sizeof(buf), "%s %s..%s  %s",
+      metric_names[g_trend_metric], lo_s, hi_s, span_s);
+  lcd_puts(GRID_LEFT, STATUS_LINE_Y, buf);
+}
+
+//-----------------------------------------------------------------------------
+static void trend_toggle(void)
+{
+  g_trend_mode = !g_trend_mode;
+  g_decode_mode = false;
+  g_fft_mode = false;
+  g_shadow_valid = false;
+  g_sweep_force = true;
+
+  if (g_trend_mode)
+    trend_view_update();
+  else
+    update_display();
+
+  draw_status_line();
+}
+
+//-----------------------------------------------------------------------------
+static bool trend_buttons(int buttons, bool shift, bool repeat)
+{
+  if (repeat)
+    return true;
+
+  if ((buttons & BTN_EDGE) && !shift)
+  {
+    g_trend_metric = (g_trend_metric + 1) % 3;
+    trend_view_update();
+    trend_readout();
+    return true;
+  }
+
+  if ((buttons & BTN_MODE) && !shift)
+  {
+    trend_reset();
+    trend_view_update();
+    trend_readout();
+    return true;
+  }
+
+  // Arrows, AUTO and 50% have no meaning here; swallowing them beats having
+  // them silently retune the scope underneath the plot
+  if (buttons & (BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT | BTN_AUTO | BTN_50P))
+    return true;
+
+  return false; // SAVE, STOP and the SHIFT view switches fall through
+}
+
+//-----------------------------------------------------------------------------
+// How tall the bit grid's lines are: exactly what the waveform spans under
+// the decoded bytes, top pixel to bottom pixel. Measured over the decoded
+// columns and not the whole screen, because those are the only columns the
+// grid is drawn in - a marker pulse somewhere else in the record has nothing
+// to do with how tall a line over THIS byte should be.
+//
+// Per frame, not per decode: the bytes move when the record changes, the
+// signal's height moves whenever the vertical scale, the position or the
+// signal itself does.
+static void dbit_span_update(void)
+{
+  int top = GRID_HEIGHT, bot = -1;
+
+  if (!g_dbit_on)
+    return;
+
+  for (int c = 0; c < GRID_WIDTH; c++)
+  {
+    if (g_dband_byte[c] < 0)
+      continue;
+
+    if (!(g_display_buffer.flags[c] & SAMPLE_FLAG_VALID))
+      continue;
+
+    if (g_display_buffer.min[c] < top)
+      top = g_display_buffer.min[c];
+
+    if (g_display_buffer.max[c] > bot)
+      bot = g_display_buffer.max[c];
+  }
+
+  g_dbit_top = top;
+  g_dbit_bot = (bot > GRID_HEIGHT - 2) ? GRID_HEIGHT - 2 : bot;
+
+  // The numbers go in the middle of that span. A digital trace lives at its
+  // two rails and crosses the middle only on its edges - which is exactly
+  // where the lines are and exactly where the numbers are not.
+  int row = (g_dbit_top + g_dbit_bot) / 2 - 4;
+
+  if (row < 0)
+    row = 0;
+
+  if (row + 8 > GRID_HEIGHT)
+    row = GRID_HEIGHT - 8;
+
+  g_dbit_text_row = row;
+}
+
 //-----------------------------------------------------------------------------
 static void update_display(void)
 {
   int scale = vs_px_value[config.vertical_scale];
+
+  // The display buffer is the trend plot while that view is up: a frame
+  // landing (or a pan-settle refresh) must not overwrite it with the trace
+  if (g_trend_mode)
+  {
+    trend_view_update();
+    return;
+  }
 
   g_data_buffer.size = GRID_WIDTH;
   capture_get_data(&g_data_buffer);
@@ -1706,7 +3277,12 @@ static void update_display(void)
     g_display_buffer.flags[i] = g_data_buffer.flags[i];
   }
 
+  display_average();            // thin running-mean trace instead of the band
   close_gaps(&g_display_buffer);
+  display_persist_accum();      // envelope of what is actually displayed
+
+  dbit_span_update();           // the bit grid is as tall as the trace is
+
   redraw_trace();
 }
 
@@ -1820,6 +3396,39 @@ static void fft_update(void)
   decim = fft_decimation(size);
 
   fft_spectrum_decim(data, size, offset, decim, g_fft_mag);
+
+  if (g_fft_hold_mode != FFT_HOLD_OFF)
+  {
+    if (decim != g_fft_hold_decim || period_ns != g_fft_hold_period)
+      g_fft_hold_primed = false; // bins mean new frequencies now
+
+    if (!g_fft_hold_primed)
+    {
+      for (int i = 0; i < FFT_BINS; i++)
+        g_fft_hold[i] = g_fft_mag[i];
+
+      g_fft_hold_primed = true;
+      g_fft_hold_decim = decim;
+      g_fft_hold_period = period_ns;
+    }
+    else if (g_fft_hold_mode == FFT_HOLD_MAX)
+    {
+      for (int i = 0; i < FFT_BINS; i++)
+      {
+        if (g_fft_mag[i] > g_fft_hold[i])
+          g_fft_hold[i] = g_fft_mag[i];
+      }
+    }
+    else
+    {
+      for (int i = 0; i < FFT_BINS; i++)
+        g_fft_hold[i] += (g_fft_mag[i] - g_fft_hold[i]) * 0.125f;
+    }
+
+    for (int i = 0; i < FFT_BINS; i++)
+      g_fft_mag[i] = g_fft_hold[i];
+  }
+
   fft_analyze(g_fft_mag, period_ns * decim, &g_fft_an);
 
   g_fft_peak_hz = (int)(g_fft_an.fundamental + 0.5f);
@@ -2053,6 +3662,7 @@ static void change_vertical_scale(int delta)
 
   config.trigger_level_mv = config.trigger_level * vs_px_value[config.vertical_scale];
 
+  scope_display_settings_changed(); // px-to-mV mapping changed under them
   capture_set_vertical_parameters();
   capture_set_trigger_level(config.trigger_level_mv);
   draw_vertical_scale();
@@ -2069,6 +3679,8 @@ static void change_vertical_position_ex(int delta, bool repeat)
 
   config.vertical_position += delta;
   config.vertical_position_mv = config.vertical_position * vs_px_value[config.vertical_scale];
+
+  scope_display_settings_changed(); // every column moved on screen
 
   // Same held-key coalescing as horizontal pan: the DAC/DMA restart runs
   // every 4th repeat tick, the settle timer finalizes after release
@@ -2198,6 +3810,18 @@ static bool fft_buttons(int buttons, bool shift, bool repeat)
     else
       fft_jump_peak(-1);
   }
+  else if (buttons & BTN_EDGE)
+  {
+    // Off -> Max -> Avg. Restarting the accumulator on every switch is the
+    // point: stale max-hold from before a probing change is a lie.
+    if (!repeat)
+    {
+      g_fft_hold_mode = (g_fft_hold_mode + 1) % 3;
+      g_fft_hold_primed = false;
+      g_fft_panel_pending = true;
+      fft_update();
+    }
+  }
   else if (buttons & BTN_TRIG_UP)
   {
     if (!repeat)
@@ -2316,6 +3940,158 @@ static void change_sample_rate_limit(int delta)
 //-----------------------------------------------------------------------------
 // Map every trace column to the decoded byte its center sample belongs to
 //-----------------------------------------------------------------------------
+// The timebase that holds a whole message at this rate.
+//
+// The record is 24576 samples of whatever the timebase makes them, and the
+// window on the screen is what picks the sample rate, so the two are the same
+// question. The trigger sits in the middle of the record, so only the second
+// half carries a message that starts at it - hence the doubling. And a result
+// holds LOGIC_MAX_BYTES, so there is no point in a window wider than that
+// many frames: past it the record grows and the decode does not.
+static int decode_fit_scale(int baud)
+{
+  if (baud <= 0)
+    return -1;
+
+  // start + 8 data + stop, twice over for the pre-trigger half of the record
+  int64_t want_ns = (int64_t)LOGIC_MAX_BYTES * 10 * 2 * 1000000000ll / baud;
+
+  for (int hs = 0; hs < HS_COUNT; hs++)
+  {
+    if ((int64_t)hs_div_value[hs] * GRID_DIVS_H >= want_ns)
+      return hs;
+  }
+
+  return HS_LAST;
+}
+
+//-----------------------------------------------------------------------------
+// Put the whole message on the screen once the rate is known, so reading a
+// UART does not start with hunting for a timebase. Done once per lock, not
+// per decode: after this the timebase is the user's again, to zoom into a
+// byte with, and nothing takes it back.
+static void decode_fit_window(int baud)
+{
+  int hs = decode_fit_scale(baud);
+
+  if (config.decoder_fit_mode != 0 || hs < 0 || hs == config.horizontal_scale)
+    return;
+
+  config.horizontal_scale = hs;
+  config.horizontal_position_px = config.horizontal_position / hs_px_value[hs];
+  config.horizontal_period = hs_px_value[hs];
+
+  // The frames on the panel were measured in a record this has just thrown
+  // away; they stay up as held until the next decode replaces them
+  g_decode_held = true;
+  g_decode_force = true;
+
+  draw_horizontal_scale();
+  draw_horizontal_position();
+  update_sample_rate();
+  refresh_view();
+
+  char msg[48];
+
+  snprintf(msg, sizeof(msg), "Timebase set for %d baud", baud);
+  toast_show();
+  lcd_puts(GRID_LEFT, STATUS_LINE_Y, msg);
+}
+
+//-----------------------------------------------------------------------------
+// Hunt for the head of a message.
+//
+// There is no edge that means "start of message". The hardware triggers on an
+// edge and every bit of a frame is one, so the trigger cannot be asked for it
+// and never could be. What CAN be recognised, after the fact, is the record
+// that caught the line RESTING before its first frame - that rest is the only
+// thing that distinguishes the head of a message from its middle.
+//
+// So the hunt is: trigger on the falling edge that a start bit is, put that
+// edge one division from the left so the record runs forward from it instead
+// of spending half of itself on what came before, then decode every record
+// that arrives - not one every 250 ms - until one decodes cleanly with an
+// idle in front of it. That record is the head of a message, and acquisition
+// freezes on it.
+//
+// The trigger goes to NORMAL for the duration: in AUTO the acquisition gives
+// up waiting after 100 ms and hands over a record of the idle line, and a
+// message every 200 ms means most of the hunt would be spent on those.
+static void trigger_set_50_percent(void); // defined with the other trigger helpers
+
+static void decode_arm_hunt(void)
+{
+  int baud = decoder_baud_value();
+  char msg[48];
+
+  if (baud <= 0 && g_logic_have && decode_proto_is_serial(g_logic.proto))
+    baud = g_logic.rate; // not told, but a record has already said
+
+  if (baud > 0)
+  {
+    g_decode_fitted = true;
+    decode_fit_window(baud);
+  }
+
+  config.trigger_mode = TRIGGER_MODE_NORMAL;
+  capture_set_trigger_mode(config.trigger_mode);
+
+  // A start bit pulls an idle-high line down. Inverted logic is rare enough
+  // that the only evidence worth trusting is a decode that already said so.
+  config.trigger_edge = (g_logic_have && decode_proto_is_serial(g_logic.proto) &&
+      !g_logic.idle_high) ? TRIGGER_EDGE_RISE : TRIGGER_EDGE_FALL;
+  capture_set_trigger_edge(config.trigger_edge);
+
+  trigger_set_50_percent();
+
+  // One division of what came before is all the hunt needs - the test is for
+  // a frame time of idle - and the other eleven go to the message
+  int div = hs_div_value[config.horizontal_scale];
+  int64_t hpos = (int64_t)div * (GRID_DIVS_H / 2 - 1);
+
+  if (hpos > MAX_HORIZONTAL_POSITION)
+    hpos = MAX_HORIZONTAL_POSITION;
+
+  config.horizontal_position = hpos;
+  config.horizontal_position_px = (int)(hpos / hs_px_value[config.horizontal_scale]);
+
+  draw_trigger_mode();
+  draw_trigger_edge();
+  draw_horizontal_position();
+  update_sample_rate();
+  capture_start();
+  refresh_view();
+
+  g_decode_hunt = true;
+  g_decode_force = true;
+
+  if (baud > 0)
+    snprintf(msg, sizeof(msg), "Waiting for a message start, %d baud", baud);
+  else
+    snprintf(msg, sizeof(msg), "Waiting for a message start");
+
+  toast_show();
+  lcd_puts(GRID_LEFT, STATUS_LINE_Y, msg);
+}
+
+//-----------------------------------------------------------------------------
+// The bit grid draws over the whole height of the grid, not just over the
+// band, so switching it off has to repaint everything - clearing the band
+// alone would leave the hairlines standing on a trace that no longer has a
+// reason for them.
+void scope_decode_redraw(void)
+{
+  mpanel_invalidate();
+  g_shadow_valid = false;   // every column has to be composed again
+}
+
+//-----------------------------------------------------------------------------
+void scope_decode_catch_start(void)
+{
+  g_decode_hunt_request = true;
+}
+
+//-----------------------------------------------------------------------------
 // Run the protocol auto-decoder over the current record; flag the panel for
 // a repaint only when the result actually changed. Optionally freeze the
 // capture the moment a structured protocol is caught ("trigger on decode").
@@ -2323,7 +4099,9 @@ static void decode_update(void)
 {
   const uint8_t *data;
   int size, offset, period_ns, trig_pos;
-  LogicResult res;
+  // Static, not automatic: a LogicResult is over half a kilobyte now that a
+  // whole console line fits in one, and logic_decode() has one of its own
+  static LogicResult res;
   static uint32_t last_ms = 0;
 
   // Decoding a 24K record (worse: the whole auto-detect cascade) on every
@@ -2331,7 +4109,11 @@ static void decode_update(void)
   // of a serial console is indistinguishable from instant. The throttle is
   // on time alone: keying it off "have a result" let a decoder that never
   // matches anything run flat out, which is exactly the case that hurts.
-  if (!g_decode_force && timer_ms() - last_ms < 250)
+  //
+  // The hunt is the one case that cannot afford it. A message every 200 ms
+  // against four looks a second is a coin toss repeated slowly: minutes to
+  // catch what the acquisition is handing over sixty times a second.
+  if (!g_decode_force && !g_decode_hunt && timer_ms() - last_ms < 250)
     return;
 
   g_decode_force = false;
@@ -2339,6 +4121,8 @@ static void decode_update(void)
 
   if (!capture_get_record(&data, &size, &offset, &period_ns, &trig_pos))
     return;
+
+  uart_decode_set_baud(decoder_baud_value());
 
   // Sticky protocol: once something matched, try it alone first and only
   // fall back to the full auto cascade when it stops matching
@@ -2360,34 +4144,133 @@ static void decode_update(void)
         (LogicScratch *)CAPTURE_SPARE_RAM, &res);
   }
 
+  // A record can decode as UART and be, sample for sample, a square wave:
+  // 0x55 back to back at 115200 IS a 57.6 kHz square wave, and the "UUUU"
+  // preamble of a test message is exactly that. Nothing in such a record
+  // settles the question, so it is taken only once another record has - one
+  // that caught the line resting between frames. That first record is the
+  // proof; after it, the preamble decodes like everything else.
+  if (res.count > 0 && res.proto == PROTO_UART)
+  {
+    if (!res.ambiguous)
+      g_uart_locked = true;
+    else if (!g_uart_locked)
+      res.count = 0;
+  }
+
+  // Hunting: a record that is not the head of a message is not shown at all.
+  // Taking it would fill the panel with the middle of one, decoded from
+  // whatever phase the record happened to start in - which is the very thing
+  // the hunt is here to avoid. So it is dropped, the panel keeps what it had,
+  // and the next record gets its turn. Only the serial ones need the test:
+  // 1-Wire, WS2812 and NEC each match from their own leader, so a match is
+  // already a head.
+  if (g_decode_hunt)
+  {
+    if (res.count == 0 || res.proto == PROTO_RAW ||
+        (decode_proto_is_serial(res.proto) &&
+         !(res.burst_start && res.errors == 0)))
+      return;
+
+    g_decode_hunt = false;
+
+    if (capture_get_state() != CAPTURE_STATE_STOP)
+      capture_stop();
+
+    toast_show();
+    lcd_puts(GRID_LEFT, STATUS_LINE_Y, "Message start caught (STOP resumes)");
+  }
+
+  // Most records hold nothing to decode. A 200 ms burst is 2% of the time,
+  // and AUTO force-triggers on the idle line whenever the traffic keeps it
+  // waiting - so the acquisition hands over one empty record after another
+  // and only occasionally one with a message in it. Blanking the panel on
+  // every empty one is what makes a working decoder look like a broken one:
+  // the frames flash up for a quarter of a second and are gone. So the last
+  // frames stay on the panel, marked as held, until new ones replace them.
+  // Only STOP mode shows the record itself, and there the panel is live.
+  if (res.count == 0 && g_logic_have && g_logic.count > 0)
+  {
+    if (!g_decode_held)
+    {
+      g_decode_held = true;
+      g_decode_panel_pending = true;
+      redraw_miniview();   // the byte map belongs to a record that is gone
+      decode_band_build(); // and so do the marks on the trace
+    }
+
+    return;
+  }
+
   g_decode_period_ns = period_ns;
   g_decode_trig_pos = trig_pos;
   g_decode_size = size;
 
-  bool changed = !g_logic_have || res.count != g_logic.count ||
+  bool changed = !g_logic_have || g_decode_held || res.count != g_logic.count ||
       res.proto != g_logic.proto || res.rate != g_logic.rate ||
       memcmp(res.bytes, g_logic.bytes, (size_t)res.count) != 0;
 
   if (changed)
   {
     g_logic = res;
+
+    if (res.proto == PROTO_ONEWIRE)
+      g_pana.ow = *onewire_analysis();
+    else if (res.proto == PROTO_CAN)
+      g_pana.can = *can_analysis();
+    else if (res.proto == PROTO_DHT)
+      g_pana.dht = *dht_analysis();
+    else if (res.proto == PROTO_SENT)
+      g_pana.sent = *sent_analysis();
+    else if (res.proto == PROTO_MIDI)
+      g_pana.midi = *midi_analysis();
+    else if (res.proto == PROTO_LIN)
+      g_pana.lin = *lin_analysis();
+
     g_logic_have = true;
+    g_decode_held = false;
     g_decode_panel_pending = true;
+
+    // First lock on a rate: put the whole message on the screen. Once only -
+    // g_decode_fitted stays set until the decoder view is re-entered, so
+    // zooming into a byte afterwards sticks.
+    if (!g_decode_fitted && decode_proto_is_serial(res.proto) && res.rate > 0)
+    {
+      g_decode_fitted = true;
+      decode_fit_window(res.rate);
+    }
 
     if (g_decode_sel >= res.count)
       g_decode_sel = (res.count > 0) ? res.count - 1 : 0;
 
     // Stop-on-decode: RAW matches nearly anything, so it only counts as a
-    // catch when the user explicitly selected it
+    // catch when the user explicitly selected it.
+    //
+    // "At message start" narrows it further. The hardware triggers on an
+    // edge, and every bit in a frame is an edge, so a plain edge trigger
+    // freezes on whatever byte the line happened to be sending - a record
+    // out of the middle of a message, with its first frames missing. What
+    // marks a real start is what comes BEFORE it: a line at rest for longer
+    // than a frame. The decoder reports that as burst_start, so waiting for
+    // it turns "stop on frames" into "stop on the head of a message" and the
+    // record fills up forwards from there. Only the serial ones need asking:
+    // 1-Wire, WS2812 and NEC each match from their own leader or reset
+    // pulse, so a match already is the head of a message.
     if (config.decoder_stop && res.count > 0 &&
         (res.proto != PROTO_RAW || (proto_t)config.decoder_proto == PROTO_RAW) &&
+        (!config.decoder_stop_start || !decode_proto_is_serial(res.proto) ||
+            res.burst_start) &&
         capture_get_state() != CAPTURE_STATE_STOP)
       capture_stop();
   }
 
-  // The byte map lives in the miniview: repaint it when the result changed
+  // The byte map lives in the miniview, the byte marks on the trace itself:
+  // repaint both when the result changed
   if (changed)
+  {
     redraw_miniview();
+    decode_band_build();
+  }
 }
 
 //-----------------------------------------------------------------------------
@@ -2419,9 +4302,40 @@ static void decode_jump_to_selected(void)
 }
 
 //-----------------------------------------------------------------------------
+// First byte of a `width`-wide window over `count` bytes that keeps `sel`
+// in view, centred where it can be and clamped at either end
+static int window_base(int sel, int width, int count)
+{
+  int base = sel - width / 2;
+
+  if (base > count - width)
+    base = count - width;
+
+  return (base < 0) ? 0 : base;
+}
+
+//-----------------------------------------------------------------------------
 // Decoded-bytes overlay, drawn after a trace sweep completes so the sweep
 // does not immediately paint over it (unchanged columns are skipped by the
 // dirty-column logic, which keeps the panel intact on a stable signal)
+#define DECODE_HEX_COLS   8   // per row, two rows of them
+#define DECODE_CHAR_W     6   // FONT_SMALL is 6x8
+
+//-----------------------------------------------------------------------------
+// What byte `idx` is, in a word, for the row under the hex. Never empty: a
+// byte the protocol has no name for still holds its place in the row, or the
+// labels stop lining up with the numbers they belong to.
+static void decode_byte_label(char *buf, int size, int idx)
+{
+  dband_meaning_text(buf, size, idx, g_logic.bytes[idx]);
+
+  if (!buf[0])
+    snprintf(buf, size, "..");
+}
+// The text row is 30 characters wide and the outer two are the < > that say
+// the message runs on past what is shown
+#define DECODE_TEXT_MAX  26
+
 static void draw_decode_panel(void)
 {
   char line[36];
@@ -2440,45 +4354,304 @@ static void draw_decode_panel(void)
   }
   else
   {
-    // The 16-byte window follows the selected byte
-    int show = (g_logic.count < 16) ? g_logic.count : 16;
-    int base = g_decode_sel - 8;
+    // The panel is a window onto the result, not the result: two rows of
+    // eight is all the hex that fits. That looked exactly like a 16-byte
+    // limit until the header started saying how many bytes there are, so
+    // "0123456789ABCDEF" out of a 32-byte message reads as a window with
+    // more to its right, and TRIG_UP/DN is visibly the way to it.
+    int hex_base = window_base(g_decode_sel, DECODE_HEX_COLS * 2, g_logic.count);
+    bool text = decode_proto_is_text();
+    int sel_start = g_decode_sel, sel_len = 1;
 
-    if (base > g_logic.count - show)
-      base = g_logic.count - show;
+    decode_group_at(g_decode_sel, &sel_start, &sel_len);
+    // Text is what a console line is for and this row is 30 characters wide,
+    // so it shows nearly twice the bytes the hex rows do. On a protocol that
+    // carries no text the same row says what the bytes ARE instead - ADDR,
+    // ~ADDR, CMD, ~CMD for a remote control - and that is written out in
+    // words, so it follows the hex window and fits as many as it can.
+    int txt_show = (g_logic.count < DECODE_TEXT_MAX) ? g_logic.count : DECODE_TEXT_MAX;
+    int txt_base = text ? window_base(g_decode_sel, DECODE_TEXT_MAX, g_logic.count)
+        : hex_base;
 
-    if (base < 0)
-      base = 0;
+    if (!text)
+    {
+      // The label row is a flow of words, not eight fixed columns, so it
+      // holds far fewer of them than there are numbers above it, and how many
+      // depends on how long the words are. Two things follow from that, and
+      // both were missing.
+      //
+      // It has to SCROLL with the selection. Eight nibbles all fit the hex
+      // rows, so hex_base never moves, so a label row anchored to it would
+      // never draw the last labels of the frame however far the cursor
+      // walked - the CRC of a SENT frame was unreachable.
+      //
+      // And it has to SAY SO. A row that stops after "S1=543" with nothing
+      // to mark the edge reads as a decoder that ran out of things to name,
+      // which is the one reading it must never invite: the frame was whole,
+      // the panel was narrow.
+      int budget = DECODE_PANEL_W - 8 - 2 * DECODE_CHAR_W;  // the < > columns
+      int limit = hex_base + DECODE_HEX_COLS * 2;
 
-    lcd_puts(DECODE_PANEL_X + 4, DECODE_PANEL_Y + 4, g_logic.info);
+      txt_base = hex_base;
+
+      for (int guard = 0; guard < DECODE_HEX_COLS * 2; guard++)
+      {
+        int px = 0;
+        int i = txt_base;
+
+        // One label per GROUP, not per byte: three nibbles that are one
+        // signal get one "S1=543" across them
+        while (i < g_logic.count && i < limit)
+        {
+          char lab[16];
+          int gs, gl, w;
+
+          decode_group_at(i, &gs, &gl);
+          decode_byte_label(lab, sizeof(lab), gs + gl - 1);
+          w = ((int)strlen(lab) + (i > txt_base ? 1 : 0)) * DECODE_CHAR_W;
+
+          if (px + w > budget)
+            break;
+
+          px += w;
+          i = gs + gl;   // always past i: idx lies inside its own group
+        }
+
+        txt_show = i - txt_base;
+
+        if (txt_show < 1)
+          txt_show = 1;  // a label wider than the panel still holds its place
+
+        if (g_decode_sel < txt_base + txt_show ||
+            txt_base + txt_show >= limit || txt_base + txt_show >= g_logic.count)
+          break;
+
+        txt_base++;
+      }
+    }
+
+    // The header's range describes the hex rows, which are what its numbers
+    // are counting. The label row keeps its own markers, because it is a
+    // narrower window onto the same bytes and the two edges do not coincide.
+    int win_show = txt_show;
+
+    if (!text)
+    {
+      win_show = g_logic.count - hex_base;
+
+      if (win_show > DECODE_HEX_COLS * 2)
+        win_show = DECODE_HEX_COLS * 2;
+    }
+
+    bool more_left = text ? (txt_base > 0) : (hex_base > 0);
+    bool more_right = text ? (txt_base + win_show < g_logic.count)
+        : (hex_base + win_show < g_logic.count);
+    // ...and separately, whether the labels under them ran out of width
+    bool lab_more_left = !text && (txt_base > 0);
+    bool lab_more_right = !text && (txt_base + txt_show < g_logic.count);
+
+    // The header counts what was decoded; when the panel cannot show all of
+    // it, it counts what is on the panel out of it instead. "45B" and
+    // "12-37/45" are the difference between a complete dump and a view of
+    // one, and the panel is a view of one far more often than not.
+    if (more_left || more_right)
+      snprintf(line, sizeof(line), "%.20s %d-%d/%d", g_logic.info,
+          txt_base + 1, txt_base + win_show, g_logic.count);
+    else
+      snprintf(line, sizeof(line), "%.24s %dB", g_logic.info, g_logic.count);
+
+    lcd_puts(DECODE_PANEL_X + 4, DECODE_PANEL_Y + 4, line);
 
     for (int row = 0; row < 2; row++)
     {
-      for (int i = 0; i < 8; i++)
+      for (int i = 0; i < DECODE_HEX_COLS; i++)
       {
-        int idx = base + row * 8 + i;
+        int idx = hex_base + row * DECODE_HEX_COLS + i;
 
         if (idx >= g_logic.count)
           break;
 
+        // The selected byte, and lit behind it the others that make up the
+        // same character. Two bytes for one letter is a thing to be SHOWN;
+        // a word in the corner saying "UTF-8" leaves the reader to work out
+        // which of the numbers in front of them go together.
+        bool grouped = (sel_len > 1 && idx >= sel_start && idx < sel_start + sel_len);
+
         snprintf(line, sizeof(line), "%02X", g_logic.bytes[idx]);
-        lcd_set_color(BG_COLOR,
-            (idx == g_decode_sel) ? DSTRIP_SEL : LCD_WHITE_COLOR);
+        lcd_set_color(BG_COLOR, (idx == g_decode_sel) ? DSTRIP_SEL :
+            grouped ? DSTRIP_GROUP : LCD_WHITE_COLOR);
         lcd_puts(DECODE_PANEL_X + 4 + i * 18, DECODE_PANEL_Y + 14 + row * 9, line);
       }
     }
 
-    char *p = line;
-
-    for (int i = 0; i < show && p < line + 32; i++)
+    if (text)
     {
-      uint8_t ch = g_logic.bytes[base + i];
-      *p++ = (ch >= 32 && ch < 127) ? (char)ch : '.';
+      // The text, between the markers that say which way the rest of it lies.
+      // The left one holds its column whether or not it is needed, so the
+      // text does not shift sideways by a character as the window scrolls.
+      //
+      // One place per CHARACTER, not per byte: a two-byte UTF-8 character
+      // gets a single '?' rather than two dots. The font cannot draw it - it
+      // is 6x8 ASCII - but the count is the point. Four dots where two
+      // characters were sent reads as a decode that went wrong; two
+      // placeholders read as text this screen cannot show, which is what it
+      // is.
+      char *p = line;
+
+      *p++ = more_left ? '<' : ' ';
+
+      for (int i = 0; i < txt_show; )
+      {
+        uint8_t ch = g_logic.bytes[txt_base + i];
+        int len = utf8_len(&g_logic.bytes[txt_base + i], txt_show - i);
+
+        if (len > 1)
+        {
+          *p++ = '?'; // one character, however many bytes it took
+          i += len;
+        }
+        else
+        {
+          *p++ = (ch >= 32 && ch < 127) ? (char)ch : '.';
+          i++;
+        }
+      }
+
+      if (more_right)
+        *p++ = '>';
+
+      *p = 0;
+      lcd_set_color(BG_COLOR, MEASURE_FREQ_COLOR);
+      lcd_puts(DECODE_PANEL_X + 4, DECODE_PANEL_Y + 34, line);
+    }
+    else
+    {
+      // What the bytes above ARE. The decoder worked this out to decode them
+      // at all - which byte of a NEC frame is the command, which byte of a
+      // WS2812 pixel is green - and it was only being said on the trace, at
+      // zooms where a byte is wide enough to write in. Here it costs a row
+      // that was showing four full stops.
+      //
+      // Written label by label rather than as one string, so the selected one
+      // can be lit the way its number is lit above it.
+      //
+      // And shaded by the parity of the byte it belongs to, because a space
+      // between labels cannot be told from a space inside one: "READ ROM" and
+      // "ID=123" are single labels, and a row that reads them as two puts
+      // every label after them under the wrong number. The row is one flow of
+      // text - it cannot line up with the eight fixed hex columns above it -
+      // so the shade is what says where one label ends.
+      int x = DECODE_PANEL_X + 4;
+
+      // The marker column is held whether or not it is needed, so the labels
+      // do not shift sideways by a character as the row scrolls
+      lcd_set_color(BG_COLOR, CAPTURE_WAIT_COLOR);
+      lcd_puts(x, DECODE_PANEL_Y + 34, lab_more_left ? "<" : " ");
+      x += DECODE_CHAR_W;
+
+      for (int i = txt_base; i < txt_base + txt_show; )
+      {
+        char lab[16];
+        int gs, gl;
+
+        decode_group_at(i, &gs, &gl);
+        decode_byte_label(lab, sizeof(lab), gs + gl - 1);
+
+        if (i > txt_base)
+          x += DECODE_CHAR_W; // the space between labels
+
+        // Lit for the group the cursor is in, whichever of its bytes that is
+        bool sel = (g_decode_sel >= gs && g_decode_sel < gs + gl);
+
+        lcd_set_color(BG_COLOR, sel ? DSTRIP_SEL :
+            (gs & 1) ? MPANEL_DIM(MEASURE_FREQ_COLOR) : MEASURE_FREQ_COLOR);
+        lcd_puts(x, DECODE_PANEL_Y + 34, lab);
+        x += (int)strlen(lab) * DECODE_CHAR_W;
+
+        i = gs + gl;
+      }
+
+      if (lab_more_right)
+      {
+        lcd_set_color(BG_COLOR, CAPTURE_WAIT_COLOR);
+        lcd_puts(x + DECODE_CHAR_W, DECODE_PANEL_Y + 34, ">");
+      }
     }
 
-    *p = 0;
-    lcd_set_color(BG_COLOR, MEASURE_FREQ_COLOR);
-    lcd_puts(DECODE_PANEL_X + 4, DECODE_PANEL_Y + 34, line);
+    // Bottom row: why what is above may not be the whole story.
+    //
+    // "hold" - the frames are older than the record on the screen, so a panel
+    // that stopped changing reads as "nothing new since" and not as "this is
+    // what is on the wire now".
+    //
+    // "cut" - a record is a window, and a message wider than the window comes
+    // out cut. Four bytes of forty look like a broken decoder right up until
+    // the record length is on the screen next to them.
+    // The row is 29 characters and these compete for it, so they go in in
+    // order of what would mislead most if it were left out: frames that are
+    // not from this record, then a record that did not hold the message,
+    // then a panel that is only a view of what it did hold. The last one has
+    // its own < > markers on the text row and can afford to lose the words.
+    // Any protocol can be cut off by the end of the record - a NEC frame is
+    // 67.5 ms of it - so overrun speaks for all of them. Only the serial ones
+    // also report a record that started mid-message, because only they have
+    // an idle line to have started in the middle of.
+    bool cut = g_logic.overrun ||
+        (decode_proto_is_serial(g_logic.proto) && !g_logic.burst_start);
+    // Fewer characters than bytes is what "not plain ASCII" actually means,
+    // and it is a count rather than a claim: "18 bytes, 12 characters" says
+    // the line is mostly ASCII with some of it not, which is what a mixed
+    // message is. A bare "UTF-8" says nothing about how much, or where.
+    int chars = text ? utf8_char_count(g_logic.bytes, g_logic.count) : g_logic.count;
+    bool utf8 = (chars < g_logic.count);
+
+    // The label row runs out of width long before the hex rows run out of
+    // columns, and TRIG_UP/DN is the way to the rest of it just the same
+    bool more = more_left || more_right || lab_more_left || lab_more_right;
+
+    if (g_decode_held || cut || more || utf8)
+    {
+      int64_t span_us = ((int64_t)g_decode_size * g_decode_period_ns) / 1000;
+      char *q = line;
+      size_t left = sizeof(line);
+
+      if (g_decode_held)
+        q += snprintf(q, left, "hold ");
+
+      left = sizeof(line) - (size_t)(q - line);
+
+      if (cut)
+      {
+        q += snprintf(q, left, "cut: rec %d.%02dms", (int)(span_us / 1000),
+            (int)(span_us % 1000) / 10);
+        left = sizeof(line) - (size_t)(q - line);
+      }
+
+      // The encoding goes before the navigation hint: it changes how what is
+      // already on the screen should be read, which the hint does not.
+      // Sitting on a multi-byte character it says which one - the same
+      // U+xxxx the band writes on the trace, so the two views agree instead
+      // of one being specific and the other waving at the topic.
+      if (sel_len > 1 && (q - line) + 11 <= 29)
+      {
+        q += snprintf(q, left, "%sU+%04X %dB", (q == line) ? "" : " ",
+            (unsigned)utf8_code_point(&g_logic.bytes[sel_start], sel_len), sel_len);
+        left = sizeof(line) - (size_t)(q - line);
+      }
+      else if (utf8 && (q - line) + 15 <= 29)
+      {
+        q += snprintf(q, left, "%sUTF-8 %dch/%dB", (q == line) ? "" : " ",
+            chars, g_logic.count);
+        left = sizeof(line) - (size_t)(q - line);
+      }
+
+      // 29 characters at 6 px each is the panel's width
+      if (more && (q - line) + 17 <= 29)
+        snprintf(q, left, "%smore: TRIG_UP/DN", (q == line) ? "" : " ");
+
+      lcd_set_color(BG_COLOR, CAPTURE_WAIT_COLOR);
+      lcd_puts(DECODE_PANEL_X + 4, DECODE_PANEL_Y + 43, line);
+    }
   }
 
   lcd_set_font(FONT_LARGE);
@@ -2576,8 +4749,10 @@ static void draw_fft_panel(void)
 
   fft_format_hz(num1, sizeof(num1), g_fft_an.bin_hz);
   fft_format_hz(num2, sizeof(num2), g_fft_an.nyquist_hz);
-  snprintf(line, sizeof(line), "df %-9s BW %s%s", num1, num2,
-      g_fft_band_auto ? "" : "*");
+  snprintf(line, sizeof(line), "df %-9s BW %s%s%s", num1, num2,
+      g_fft_band_auto ? "" : "*",
+      (g_fft_hold_mode == FFT_HOLD_MAX) ? " M" :
+      (g_fft_hold_mode == FFT_HOLD_AVG) ? " A" : "");
   fft_panel_row(row++, MEASURE_FREQ_COLOR, line);
 
   for (int i = 0; i < g_fft_an.count && i < FFT_PANEL_ROWS; i++)
@@ -2620,6 +4795,96 @@ static void draw_fft_panel(void)
 }
 
 //-----------------------------------------------------------------------------
+// SHIFT+50P: find the narrowest pulse anywhere in the record and pan to it.
+//
+// The screen shows 300 of 98304 samples; a runt that fires once per record
+// is practically invisible on the live trace and an edge trigger never
+// singles it out. Scanning the whole record after the fact does. Runs on the
+// STOPPED record - on a live one the glitch would be overwritten before the
+// pan lands on it - so it stops acquisition first, exactly like STOP.
+static void find_glitch(void)
+{
+  Measure m;
+  const uint8_t *data;
+  int size, offset, period_ns, trigger_timepos;
+  int width = 0, count = 0, pos, mid, hyst;
+  int64_t t_ns;
+  char msg[48], wtxt[12];
+  bool high = false;
+
+  if (capture_get_state() != CAPTURE_STATE_STOP)
+  {
+    capture_stop();
+    draw_capture_state();
+  }
+
+  if (!capture_get_raw_measure_fresh(&m) || !capture_get_record(&data, &size,
+      &offset, &period_ns, &trigger_timepos))
+    return;
+
+  if ((m.pk_hi - m.pk_lo) < 6)
+  {
+    toast_show();
+    lcd_puts(GRID_LEFT, STATUS_LINE_Y, "No signal to search");
+    return;
+  }
+
+  // The frequency counter's own Schmitt pair, so "a pulse" means the same
+  // thing here as it does there
+  mid = (m.pk_lo + m.pk_hi) / 2;
+  hyst = (m.pk_hi - m.pk_lo) * 20 / 100;
+
+  if (hyst < 2)
+    hyst = 2;
+
+  pos = measure_find_min_pulse(data, size, offset, mid - hyst, mid + hyst,
+      &width, &high, &count);
+
+  if (pos < 0)
+  {
+    toast_show();
+    lcd_puts(GRID_LEFT, STATUS_LINE_Y, "No pulses in the record");
+    return;
+  }
+
+  // Pan the view onto the pulse: its center in trigger-relative time is
+  // exactly what horizontal_position means
+  t_ns = (int64_t)(pos - trigger_timepos) * period_ns;
+
+  if (t_ns < MIN_HORIZONTAL_POSITION)
+    t_ns = MIN_HORIZONTAL_POSITION;
+  else if (t_ns > MAX_HORIZONTAL_POSITION)
+    t_ns = MAX_HORIZONTAL_POSITION;
+
+  config.horizontal_position = t_ns;
+  config.horizontal_position_px =
+      (int)(config.horizontal_position / hs_px_value[config.horizontal_scale]);
+
+  draw_horizontal_position();
+  update_sample_rate();
+  refresh_view();
+
+  {
+    int64_t w_ps = (int64_t)width * period_ns * 1000;
+
+    format_ps((w_ps > 0x7fffffff) ? 0x7fffffff : (int)w_ps, wtxt, sizeof(wtxt));
+  }
+
+  // The tie count is the verdict: "x1" is a genuine outlier worth staring
+  // at, "x2481" is the signal's own half-periods quantized by the sample
+  // clock - nothing anomalous in the record at all
+  if (count > 1)
+    snprintf(msg, sizeof(msg), "Min %s pulse: %s x%d (STOP resumes)",
+        high ? "high" : "low", wtxt, count);
+  else
+    snprintf(msg, sizeof(msg), "Min %s pulse: %s (STOP resumes)",
+        high ? "high" : "low", wtxt);
+
+  toast_show();
+  lcd_puts(GRID_LEFT, STATUS_LINE_Y, msg);
+}
+
+//-----------------------------------------------------------------------------
 // Put the trigger level at the mid point between the measured signal
 // extremes (the classic 50% button). Draw-free public form for the system
 // menu; the scope's own button path wraps it with the marker redraw.
@@ -2640,6 +4905,48 @@ static void trigger_set_50_percent(void)
 {
   scope_trigger_50_percent();
   draw_trigger_level();
+}
+
+//-----------------------------------------------------------------------------
+// Enter the decoder view: drop every conclusion the last session reached, put
+// the trigger where a logic signal wants it, and set the scope up from the
+// rate when the rate is already known.
+//
+// Told BOTH the protocol and the rate, there is nothing left to work out from
+// a record, so there is no reason to look at a random one: the window, the
+// trigger and the hunt for a message start can all be set before the first
+// record arrives. That is the difference between reading a message and first
+// having to catch one.
+static void decode_mode_enter(void)
+{
+  g_decode_mode = true;
+  g_fft_mode = false;
+  g_trend_mode = false;
+  g_logic_have = false;
+  g_decode_held = false;
+  g_uart_locked = false;
+  g_decode_fitted = false;
+  g_decode_hunt = false;
+  g_decode_sel = 0;
+  g_decode_force = true; // show something without waiting for the throttle
+  trigger_set_50_percent();
+
+  if (decoder_baud_value() > 0 && config.decoder_fit_mode == 0 &&
+      (proto_t)config.decoder_proto == PROTO_UART)
+  {
+    decode_arm_hunt(); // window, trigger and the hunt in one
+  }
+  else if (decoder_baud_value() > 0)
+  {
+    g_decode_fitted = true;
+    decode_fit_window(decoder_baud_value());
+  }
+
+  decode_update();
+  g_decode_panel_pending = true;
+  g_shadow_valid = false;
+  g_sweep_force = true;
+  update_display();
 }
 
 //-----------------------------------------------------------------------------
@@ -3771,6 +6078,20 @@ static void draw_calibration_info(void)
 //-----------------------------------------------------------------------------
 static void draw_status_line(void)
 {
+  // The trend view and the cursors each own the whole line while they are
+  // up; both repaint it themselves, toast expiry included
+  if (g_trend_mode)
+  {
+    trend_readout();
+    return;
+  }
+
+  if (g_cursor_sel && !g_fft_mode && !g_decode_mode)
+  {
+    cursor_readout();
+    return;
+  }
+
   lcd_fill_rect(GRID_LEFT, GRID_BOTTOM+1, GRID_WIDTH+1, STATUS_LINE_HEIGHT, BG_COLOR);
 
   draw_vertical_scale();
@@ -3826,6 +6147,19 @@ void scope_buttons_handler(int buttons)
   if (g_fft_mode && !scope_calibration_mode)
   {
     if (fft_buttons(buttons, shift, repeat))
+      return;
+  }
+
+  if (g_trend_mode && !scope_calibration_mode)
+  {
+    if (trend_buttons(buttons, shift, repeat))
+      return;
+  }
+
+  if (g_cursor_sel && !g_fft_mode && !g_decode_mode && !g_trend_mode &&
+      !scope_calibration_mode)
+  {
+    if (cursor_buttons(buttons, shift, repeat))
       return;
   }
 
@@ -3899,27 +6233,19 @@ void scope_buttons_handler(int buttons)
     if (shift)
     {
       // SHIFT+EDGE: toggle the protocol decoder view
-      g_decode_mode = !g_decode_mode;
-
-      if (g_decode_mode)
+      if (!g_decode_mode)
       {
-        g_fft_mode = false;
-        g_logic_have = false;
-        g_decode_sel = 0;
-        g_decode_force = true; // show something without waiting for the throttle
-        trigger_set_50_percent();
-        decode_update();
-        g_decode_panel_pending = true;
-        g_shadow_valid = false;
-        g_sweep_force = true;
-        update_display();
+        decode_mode_enter();
       }
       else
       {
+        g_decode_mode = false;
+        g_decode_hunt = false;
         g_shadow_valid = false;
         g_sweep_force = true;
         update_display();
-        redraw_miniview(); // restore the decorative wave over the byte map
+        redraw_miniview();   // restore the decorative wave over the byte map
+        decode_band_build(); // and clear the byte marks off the trace
       }
 
       draw_status_line();
@@ -3977,6 +6303,7 @@ void scope_buttons_handler(int buttons)
 
     config.ac_coupling = !config.ac_coupling;
 
+    scope_display_settings_changed(); // the DC level just moved
     capture_set_vertical_parameters();
     draw_ac_dc();
   }
@@ -4003,6 +6330,7 @@ void scope_buttons_handler(int buttons)
       // SHIFT+MODE: toggle the FFT spectrum view
       g_fft_mode = !g_fft_mode;
       g_decode_mode = false;
+      g_trend_mode = false;
       g_shadow_valid = false;
       g_sweep_force = true;
       draw_status_line();
@@ -4053,11 +6381,42 @@ void scope_buttons_handler(int buttons)
     if (repeat || scope_calibration_mode)
       return;
 
-    trigger_set_50_percent();
+    if (shift)
+      find_glitch();
+    else
+      trigger_set_50_percent();
   }
 
   else if (buttons & BTN_SAVE)
   {
+    if (repeat || scope_calibration_mode)
+      return;
+
+    if (shift)
+    {
+      trend_toggle();
+      return;
+    }
+
+    // Cursors live on the waveform view only
+    if (g_fft_mode || g_decode_mode || g_trend_mode)
+      return;
+
+    if (g_cursor_sel == 0 && g_cursor_t[0] == g_cursor_t[1])
+    {
+      // Never used yet: park the pairs two divisions around the view centre
+      int64_t div_ns = hs_div_value[config.horizontal_scale];
+      int div_mv = vs_px_value[config.vertical_scale] * GRID_DIV_PX;
+
+      g_cursor_t[0] = config.horizontal_position - 2 * div_ns;
+      g_cursor_t[1] = config.horizontal_position + 2 * div_ns;
+      g_cursor_v[0] = config.vertical_position_mv + 2 * div_mv;
+      g_cursor_v[1] = config.vertical_position_mv - 2 * div_mv;
+    }
+
+    g_cursor_sel = (g_cursor_sel + 1) % 5;
+    g_cursor_dirty = true;
+    draw_status_line(); // hands the line to the readout - or back
   }
 
   else if (buttons & BTN_STOP)
@@ -4065,7 +6424,7 @@ void scope_buttons_handler(int buttons)
     if (capture_get_state() == CAPTURE_STATE_STOP)
       capture_start();
     else
-      capture_stop();
+      capture_stop_view(); // freeze what the display shows, not the live ring
   }
 }
 
@@ -4123,7 +6482,9 @@ void scope_init(bool calibration_mode)
   timer_add(&g_pan_settle_timer);
   timer_add(&g_fps_timer);
   timer_add(&g_fft_timer);
+  timer_add(&g_trend_timer);
   g_fps_timer = 1000;
+  g_trend_timer = TREND_INTERVAL_MS;
 
   g_measure_timer = config.measure_display ? MEASURE_UPDATE_TIMEOUT : TIMER_DISABLE;
 
@@ -4202,6 +6563,8 @@ void scope_task(void)
         autoset_step();
       else if (g_fft_mode)
         fft_tick();
+      else if (g_trend_mode)
+        capture_consume_frame(); // keep acquisition flowing under the plot
       else
       {
         update_display();
@@ -4212,11 +6575,78 @@ void scope_task(void)
     }
   }
 
+  // A cursor moved: repaint the sweep once the current one is done. The
+  // overlay is composited into the columns, so the shadow cache is stale.
+  if (g_cursor_dirty && trace_ready() && !g_fft_mode && !g_trend_mode)
+  {
+    g_cursor_dirty = false;
+    g_shadow_valid = false;
+    update_display();
+  }
+
+  // The trend logger ticks whether or not its view is open. A stopped scope
+  // logs nothing: its record is frozen and the "measurements" would flatline.
+  if (g_trend_timer == 0)
+  {
+    ScopeMeasure sm;
+
+    g_trend_timer = TREND_INTERVAL_MS;
+
+    if (capture_get_state() != CAPTURE_STATE_STOP && !scope_calibration_mode &&
+        !g_autocal_active && capture_get_measurements(&sm))
+    {
+      trend_push(sm.frequency, sm.vrms_mv, sm.duty_x10);
+
+      if (g_trend_mode)
+      {
+        trend_view_update();
+        trend_readout();
+      }
+    }
+  }
+
   // A RUN/STOP transition switches the active record (decimated storage vs
   // full-rate capture buffer): the decode and its positions must follow.
   // Only STOP matters here — capture_get_state() also flips WAIT<->TRIG on
   // every single acquisition, and reacting to that ran the whole decoder
   // cascade dozens of times a second with the throttle bypassed.
+  //
+  // Asked for from the menu, done here: the menu is a screen over the scope
+  // and the scope does not draw while it is open
+  if (g_decode_hunt_request)
+  {
+    g_decode_hunt_request = false;
+
+    if (!g_decode_mode)
+    {
+      decode_mode_enter(); // which arms the hunt itself when it can
+      draw_status_line();
+    }
+
+    if (!g_decode_hunt)
+      decode_arm_hunt();
+  }
+
+  // A stop may swap the record under the frozen trace (an AUTO stop
+  // publishes the live ring, up to one sweep newer than the drawn frame;
+  // see capture_stop_view): repaint from the actual frozen record NOW,
+  // so the first pan/zoom does not silently morph the trace into it.
+  {
+    static int prev_stopped = -1;
+    int stopped = (capture_get_state() == CAPTURE_STATE_STOP);
+
+    if (stopped != prev_stopped && trace_ready())
+    {
+      prev_stopped = stopped;
+
+      if (stopped && !g_fft_mode && !g_trend_mode && !scope_calibration_mode)
+      {
+        g_shadow_valid = false;
+        update_display();
+      }
+    }
+  }
+
   if (g_decode_mode)
   {
     static int prev_stopped = -1;
@@ -4232,8 +6662,9 @@ void scope_task(void)
 
   // Same for the spectrum: STOP is where the analysis matters most. A
   // stopped acquisition delivers no more frames, so nothing else would ever
-  // re-run it — and the record it freezes is the full-rate one, four times
-  // longer than the storage record the running view analyzes.
+  // re-run it — and the record it freezes may have swapped (an AUTO stop
+  // publishes the raw ring, four times longer than the storage record the
+  // running view analyzes; a NORMAL/SINGLE one keeps the snapshot).
   if (g_fft_mode)
   {
     static int prev_stopped = -1;
@@ -4245,6 +6676,32 @@ void scope_task(void)
       g_fft_timer = TIMER_DISABLE;
       fft_update();
     }
+  }
+
+  // The snapshot tag's lifecycle. On/off transitions cover stop/start from
+  // every path (the button, the decode hunt, the glitch finder); the
+  // sweep-completion repaint self-heals after anything that repainted the
+  // whole grid over it (a view switch, the menu closing) - any such repaint
+  // runs a sweep, and the sweep's hole spares the tag columns from then on.
+  {
+    static bool was_ready = true;
+    bool ready = trace_ready();
+    bool want = capture_stopped_on_snapshot() && !g_fft_mode &&
+        !g_trend_mode && !scope_calibration_mode;
+
+    if (want != g_snap_tag)
+    {
+      g_snap_tag = want;
+
+      if (want)
+        snap_tag_paint();
+      else
+        overlay_repaint_region(0, SNAP_TAG_H); // put the trace back
+    }
+    else if (want && ready && !was_ready)
+      snap_tag_paint();
+
+    was_ready = ready;
   }
 
   if (g_autoset_active && g_autoset_timer == 0)

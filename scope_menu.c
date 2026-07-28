@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * Oscilloscope application menu
  *
@@ -21,6 +22,7 @@
 #include "capture.h"
 #include "ui.h"
 #include "menu_widget.h"
+#include "logic_decode.h" // the protocol labels are indexed by proto_t
 #include "scope.h"
 
 /*- Implementations ---------------------------------------------------------*/
@@ -67,13 +69,37 @@ static const char *const g_measure_panel_labels[] = { "On", "Off" };
 // trigger readouts, which is what an empty slot means.
 static const char *const g_measure_slot_labels[] =
 {
-  "Off", "Vpp", "Frequency", "Duty", "Vrms", "Vavg", "Type", "THD",
+  "Off", "Vpp", "Frequency", "Duty", "Vrms", "Vavg", "Type", "THD", "Jitter",
 };
 
+// The slot choice cycles through MEASURE_COUNT entries, so this array MUST
+// have one label per enum value - a missing one is an out-of-bounds read,
+// not a cosmetic gap
+_Static_assert(ARRAY_SIZE(g_measure_slot_labels) == MEASURE_COUNT,
+    "one label per MEASURE_* value");
+
+// In proto_t order, so the index the config stores IS the protocol number
 static const char *const g_decoder_proto_labels[] =
 {
-  "Auto", "UART", "1-Wire", "WS2812", "NEC IR", "Raw",
+  "Auto", "UART", "1-Wire", "WS2812", "NEC IR", "Raw", "Servo PWM", "CAN",
+  "DHT11/22", "SENT", "MIDI", "LIN",
 };
+
+_Static_assert(ARRAY_SIZE(g_decoder_proto_labels) == PROTO_COUNT,
+    "one label per proto_t value, in its order");
+
+// On is index 0 so a config saved before the setting existed reads as on
+static const char *const g_decoder_fit_labels[] = { "On", "Off" };
+static const char *const g_decoder_bits_labels[] = { "On", "Off" };
+
+//-----------------------------------------------------------------------------
+// The scope does the work on its next tick, once this menu is off the screen
+static void action_decode_catch(const void *arg)
+{
+  (void)arg;
+  scope_decode_catch_start();
+  menu_close_popups();
+}
 
 //-----------------------------------------------------------------------------
 // Help pages
@@ -88,6 +114,13 @@ static const char *const g_scope_help_lines[] =
   "  WS2812/NEC/raw; TRIG_UP/DN jump bytes",
   "AUTO        - Auto-setup (scale/trigger)",
   "50%         - Trigger level to mid-signal",
+  "SHIFT+50%   - Find the narrowest pulse in",
+  "  the record (stops) and pan to it",
+  "SAVE        - Cursors T1>T2>V1>V2>off;",
+  "  arrows drag (SHIFT x10), line shows",
+  "  dT, 1/dT, dV",
+  "SHIFT+SAVE  - Trend view: 1 Hz log of",
+  "  f/Vrms/duty; EDGE metric, MODE clears",
   "STOP        - Freeze: pan/zoom/measure/",
   "  decode/spectrum on the frozen record",
   "TRIG / EDGE - Trigger mode / edge",
@@ -109,6 +142,9 @@ static const char *const g_spectrum_help_lines[] =
   "SHIFT+MODE - enter/leave   MODE - panel",
   "LEFT/RIGHT - cursor   UP/DOWN - peaks",
   "TRIG_UP/DN - wider span / finer df",
+  "EDGE - hold: off / Max (M) / Avg (A);",
+  "  max pins whatever ever appeared, avg",
+  "  sinks the noise floor ~9 dB",
   "SHIFT+L/R - timebase  SHIFT+U/D - volts",
   "",
   "The whole record is transformed, so the",
@@ -128,6 +164,279 @@ static const info_page_t g_page_spectrum_help =
   .title = "Spectrum (FFT)",
   .lines = g_spectrum_help_lines,
   .count = ARRAY_SIZE(g_spectrum_help_lines),
+};
+
+// The decoder reads the whole record, and the record is what the TIMEBASE
+// makes it - which is the one thing that decides whether a message decodes
+// at all, and the one thing that is not obvious from the decoder panel
+static const char *const g_decoder_help_lines[] =
+{
+  "SHIFT+EDGE - enter/leave",
+  "TRIG_UP/DN - step through the bytes,",
+  "  the view follows the selected one",
+  "",
+  "Decoded bytes are marked on the",
+  "trace itself: a tick where each",
+  "frame starts, and the value written",
+  "in where the byte is wide enough.",
+  "The panel shows 16 of them at a",
+  "time and the header the total.",
+  "",
+  "Zoom in far enough and a grey grid",
+  "appears over the trace: a hairline",
+  "at every bit boundary and, in each",
+  "cell, the NUMBER of the bit that",
+  "landed there - S for the start bit,",
+  "0..7 for the data, P for the stop.",
+  "The lines are exactly as tall as the",
+  "waveform is - a two-volt square wave",
+  "gets two volts of line - and they",
+  "are blended, not painted, so nothing",
+  "they cross is hidden.",
+  "The waveform already shows the level;",
+  "what it cannot show is which bit that",
+  "level became. 0 marks the LSB, so",
+  "the bit ORDER is on the screen too.",
+  "Decoder > Bit grid turns it off.",
+  "Only UART, MIDI, LIN and raw get it:",
+  "those four sample a byte on an even",
+  "grid, so dividing it evenly puts the",
+  "lines exactly where the decoder",
+  "looked. NEC, DHT, 1-Wire and SENT",
+  "time every bit on its own and CAN",
+  "stuffs extra ones in, so an even",
+  "grid would be lines in places",
+  "nothing was ever read - and a grid",
+  "you cannot trust is worse than none.",
+  "",
+  "Given the protocol AND the baud,",
+  "entering the view sets the timebase",
+  "and the trigger and then hunts: the",
+  "trigger goes to Normal on the edge a",
+  "start bit is, one division from the",
+  "left, and every record is decoded",
+  "until one is the head of a message.",
+  "It freezes there. Decoder > Catch a",
+  "message start does it on demand;",
+  "Set up from the rate turns it off.",
+  "",
+  "No edge means 'message start' - each",
+  "bit is an edge too. What marks one",
+  "is the idle BEFORE it, and that can",
+  "only be checked after the record is",
+  "taken. Hence hunting rather than",
+  "triggering.",
+  "",
+  "The whole record is decoded, so the",
+  "TIMEBASE decides what fits: a 24K",
+  "record needs >=3 samples per bit at",
+  "one end and the whole message inside",
+  "it at the other. 45 bytes at 115200",
+  "is 3.9 ms and wants 500 us/div.",
+  "",
+  "A message longer than the record is",
+  "decoded as far as it reached: the",
+  "panel says 'cut' and how long the",
+  "record was. '+' means more bytes",
+  "than the 64 a result holds.",
+  "",
+  "Most records hold nothing - a burst",
+  "is a few ms out of every 200. The",
+  "last frames stay up, marked 'hold',",
+  "so they do not flash past.",
+  "",
+  "Baud is found by trying every rate",
+  "that fits and keeping the one whose",
+  "frames explain most of the record.",
+  "Fix it in UART baud if the record",
+  "holds too few frames to be sure.",
+  "",
+  "Stop on frames freezes on a match.",
+  "...at message start waits for a",
+  "record that caught the line idle",
+  "first, so the freeze lands on the",
+  "head of a message, not its middle.",
+  "",
+  "On 1-Wire the transaction is read,",
+  "not just the bytes: the family code",
+  "under its CRC and the scratchpad",
+  "behind READ SP name the part.",
+  "DS18B20 comes out as the reading",
+  "itself - 'DS18B20 +25.06C 12b' - and",
+  "an intercom key as 'DS1990 key",
+  "ROM ok'. Same slots, same decoder;",
+  "what tells them apart is which",
+  "command framed the bytes.",
+  "A CRC that does not check out names",
+  "nothing and says 'CRC!' instead.",
+  "Every scratchpad byte is labelled,",
+  "reserved ones included - a byte with",
+  "nothing under it reads as one the",
+  "decoder could not account for. Bytes",
+  "5 and 7 hold FF and 10 on a working",
+  "part, so 'RSV!' behind a good CRC is",
+  "the part itself differing.",
+  "Byte 4 tells the DS18S20 from the",
+  "DS18B20: a config register reads",
+  "1F/3F/5F/7F, the older part has none",
+  "and reads FF. On it bytes 6 and 7 are",
+  "COUNT REMAIN and COUNT PER C, and the",
+  "reading comes out in sixteenths from",
+  "them - '+25.00C ext'.",
+  "",
+  "CAN reads either wire of the pair:",
+  "recessive is wherever the line rests,",
+  "so CAN_H, CAN_L and a transceiver's",
+  "TX all decode. The rate is found from",
+  "the standard list, 10k to 1M.",
+  "Every frame is confirmed by its own",
+  "CRC-15 before it is shown, and a",
+  "record with none is refused - which",
+  "is why CAN can run first without",
+  "taking anyone else's records.",
+  "'NAK' on the last byte means the",
+  "frame was correct and nobody on the",
+  "bus acknowledged it. CAN FD is",
+  "recognised and declined: its data",
+  "phase changes rate mid-frame.",
+  "",
+  "DHT11/22 send forty bits whose HIGH",
+  "carries the value: 26 us is a zero,",
+  "70 a one, over a 50 us low. Five",
+  "bytes, the fifth their sum, and no",
+  "sum means no frame.",
+  "The two parts are identical on the",
+  "wire and differ in the numbers: a",
+  "DHT11 sends whole units and leaves",
+  "the fractional bytes at zero, a DHT22",
+  "sends tenths across both. Reading one",
+  "as the other gives 1152 % humidity,",
+  "which is what decides it. If both fit",
+  "the 18 ms start pulse settles it, and",
+  "if it was off-screen the header says",
+  "so with a '?'.",
+  "",
+  "What makes up ONE value is shown as",
+  "one: three SENT nibbles, four CAN id",
+  "bytes, two DHT bytes. They light",
+  "together and the value is written",
+  "once across them, the way UTF-8 does",
+  "with a letter. The numbers above stay",
+  "one per byte - a byte is what was on",
+  "the wire.",
+  "Where there are groups the band grows",
+  "a third row, and the three go from",
+  "the specific to the general as they",
+  "leave the trace: the number, then",
+  "what that byte is (D1 D2 D3), then",
+  "the value they make (S1=394).",
+  "Labels alternate in brightness - a",
+  "space between two of them looks just",
+  "like the space inside 'READ ROM'.",
+  "The label row is narrower than the",
+  "hex rows, so it scrolls on its own",
+  "and marks its edges with < >: a row",
+  "that just stops reads as a decoder",
+  "out of names, not as a narrow panel.",
+  "",
+  "SENT has no clock and no bits: the",
+  "time from one falling edge to the",
+  "next is the nibble, 12 ticks for 0",
+  "and 27 for 15. The tick is not agreed",
+  "in advance - each frame opens with a",
+  "56-tick sync pulse, and dividing by",
+  "56 gives the sensor's own unit time.",
+  "Six data nibbles read as two 12-bit",
+  "signals, three as one. Both of the",
+  "CRCs J2716 blessed are accepted; a",
+  "frame matching neither is shown only",
+  "when SENT is picked by name.",
+  "A nibble needs a closing edge, so a",
+  "record that ends before it holds a",
+  "frame with no CRC in it - the last",
+  "measured nibble is data and is not",
+  "labelled CRC. It reads 'cut'.",
+  "SENT needs >=4 samples per tick: at",
+  "3 us that is 750 ns a sample, so",
+  "0.2 to 1 ms/div.",
+  "",
+  "MIDI is 8N1 at 31250 baud and no",
+  "other rate, so the framing is a",
+  "UART's and the rate is half the",
+  "evidence. The other half is the",
+  "grammar: bit 7 says status or data,",
+  "and a status byte says how many data",
+  "bytes follow it. A record with no",
+  "status byte in it is not read as",
+  "MIDI at all - that is what ASCII at",
+  "31250 looks like.",
+  "Running status leaves the status byte",
+  "out and sends the data alone; those",
+  "bytes are still shown as the message",
+  "they make. Clock, Start and Stop are",
+  "one byte and may land in the MIDDLE",
+  "of a note - the note carries on in a",
+  "group of its own afterwards.",
+  "Notes read as names, 60 = C4, and a",
+  "note on at velocity 0 reads 'Off'",
+  "because that is what it is.",
+  "Pitch bend is signed from centre.",
+  "A whole message settles it; a record",
+  "of nothing but clock bytes needs the",
+  "line RESTING between them, which a",
+  "square wave never does.",
+  "A fault in the traffic - a message",
+  "the next status cut short, a data",
+  "byte with no status left in front of",
+  "it - is counted and shown as 'err'.",
+  "It does not hand the record to the",
+  "UART decoder, which would read the",
+  "same byte as an ordinary one and say",
+  "nothing about it.",
+  "31250 baud is 32 us a bit: 0.2 to",
+  "2 ms/div, and the whole record holds",
+  "about 40 messages.",
+  "",
+  "LIN is the cheap one-wire bus in a",
+  "car door. A frame is BREAK, sync,",
+  "PID, 1-8 data, checksum - and after",
+  "the break it is plain 8N1.",
+  "The break is >=13 dominant bits and",
+  "8N1 cannot send more than nine, so",
+  "it identifies the bus outright.",
+  "The sync byte is 0x55: nine runs of",
+  "exactly one bit, eight bit times",
+  "between the first falling edge and",
+  "the last. That IS the rate - nothing",
+  "is guessed and no baud list is used,",
+  "which is why 1k to 20k all decode.",
+  "The PID carries two parity bits over",
+  "six identifier bits; the panel shows",
+  "the identifier, with a '!' when the",
+  "parity does not hold.",
+  "Both checksums are tried - classic",
+  "(LIN 1.3, data only) and enhanced",
+  "(2.x, PID included) - and a bus that",
+  "has shown one is tried that way",
+  "first. Whichever agreed is named in",
+  "the header, 'cls' or 'enh'.",
+  "IDs 3C and 3D are diagnostic and",
+  "always classic, so nothing is said",
+  "there; their first three bytes read",
+  "NAD, PCI and the service name.",
+  "A header with nothing after it says",
+  "'no resp': the master asked and no",
+  "slave on the wire owns that ID,",
+  "which is what unplugged looks like.",
+  "19200 is 52 us a bit, 9600 is 104:",
+  "0.5 to 5 ms/div.",
+};
+
+static const info_page_t g_page_decoder_help =
+{
+  .title = "Decoder",
+  .lines = g_decoder_help_lines,
+  .count = ARRAY_SIZE(g_decoder_help_lines),
 };
 
 //-----------------------------------------------------------------------------
@@ -167,6 +476,9 @@ static const menu_item_t g_panel_items[] =
     .u.toggle = { &config.show_type, NULL } },
   { .kind = MI_TOGGLE, .label = "THD",
     .u.toggle = { &config.show_thd, NULL } },
+  { .kind = MI_TOGGLE, .label = "Jitter",
+    .desc = "Period sigma ~ peak-to-peak",
+    .u.toggle = { &config.show_jitter, NULL } },
 };
 
 // The status line: exactly two values in the large font, and the user says
@@ -200,9 +512,53 @@ static const menu_item_t g_measure_items[] =
 static const menu_item_t g_decoder_items[] =
 {
   { .kind = MI_CHOICE, .label = "Protocol",
-    .u.choice = { &config.decoder_proto, g_decoder_proto_labels, 6, NULL } },
+    .u.choice = { &config.decoder_proto, g_decoder_proto_labels,
+        ARRAY_SIZE(g_decoder_proto_labels), NULL } },
+  { .kind = MI_CHOICE, .label = "UART baud",
+    .desc = "Auto reads it off the record",
+    .u.choice = { &config.decoder_baud, decoder_baud_labels,
+        DECODER_BAUD_COUNT, NULL } },
   { .kind = MI_TOGGLE, .label = "Stop on frames",
+    .desc = "Freeze the record on a match",
     .u.toggle = { &config.decoder_stop, NULL } },
+  { .kind = MI_TOGGLE, .label = "  ...at message start",
+    .desc = "Only after the line was idle",
+    .u.toggle = { &config.decoder_stop_start, NULL } },
+  { .kind = MI_CHOICE, .label = "Set up from the rate",
+    .desc = "Timebase and trigger, once",
+    .u.choice = { &config.decoder_fit_mode, g_decoder_fit_labels, 2, NULL } },
+  { .kind = MI_CHOICE, .label = "Bit grid",
+    .desc = "Bit lines and numbers on the trace",
+    .u.choice = { &config.decoder_bits_mode, g_decoder_bits_labels, 2,
+        scope_decode_redraw } },
+  { .kind = MI_SEPARATOR },
+  { .kind = MI_ACTION, .label = "Catch a message start",
+    .desc = "Arm and freeze on the first one",
+    .u.action = { action_decode_catch, NULL } },
+};
+
+//-----------------------------------------------------------------------------
+// Display processing: persistence and averaging. Both accumulate per-column
+// state inside the scope; a toggle mid-run must drop it.
+static void display_processing_changed(void)
+{
+  scope_display_settings_changed();
+}
+
+static const char *const g_average_labels[] =
+{
+  "Off", "4 frames", "8 frames", "16 frames", "32 frames", "64 frames",
+};
+
+static const menu_item_t g_display_items[] =
+{
+  { .kind = MI_TOGGLE, .label = "Persistence",
+    .desc = "Envelope accumulates over frames",
+    .u.toggle = { &config.display_persist, display_processing_changed } },
+  { .kind = MI_CHOICE, .label = "Averaging",
+    .desc = "Mean of N triggered frames",
+    .u.choice = { &config.average_mode, g_average_labels,
+        ARRAY_SIZE(g_average_labels), display_processing_changed } },
 };
 
 // The four parameters the calibration screen edits, and the order the
@@ -374,8 +730,6 @@ static const menu_item_t g_calib_items[] =
   { .kind = MI_SEPARATOR },
   { .kind = MI_TOGGLE, .label = "Calibration mode",
     .u.toggle = { &scope_calibration_mode, scope_calibration_changed } },
-  { .kind = MI_ACTION, .label = "How to calibrate",
-    .u.action = { menu_action_info, &g_page_calib_help } },
 };
 
 static const menu_item_t g_scope_items[] =
@@ -384,14 +738,12 @@ static const menu_item_t g_scope_items[] =
     .u.submenu = { g_trigger_items, ARRAY_SIZE(g_trigger_items) } },
   { .kind = MI_SUBMENU, .label = "Measurements",
     .u.submenu = { g_measure_items, ARRAY_SIZE(g_measure_items) } },
+  { .kind = MI_SUBMENU, .label = "Display",
+    .u.submenu = { g_display_items, ARRAY_SIZE(g_display_items) } },
   { .kind = MI_SUBMENU, .label = "Decoder",
     .u.submenu = { g_decoder_items, ARRAY_SIZE(g_decoder_items) } },
   { .kind = MI_SUBMENU, .label = "Calibration",
     .u.submenu = { g_calib_items, ARRAY_SIZE(g_calib_items) } },
-  { .kind = MI_ACTION, .label = "Scope Functions",
-    .u.action = { menu_action_info, &g_page_scope_help } },
-  { .kind = MI_ACTION, .label = "Spectrum (FFT)",
-    .u.action = { menu_action_info, &g_page_spectrum_help } },
 };
 
 const menu_def_t scope_menu =
@@ -399,4 +751,26 @@ const menu_def_t scope_menu =
   .title = "Oscilloscope",
   .items = g_scope_items,
   .count = ARRAY_SIZE(g_scope_items),
+};
+
+// The read-only pages. They are not settings, so they do not sit among the
+// settings: the system menu folds them into its Help section, next to the
+// pages every other application contributes.
+static const menu_item_t g_scope_help_items[] =
+{
+  { .kind = MI_ACTION, .label = "Scope Functions",
+    .u.action = { menu_action_info, &g_page_scope_help } },
+  { .kind = MI_ACTION, .label = "Spectrum (FFT)",
+    .u.action = { menu_action_info, &g_page_spectrum_help } },
+  { .kind = MI_ACTION, .label = "Decoder",
+    .u.action = { menu_action_info, &g_page_decoder_help } },
+  { .kind = MI_ACTION, .label = "Calibration",
+    .u.action = { menu_action_info, &g_page_calib_help } },
+};
+
+const menu_def_t scope_help_menu =
+{
+  .title = "Oscilloscope",
+  .items = g_scope_help_items,
+  .count = ARRAY_SIZE(g_scope_help_items),
 };

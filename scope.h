@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2019-2020, Alex Taradov <alex@taradov.com>
+ * Copyright (c) 2026, Niaz Leushkin <niazlv03@gmail.com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -34,13 +35,23 @@
 #include "menu_widget.h"
 
 /*- Variables ---------------------------------------------------------------*/
-// The scope's section of the system menu, see scope_menu.c
+// The scope's section of the system menu and its pages in the menu's Help
+// section, see scope_menu.c
 extern const menu_def_t scope_menu;
+extern const menu_def_t scope_help_menu;
 
 // Calibration mode: the scope screen turns into the calibration UI (raw ADC
 // readout plus one adjustable parameter). The menu toggles this directly and
 // then calls scope_calibration_changed().
 extern bool scope_calibration_mode;
+
+// UART decoder rate table. config.decoder_baud indexes both arrays; index 0
+// is "Auto" and a zero rate, which is what the decoder reads as "work it out
+// from the record". Labels and rates live together so a menu entry cannot
+// drift away from the rate it names.
+#define DECODER_BAUD_COUNT  9
+extern const char *const decoder_baud_labels[DECODER_BAUD_COUNT];
+extern const int decoder_baud_values[DECODER_BAUD_COUNT];
 
 /*- Prototypes --------------------------------------------------------------*/
 void scope_init(bool calibration_mode);
@@ -66,6 +77,19 @@ void scope_calib_apply(bool touch_dac);
 int scope_calib_ref_mv(void);
 void scope_set_vertical_scale(int scale);
 int scope_get_fps(void);
+
+// Point the scope at the head of a message: decoder view on, trigger on a
+// start bit and at the left of the screen, window from the rate, and every
+// record decoded until one arrives that caught the line idle before its
+// first frame. Freezes on that one. Takes effect on the scope's next tick,
+// so it is safe to call from a menu.
+void scope_decode_catch_start(void);
+void scope_decode_redraw(void);
+
+// Forget the accumulated persistence envelope and averaging state: the menu
+// calls it when it toggles either feature; the scope itself calls it on
+// every pan/zoom/scale change
+void scope_display_settings_changed(void);
 
 // Live state of the measurements panel, for the System Info page: this is
 // the path that has gone blank after an auto-setup, and the flags below say
