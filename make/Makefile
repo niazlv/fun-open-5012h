@@ -117,6 +117,7 @@ SRCS += \
   ../src/ui/menu_widget.c \
   ../src/ui/launcher.c \
   ../src/ui/system_menu.c \
+  ../src/ui/key_remap.c \
   ../src/ui/flash_viewer.c \
   ../src/ui/fonts.c \
   ../src/ui/images.c \

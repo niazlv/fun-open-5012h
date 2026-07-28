@@ -26,6 +26,7 @@
 #include "ui.h"
 #include "menu_widget.h"
 #include "input.h"
+#include "key_remap.h"
 #include "launcher.h"
 #include "system_menu.h"
 
@@ -279,11 +280,22 @@ static const char *const g_key_bindings_lines[] =
   "scroll and closes on any key at all.",
   "",
   INFO_HEAD "Remappable keys",
-  "  F1 F2 SAVE AUTO AC/DC 1X/10X",
+  "  F1 F2 SAVE AUTO AC/DC",
   "  STOP EDGE 50% TRIG TRIG_UP/DOWN",
+  "",
+  "MENU > General Settings > Remap Keys sets",
+  "what each of them does, and can turn one off",
+  "altogether. A key pointed at another key stays",
+  "pointed there under SHIFT too.",
   "",
   INFO_HEAD "Protected system keys",
   "  UP DOWN LEFT RIGHT MODE MENU SHIFT",
+  "",
+  "The menus are driven with these, so no mapping",
+  "can take away the way back out of one. 1X/10X",
+  "is among them without looking like it: on this",
+  "board it is the SHIFT key, one wire and one bit",
+  "under two names.",
 };
 
 static const info_page_t g_page_key_bindings =
@@ -342,6 +354,13 @@ static void shift_mode_changed(void)
 }
 
 //-----------------------------------------------------------------------------
+static void action_key_remap(const void *arg)
+{
+  (void)arg;
+  key_remap_open();
+}
+
+//-----------------------------------------------------------------------------
 // Menu tables (const, in flash). config changes are persisted automatically
 // by config_task once the struct CRC goes stale.
 //-----------------------------------------------------------------------------
@@ -353,6 +372,8 @@ static const menu_item_t g_general_items[] =
     .u.toggle = { &config.shift_mode_enabled, shift_mode_changed } },
   { .kind = MI_TOGGLE, .label = "Key Remap",
     .u.toggle = { &config.key_remapping_enabled, NULL } },
+  { .kind = MI_ACTION, .label = "Remap Keys...",
+    .u.action = { action_key_remap, NULL } },
 };
 
 static const menu_item_t g_advanced_items[] =
