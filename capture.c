@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2019-2020, Alex Taradov <alex@taradov.com>
+ * Copyright (c) 2026, Niaz Leushkin <niazlv03@gmail.com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -144,6 +145,12 @@ static volatile int g_next_buf_ptr;
 static volatile int g_trigger_ptr;
 static volatile int g_count;
 static volatile int g_remaining;
+// Bytes the CURRENT sweep has written since its dma_start (saturating).
+// capture_stop() may only publish the raw ring as the record once this
+// reaches CAPTURE_BUFFER_SIZE: until then the ring's tail still holds the
+// previous sweep's samples, and the seam between the two reads as a signal
+// discontinuity (i.e. a phantom glitch) to every whole-record consumer.
+static volatile int g_sweep_bytes;
 static volatile int g_auto_mode_count;
 static volatile bool g_auto_mode_stop;
 static volatile bool g_triggered;
@@ -538,6 +545,7 @@ static inline void dma_start(void)
   g_trigger_ptr    = 0;
   g_count          = 0;
   g_remaining      = 0;
+  g_sweep_bytes    = 0;
   g_triggered      = false;
   g_auto_mode_stop = false;
 
@@ -610,6 +618,11 @@ void irq_handler_dma1_channel2(void)
   uint8_t *active_buffer = (uint8_t *)g_capture_buffer + g_active_buf_ptr;
 
   DMA1->INTC0 = DMA1_INTC0_FTFIFC2_Msk;
+
+  // Saturating: a NORMAL-mode sweep with no trigger runs indefinitely, and
+  // all capture_stop() ever asks is "did this sweep lap the ring yet"
+  if (g_sweep_bytes < 2 * CAPTURE_BUFFER_SIZE)
+    g_sweep_bytes += g_dma_buffer_size;
 
   if (DMA1->CH2CTL_b.MBS)
     DMA1->CH2M0ADDR = (uint32_t)g_capture_buffer + g_next_buf_ptr;
@@ -706,23 +719,91 @@ void capture_start(void)
 }
 
 //-----------------------------------------------------------------------------
-void capture_stop(void)
+static void capture_stop_ex(bool fresh_record)
 {
   if (g_stopped)
     return;
 
   dma_stop();
 
-  // A stopped scope reads the RAW ring instead of the decimated storage
-  // record (snapshot_active_info), and in dual-channel mode every odd byte
-  // of that ring is still wired bit-reversed: the display, the decoders and
-  // the spectrum would all analyze garbage on alternate samples. Undo the
-  // interleave once, here, exactly like the single-shot stop in dma_finish()
-  // already does.
+  // Publish the raw ring as the record - the full 786 us of history at the
+  // ring's own rate, instead of the 24K storage snapshot (196 us at best)
+  // that the last dma_finish() left behind. Only possible when the current
+  // sweep has lapped the whole ring: a younger sweep's tail still holds the
+  // previous sweep's bytes, and the time seam between the two would read as
+  // a phantom edge to the glitch finder and every other whole-record scan.
+  // In that case the storage snapshot simply stays the record, as before.
+  //
+  // And only WANTED when the ring is what the user is watching. The display
+  // never shows the ring while running - it shows the storage snapshot of
+  // the last COMPLETED acquisition - and the ring under it belongs to the
+  // next sweep already. In AUTO the two differ by at most one sweep, so the
+  // full ring is the better record. But a NORMAL stop can come seconds or
+  // minutes after the trigger that produced the frozen frame (a caught
+  // protocol burst), and the ring then holds nothing but untriggered signal
+  // from AFTER it: publishing it silently swapped the catch for junk at the
+  // first pan/zoom. Same for STOP on an armed SINGLE re-arm. A view stop
+  // (fresh_record=false, the RUN/STOP button) keeps the snapshot there;
+  // machine stops (the decode hunt, the glitch finder) always want the
+  // freshest, longest record and pass fresh_record=true.
+  if (g_sweep_bytes >= CAPTURE_BUFFER_SIZE &&
+      (fresh_record || TRIGGER_MODE_AUTO == g_trigger_mode ||
+       g_buffer_generation == 0))
+  {
+    // The write position comes from the frozen DMA registers, NOT from
+    // update_capture_buffer(): its g_next_buf_ptr arithmetic only holds
+    // between an FTF interrupt and the pointer updates at the bottom of the
+    // handler, i.e. inside dma_finish(). Out here it is one block ahead -
+    // and whether the final FTF was serviced before dma_stop() masked it is
+    // a race, so the software pointers are ambiguous by one whole block.
+    // The active memory-buffer register (MBS selects which) always holds
+    // the start of the block being written, and CH2CNT what remains of it.
+    int pos = (int)((DMA1->CH2CTL_b.MBS ? DMA1->CH2M1ADDR : DMA1->CH2M0ADDR)
+        - (uint32_t)g_capture_buffer) + (g_dma_buffer_size - dma_get_count());
+
+    g_capture_buffer_info.offset = pos % CAPTURE_BUFFER_SIZE;
+
+    // No trigger this sweep yet: synthesize one at the usual screen
+    // position, the same way an expired auto-mode sweep does
+    if (!g_triggered)
+      g_trigger_ptr = (g_capture_buffer_info.offset + g_trigger_offset)
+          % CAPTURE_BUFFER_SIZE;
+
+    g_capture_buffer_info.trigger = g_trigger_ptr;
+    g_capture_buffer_info.valid   = true;
+  }
+
+  // A published ring is read directly (snapshot_active_info), and in
+  // dual-channel mode every odd byte of it is still wired bit-reversed: the
+  // display, the decoders and the spectrum would all analyze garbage on
+  // alternate samples. Undo the interleave once, here, exactly like the
+  // single-shot stop in dma_finish() already does.
   if (g_dual_channel)
     buffer_reverse((uint32_t)g_capture_buffer, CAPTURE_BUFFER_SIZE);
 
   g_stopped = true;
+}
+
+//-----------------------------------------------------------------------------
+void capture_stop(void)
+{
+  capture_stop_ex(true);
+}
+
+//-----------------------------------------------------------------------------
+void capture_stop_view(void)
+{
+  capture_stop_ex(false);
+}
+
+//-----------------------------------------------------------------------------
+// Is the frozen record only the 24K storage snapshot rather than the raw
+// ring? True after a view-preserving NORMAL/SINGLE stop and after any stop
+// too young to have lapped the ring: zoom resolution and pan range are then
+// limited to what the snapshot holds, and the display shows that.
+bool capture_stopped_on_snapshot(void)
+{
+  return g_stopped && !g_capture_buffer_info.valid && g_buffer_generation > 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -808,10 +889,15 @@ void capture_set_horizontal_parameters(int sr_divider, int trigger_offset)
 
   // Decide the record mode here rather than per acquisition: it only depends
   // on the timebase and the pan, and capture_get_record_period() has to be
-  // able to answer before the first frame under the new settings lands
+  // able to answer before the first frame under the new settings lands.
+  // Never relabel a STOPPED record though - panning a frozen full-rate
+  // window past the point where it "no longer fits" must not stretch its
+  // stored samples 4x; the stored period is a fact about the stored data.
   g_record_full_rate = record_window_fits(g_sample_period);
-  g_storage_buffer_info.period = g_record_full_rate ?
-      g_sample_period : (g_sample_period * STORAGE_BUFFER_RATIO);
+
+  if (!g_stopped)
+    g_storage_buffer_info.period = g_record_full_rate ?
+        g_sample_period : (g_sample_period * STORAGE_BUFFER_RATIO);
 
   if (g_auto_mode_count < CAPTURE_BUFFER_SIZE)
     g_auto_mode_count = CAPTURE_BUFFER_SIZE;
@@ -1133,6 +1219,11 @@ static bool get_measurements_ex(ScopeMeasure *out, bool fresh)
   out->vmid_mv   = (int)((int64_t)((m.pk_hi + m.pk_lo) / 2 - ZERO_POINT) * mult / CALIB_MULTIPLIER);
   out->frequency = m.frequency;
   out->duty_x10  = m.duty_x10;
+  out->period_med_ns = m.period_med_ns;
+  out->period_min_ns = m.period_min_ns;
+  out->period_max_ns = m.period_max_ns;
+  out->jitter_rms_ps = m.jitter_rms_ps;
+  out->jitter_pp_ps  = m.jitter_pp_ps;
   out->periods   = m.periods;
   out->period_good_pct = m.period_good_pct;
   out->level_pct = m.level_pct;
@@ -1200,11 +1291,14 @@ uint32_t capture_get_generation(void)
 //---------------------------------------------------------------------
 // Sample period of the record consumers actually see, which is the ring's
 // only while the full-rate window applies (see update_storage_window); a
-// stopped scope always reads the raw ring.
+// stopped scope reads the raw ring whenever one whole sweep of it exists.
+// Both branches return the info's own period, not g_sample_period: a
+// timebase change while stopped retunes the hardware for the NEXT run, but
+// the frozen record keeps the rate it was captured at.
 int capture_get_record_period(void)
 {
   if (g_stopped && g_capture_buffer_info.valid)
-    return g_sample_period;
+    return g_capture_buffer_info.period;
 
   return g_storage_buffer_info.period;
 }

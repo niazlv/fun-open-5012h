@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2019-2020, Alex Taradov <alex@taradov.com>
+ * Copyright (c) 2026, Niaz Leushkin <niazlv03@gmail.com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -81,6 +82,11 @@ typedef struct
   int      duty_x10;   // 0.1% units, -1 when n/a
   // How much the frequency above can be trusted: noise crosses the mid
   // level constantly and would otherwise read as a signal
+  int      period_med_ns;   // median period and its extremes over the record
+  int      period_min_ns;
+  int      period_max_ns;
+  int      jitter_rms_ps;   // period stddev / spread, ps; -1 when n/a
+  int      jitter_pp_ps;
   int      periods;         // whole periods the record held
   int      period_good_pct; // % of them within +-25% of the median
   int      level_pct;       // % of samples resting at one of the two levels:
@@ -92,7 +98,16 @@ typedef struct
 void capture_init(void);
 void capture_disable_clock(void);
 void capture_start(void);
+// Machine stop (decode hunt, glitch finder): publishes the freshest, longest
+// record - the raw ring - whenever the sweep has lapped it
 void capture_stop(void);
+// User stop (the RUN/STOP button): freezes what the display shows. In NORMAL
+// and SINGLE that keeps the storage snapshot of the last triggered frame
+// instead of letting the live ring replace it; AUTO still takes the ring.
+void capture_stop_view(void);
+// The frozen record is only the 24K storage snapshot (zoom/pan is limited to
+// what it holds) - the trace view shows a tag while this is true
+bool capture_stopped_on_snapshot(void);
 void capture_set_vertical_parameters(void);
 void capture_set_horizontal_parameters(int sr_divider, int trigger_offset);
 void capture_set_trigger_level(int level);
