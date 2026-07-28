@@ -6738,6 +6738,110 @@ int main(void)
         shift_mode_is_active(), 0, 0);
   }
 
+  // ============================= key remap ==============================
+  //
+  // The translation is a table of "this key acts as that one", and the cases
+  // that matter are the ones where the table points at itself: a swap, and a
+  // chain. Rewriting the bits in place got both wrong, because a key whose
+  // button another key had just been mapped onto had that bit cleared again
+  // when its own turn in the table came round.
+  printf("key remap:\n");
+  {
+    config.shift_mode_enabled = false;
+    config.key_remapping_enabled = false;
+    key_remap_reset();
+    input_init();
+
+    // Off: the table is not consulted at all
+    key_remap_set(key_remap_index_of(BTN_F1), BTN_AUTO);
+    check_near("disabled: F1 stays F1", input_translate(BTN_F1), BTN_F1, 0);
+
+    config.key_remapping_enabled = true;
+    check_near("enabled: F1 acts as AUTO", input_translate(BTN_F1), BTN_AUTO, 0);
+    check_near("AUTO itself is untouched", input_translate(BTN_AUTO), BTN_AUTO, 0);
+
+    // The identity costs nothing and is what an untouched config holds
+    key_remap_reset();
+    check_near("reset: default table", key_remap_is_default(), 1, 0);
+    check_near("reset: F1 is F1 again", input_translate(BTN_F1), BTN_F1, 0);
+
+    for (int i = 0; i < key_remap_count(); i++)
+    {
+      uint32_t key = key_remap_button(i);
+
+      if (input_translate(key) != (int)key)
+        check_near("default table is the identity", i, -1, 0);
+    }
+
+    // A swap, both keys held at once
+    key_remap_set(key_remap_index_of(BTN_F1), BTN_SAVE);
+    key_remap_set(key_remap_index_of(BTN_SAVE), BTN_F1);
+    check_near("swap: F1 alone", input_translate(BTN_F1), BTN_SAVE, 0);
+    check_near("swap: SAVE alone", input_translate(BTN_SAVE), BTN_F1, 0);
+    check_near("swap: both held", input_translate(BTN_F1 | BTN_SAVE),
+        BTN_F1 | BTN_SAVE, 0);
+
+    // A chain: F1 lands on F2's button while F2 is pointed elsewhere. Order
+    // of the table must not decide the outcome.
+    key_remap_reset();
+    key_remap_set(key_remap_index_of(BTN_F1), BTN_F2);
+    key_remap_set(key_remap_index_of(BTN_F2), BTN_TRIG);
+    check_near("chain: F1 alone", input_translate(BTN_F1), BTN_F2, 0);
+    check_near("chain: both held", input_translate(BTN_F1 | BTN_F2),
+        BTN_F2 | BTN_TRIG, 0);
+
+    // A chord holding a system key remaps the rest of itself, and the system
+    // key comes through as it was
+    key_remap_reset();
+    key_remap_set(key_remap_index_of(BTN_F1), BTN_AUTO);
+    check_near("SHIFT+F1 keeps SHIFT", input_translate(BTN_SHIFT | BTN_F1),
+        BTN_SHIFT | BTN_AUTO, 0);
+    check_near("MENU is never rewritten", input_translate(BTN_MENU), BTN_MENU, 0);
+    check_near("repeats survive translation",
+        input_translate(BTN_F1 | BTN_REPEAT), BTN_AUTO | BTN_REPEAT, 0);
+
+    // A key turned off drops out of the state and takes nothing with it
+    key_remap_set(key_remap_index_of(BTN_F1), 0);
+    check_near("off: F1 does nothing", input_translate(BTN_F1), 0, 0);
+    check_near("off: the rest of the chord stands",
+        input_translate(BTN_F1 | BTN_EDGE), BTN_EDGE, 0);
+    check_near("off is not the default", key_remap_is_default(), 0, 0);
+
+    // Only a remappable key can be a target: a system key is not one
+    key_remap_reset();
+    key_remap_set(key_remap_index_of(BTN_F1), BTN_MENU);
+    check_near("MENU is refused as a target", input_translate(BTN_F1), BTN_F1, 0);
+
+    // While a capture is open the buttons arrive as they were pressed, or
+    // the editor would record what the key already acts as
+    key_remap_set(key_remap_index_of(BTN_F1), BTN_AUTO);
+    input_capture_set(true);
+    check_near("capture: raw F1", input_translate(BTN_F1), BTN_F1, 0);
+    input_capture_set(false);
+    check_near("capture off: F1 acts as AUTO again",
+        input_translate(BTN_F1), BTN_AUTO, 0);
+
+    // The table the previous firmware wrote had a twelfth entry, so every
+    // key from index five down reads one place out. It only ever held the
+    // identity, so it is recognised and dropped rather than migrated.
+    static const uint32_t old_table[12] =
+    {
+      BTN_F1, BTN_F2, BTN_SAVE, BTN_AUTO, BTN_AC_DC, BTN_1X_10X,
+      BTN_STOP, BTN_EDGE, BTN_50P, BTN_TRIG_UP, BTN_TRIG_DOWN, BTN_TRIG,
+    };
+
+    key_remap_reset();
+    memcpy(config.key_mapping, old_table, sizeof(old_table));
+    input_init();
+    check_near("old table is dropped", key_remap_is_default(), 1, 0);
+    check_near("old table leaves no tail", config.key_mapping[11], 0, 0);
+    check_near("EDGE does not come up as STOP",
+        input_translate(BTN_EDGE), BTN_EDGE, 0);
+
+    config.key_remapping_enabled = false;
+    key_remap_reset();
+  }
+
   printf("\n%s (%d failures)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
   return g_failures ? 1 : 0;
 }

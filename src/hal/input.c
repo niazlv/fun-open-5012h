@@ -17,7 +17,9 @@
 
 /*- Definitions -------------------------------------------------------------*/
 #define SHIFT_DOUBLE_CLICK_MS   500
-#define REMAP_KEY_COUNT         12
+#define REMAP_KEY_COUNT         11
+#define KEY_MAPPING_SLOTS       ((int)(sizeof(config.key_mapping) / \
+                                       sizeof(config.key_mapping[0])))
 
 // The armed marker goes in the gap the status corner leaves between the
 // rightmost readout (the scope's sample rates end at x 278) and the battery
@@ -47,48 +49,201 @@ static struct
   uint32_t taps;
 } g_shift;
 
-// Keys eligible for remapping; navigation and system keys are excluded
+static bool g_capture;
+
+// Keys eligible for remapping, in the order the editor lists them. Navigation
+// and system keys are absent by construction, and that is the whole
+// protection: nothing here can rewrite the keys the menus are driven with, so
+// no mapping can lock the user out of the editor that made it.
+//
+// 1X/10X is absent for a different reason - on this hardware it IS the shift
+// key. PE12 is read as BTN_1X_10X, and BTN_1X_10X and BTN_SHIFT are the same
+// bit (17), so an entry for it was only ever an entry for SHIFT, and the
+// system-key check below threw it out again on every press.
 static const uint32_t g_remap_keys[REMAP_KEY_COUNT] =
 {
-  BTN_F1, BTN_F2, BTN_SAVE, BTN_AUTO, BTN_AC_DC, BTN_1X_10X,
+  BTN_F1, BTN_F2, BTN_SAVE, BTN_AUTO, BTN_AC_DC,
   BTN_STOP, BTN_EDGE, BTN_50P, BTN_TRIG_UP, BTN_TRIG_DOWN, BTN_TRIG,
 };
 
-#define SYSTEM_KEYS_MASK  (BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT | \
-    BTN_MODE | BTN_MENU | BTN_SHIFT)
+static const char *const g_remap_names[REMAP_KEY_COUNT] =
+{
+  "F1", "F2", "SAVE", "AUTO", "AC/DC",
+  "STOP", "EDGE", "50%", "TRIG_UP", "TRIG_DN", "TRIG",
+};
 
 /*- Implementations ---------------------------------------------------------*/
+
+//-----------------------------------------------------------------------------
+int key_remap_count(void)
+{
+  return REMAP_KEY_COUNT;
+}
+
+//-----------------------------------------------------------------------------
+const char *key_remap_name(int index)
+{
+  if (index < 0 || index >= REMAP_KEY_COUNT)
+    return "";
+
+  return g_remap_names[index];
+}
+
+//-----------------------------------------------------------------------------
+uint32_t key_remap_button(int index)
+{
+  if (index < 0 || index >= REMAP_KEY_COUNT)
+    return 0;
+
+  return g_remap_keys[index];
+}
+
+//-----------------------------------------------------------------------------
+int key_remap_index_of(uint32_t button)
+{
+  if (0 == button)
+    return -1;
+
+  for (int i = 0; i < REMAP_KEY_COUNT; i++)
+  {
+    if (button == g_remap_keys[i])
+      return i;
+  }
+
+  return -1;
+}
+
+//-----------------------------------------------------------------------------
+// A slot holds a button, KEY_MAP_NONE for a key that has been turned off, or
+// zero for one that was never touched - which is the identity, so a default
+// config needs nothing written into it and the first boot no longer dirties
+// the settings store just by looking at the table.
+uint32_t key_remap_target(int index)
+{
+  uint32_t value;
+
+  if (index < 0 || index >= REMAP_KEY_COUNT)
+    return 0;
+
+  value = config.key_mapping[index];
+
+  if (KEY_MAP_NONE == value)
+    return 0;
+
+  return value ? value : g_remap_keys[index];
+}
+
+//-----------------------------------------------------------------------------
+void key_remap_set(int index, uint32_t target)
+{
+  if (index < 0 || index >= REMAP_KEY_COUNT)
+    return;
+
+  if (0 == target)
+    config.key_mapping[index] = KEY_MAP_NONE;
+  else if (key_remap_index_of(target) < 0)
+    return; // only a remappable key can be a target
+  else if (target == g_remap_keys[index])
+    config.key_mapping[index] = 0; // itself again: back to the unset state
+  else
+    config.key_mapping[index] = target;
+}
+
+//-----------------------------------------------------------------------------
+void key_remap_reset(void)
+{
+  memset(config.key_mapping, 0, sizeof(config.key_mapping));
+}
+
+//-----------------------------------------------------------------------------
+bool key_remap_is_default(void)
+{
+  for (int i = 0; i < REMAP_KEY_COUNT; i++)
+  {
+    if (key_remap_target(i) != g_remap_keys[i])
+      return false;
+  }
+
+  return true;
+}
+
+//-----------------------------------------------------------------------------
+// A stored table this firmware could not have written is not read at all.
+//
+// The firmware before this one had a twelfth entry - 1X/10X, the shift key's
+// own bit - and filled every slot with the identity on first boot. Read
+// against this table, its entries are one place out from index five down, and
+// EDGE would have come up meaning STOP. Nothing but the identity could ever be
+// stored back then, so recognising the old table and clearing it loses
+// nothing: what it meant was "no remapping", and that is what zero means here.
+static bool mapping_is_valid(void)
+{
+  for (int i = 0; i < REMAP_KEY_COUNT; i++)
+  {
+    uint32_t value = config.key_mapping[i];
+
+    if (0 == value || KEY_MAP_NONE == value)
+      continue;
+
+    if (key_remap_index_of(value) < 0)
+      return false;
+  }
+
+  // Slots past the table belong to no key, so anything in one came from a
+  // firmware whose table was longer
+  for (int i = REMAP_KEY_COUNT; i < KEY_MAPPING_SLOTS; i++)
+  {
+    if (config.key_mapping[i])
+      return false;
+  }
+
+  return true;
+}
 
 //-----------------------------------------------------------------------------
 void input_init(void)
 {
   memset(&g_shift, 0, sizeof(g_shift));
+  g_capture = false;
 
-  for (int i = 0; i < REMAP_KEY_COUNT; i++)
-  {
-    if (0 == config.key_mapping[i])
-      config.key_mapping[i] = g_remap_keys[i];
-  }
+  if (!mapping_is_valid())
+    key_remap_reset();
 }
 
 //-----------------------------------------------------------------------------
+void input_capture_set(bool enable)
+{
+  g_capture = enable;
+
+  if (enable)
+    shift_mode_reset();
+}
+
+//-----------------------------------------------------------------------------
+// Every remappable bit is cleared first and the targets are OR-ed in after, so
+// the result does not depend on the order of the table. Rewriting the bits in
+// place did: a key mapped onto another key's button had that bit cleared again
+// when the other key's turn came, and a swap of two keys held together came
+// out as one of them.
+//
+// System keys are not in the table and so are never rewritten - and a chord
+// holding one now remaps the rest of it, which is what makes SHIFT+F1 follow
+// F1 wherever it was sent. Bailing out on the whole chord instead meant a
+// remapped key quietly reverted for as long as SHIFT was down.
 static uint32_t key_remapping_translate(uint32_t buttons)
 {
+  uint32_t result = buttons;
+
   if (!config.key_remapping_enabled)
     return buttons;
 
-  if (buttons & SYSTEM_KEYS_MASK)
-    return buttons;
-
-  uint32_t result = buttons;
+  for (int i = 0; i < REMAP_KEY_COUNT; i++)
+    result &= ~g_remap_keys[i];
 
   for (int i = 0; i < REMAP_KEY_COUNT; i++)
   {
     if (buttons & g_remap_keys[i])
-    {
-      result &= ~g_remap_keys[i];
-      result |= config.key_mapping[i];
-    }
+      result |= key_remap_target(i);
   }
 
   return result;
@@ -156,6 +311,11 @@ static void shift_mode_track(int buttons)
 //-----------------------------------------------------------------------------
 int input_translate(int buttons)
 {
+  // A capture reads the keyboard, not what the keyboard currently means:
+  // neither the mapping being edited nor a sticky shift may touch it
+  if (g_capture)
+    return buttons;
+
   shift_mode_track(buttons);
 
   buttons = key_remapping_translate(buttons);
