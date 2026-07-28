@@ -191,7 +191,26 @@ typedef struct
   // one word rather than the field being appended.
   int      decoder_bits_mode;
 
-  uint32_t padding[12];  // Reduced padding to accommodate new fields
+  // The SPI clock, in Hz, measured on SCK before the probe moved to the data
+  // line. 0 = work the bit time out of the data itself. Written by the
+  // "SPI clock = measured" action rather than typed, because a frequency
+  // measurement is exactly what the scope already has on screen while the
+  // probe is still on the clock. Carved out of padding.
+  int      spi_clock_hz;
+
+  // 0 = score both bit orders, 1 = MSB first, 2 = LSB first. Zero-is-default
+  // again: a config saved before this existed gets the scoring.
+  int      spi_order;
+
+  // Manchester: the bit rate as an index into the decoder menu's own table
+  // (0 = work it out of the record) and which convention the bits follow
+  // (0 = a rising mid-bit edge is a one, 1 = it is a zero). Nothing in a
+  // Manchester waveform decides the second one - it is a property of the
+  // protocol riding on the code, so it has to be told. Carved out of padding.
+  int      man_rate;
+  int      man_polarity;
+
+  uint32_t padding[8];  // Reduced padding to accommodate new fields
 
   int      calib_channel_delta;
   int      calib_dac_zero;
