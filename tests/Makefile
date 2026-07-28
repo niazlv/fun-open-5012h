@@ -4,8 +4,9 @@
 # Host tests: no hardware, no ARM toolchain, the system compiler is enough.
 #
 # The sources under test are the ones that go on the device, unmodified. They
-# qualify because they are arithmetic over a sample buffer and touch no
-# register - the parts that do are not built here.
+# qualify because they are arithmetic over a sample buffer, or a state machine
+# over key events, and touch no register - the parts that do are not built
+# here, and what little they call into is stubbed at the top of host_test.c.
 #
 # These lists used to live in a comment at the top of host_test.c, which meant
 # nothing checked them and moving a file broke them silently. They are here so
@@ -36,6 +37,7 @@ CFLAGS += \
 # rather than the day someone remembers this list exists.
 HOST_SRCS = \
   host_test.c \
+  $(ROOT)/src/hal/input.c \
   $(ROOT)/src/dsp/measure.c \
   $(ROOT)/src/dsp/fft.c \
   $(ROOT)/src/dsp/classify.c \

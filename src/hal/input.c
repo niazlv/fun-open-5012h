@@ -19,12 +19,32 @@
 #define SHIFT_DOUBLE_CLICK_MS   500
 #define REMAP_KEY_COUNT         12
 
+// The armed marker goes in the gap the status corner leaves between the
+// rightmost readout (the scope's sample rates end at x 278) and the battery
+// frame at x 289, so it sits next to the charge indicator instead of on top
+// of it. Amber, not red: red in this corner already means a flat battery.
+#define SHIFT_FLAG_X            280
+#define SHIFT_FLAG_Y            4
+#define SHIFT_FLAG_W            8
+#define SHIFT_FLAG_H            8
+#define SHIFT_FLAG_COLOR        LCD_COLOR(255, 200, 0)
+#define SHIFT_FLAG_REFRESH_MS   100
+
+/*- Constants ---------------------------------------------------------------*/
+// Shift arrow, one bit per pixel, MSB leftmost
+static const uint8_t g_shift_glyph[SHIFT_FLAG_H] =
+{
+  0x18, 0x3c, 0x7e, 0xff, 0x3c, 0x3c, 0x3c, 0x00,
+};
+
 /*- Variables ---------------------------------------------------------------*/
 static struct
 {
-  bool active;
-  uint32_t last_press;
-  uint32_t press_count;
+  bool active;      // armed, waiting for the key it applies to
+  bool held;        // that key is down; keep shifting it until it is released
+  bool down;        // SHIFT itself is down, so a repeat event is not a new tap
+  uint32_t last_tap;
+  uint32_t taps;
 } g_shift;
 
 // Keys eligible for remapping; navigation and system keys are excluded
@@ -77,33 +97,60 @@ static uint32_t key_remapping_translate(uint32_t buttons)
 //-----------------------------------------------------------------------------
 // Double-click on SHIFT arms sticky shift; the next regular key press gets
 // BTN_SHIFT OR-ed in and disarms it. Another double-click cancels.
+//
+// What arrives here is the whole debounced key state, not one key event, so an
+// ordinary SHIFT+key chord also has the SHIFT bit set, and so does the event
+// that reports the other key being released. Counting those as taps was enough
+// to arm sticky shift off a single deliberate tap that followed a chord, and
+// the key after it went through shifted with nothing on screen to say why.
+// Only a solo tap of SHIFT, with a release before it, counts.
 static void shift_mode_track(int buttons)
 {
   if (!config.shift_mode_enabled)
   {
     g_shift.active = false;
+    g_shift.held = false;
+    g_shift.down = false;
+    g_shift.taps = 0;
     return;
   }
 
-  if ((buttons & BTN_SHIFT) && !(buttons & BTN_REPEAT))
+  if (buttons & BTN_REPEAT)
+    return; // auto-repeat of a held key, not a new press
+
+  if (!(buttons & BTN_SHIFT))
   {
-    uint32_t now = timer_ms();
-
-    if (now - g_shift.last_press < SHIFT_DOUBLE_CLICK_MS)
-    {
-      if (++g_shift.press_count >= 2)
-      {
-        g_shift.active = !g_shift.active;
-        g_shift.press_count = 0;
-      }
-    }
-    else
-    {
-      g_shift.press_count = 1;
-    }
-
-    g_shift.last_press = now;
+    g_shift.down = false;
+    return;
   }
+
+  // SHIFT held together with something else is a plain chord, and it voids
+  // whatever double click was in progress
+  if (buttons & ~(BTN_SHIFT | BTN_REPEAT))
+  {
+    g_shift.down = true;
+    g_shift.taps = 0;
+    return;
+  }
+
+  if (g_shift.down)
+    return; // same press, seen again because another key went up
+
+  g_shift.down = true;
+
+  uint32_t now = timer_ms();
+
+  if (g_shift.taps && now - g_shift.last_tap < SHIFT_DOUBLE_CLICK_MS)
+  {
+    g_shift.active = !g_shift.active;
+    g_shift.taps = 0;
+  }
+  else
+  {
+    g_shift.taps = 1;
+  }
+
+  g_shift.last_tap = now;
 }
 
 //-----------------------------------------------------------------------------
@@ -113,12 +160,24 @@ int input_translate(int buttons)
 
   buttons = key_remapping_translate(buttons);
 
-  if (g_shift.active && (buttons & ~(BTN_SHIFT | BTN_REPEAT)))
-  {
-    buttons |= BTN_SHIFT;
+  int keys = buttons & ~(BTN_SHIFT | BTN_REPEAT);
 
-    if (!(buttons & BTN_REPEAT))
-      g_shift.active = false;
+  // Arming applies to one key, but for as long as that key stays down: the
+  // repeats have to carry SHIFT too, or holding the key would act shifted once
+  // and then unshifted, which for the arrows means changing the timebase and
+  // then panning
+  if (g_shift.active && keys)
+  {
+    g_shift.active = false;
+    g_shift.held = true;
+  }
+
+  if (g_shift.held)
+  {
+    if (keys)
+      buttons |= BTN_SHIFT;
+    else
+      g_shift.held = false;
   }
 
   return buttons;
@@ -134,6 +193,29 @@ bool shift_mode_is_active(void)
 void shift_mode_reset(void)
 {
   g_shift.active = false;
+  g_shift.held = false;
+}
+
+//-----------------------------------------------------------------------------
+// Blitted as pixels rather than drawn as text on purpose: lcd_set_font() and
+// lcd_set_color() are global, every other drawing site leaves them set to what
+// it needs and expects to find them that way next time, and this runs between
+// their frames. The badge used to set the small font and a red background here
+// and never put them back, which is what made the fonts fall apart everywhere.
+static void shift_flag_blit(int fg)
+{
+  uint16_t buf[SHIFT_FLAG_W * SHIFT_FLAG_H];
+
+  for (int y = 0; y < SHIFT_FLAG_H; y++)
+  {
+    for (int x = 0; x < SHIFT_FLAG_W; x++)
+    {
+      buf[y * SHIFT_FLAG_W + x] =
+          (g_shift_glyph[y] & (0x80 >> x)) ? fg : LCD_BLACK_COLOR;
+    }
+  }
+
+  lcd_draw_buf(SHIFT_FLAG_X, SHIFT_FLAG_Y, SHIFT_FLAG_W, SHIFT_FLAG_H, buf);
 }
 
 //-----------------------------------------------------------------------------
@@ -146,21 +228,20 @@ void shift_mode_task(void)
   {
     uint32_t now = timer_ms();
 
-    // Refresh at 10 Hz so the badge survives screen repaints without
+    // Refresh at 10 Hz so the flag survives screen repaints without
     // bit-banging the LCD on every main loop pass
-    if (!was_active || now - last_draw >= 100)
+    if (!was_active || now - last_draw >= SHIFT_FLAG_REFRESH_MS)
     {
-      lcd_fill_rect(LCD_WIDTH - 50, 5, 45, 15, LCD_COLOR(255, 0, 0));
-      lcd_set_color(LCD_COLOR(255, 0, 0), LCD_COLOR(255, 255, 255));
-      lcd_set_font(FONT_SMALL);
-      lcd_puts(LCD_WIDTH - 45, 8, "SHIFT");
+      shift_flag_blit(SHIFT_FLAG_COLOR);
       last_draw = now;
     }
   }
   else if (was_active)
   {
-    // Erase the badge; the area is repainted by whatever draws next
-    lcd_fill_rect(LCD_WIDTH - 50, 5, 45, 15, LCD_BLACK_COLOR);
+    // Erase to black, the same background the battery block next door paints
+    // its own interior on. The slot belongs to the status corner and no screen
+    // draws in it, so there is nothing underneath to restore.
+    shift_flag_blit(LCD_BLACK_COLOR);
   }
 
   was_active = g_shift.active;

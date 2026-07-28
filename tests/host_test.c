@@ -23,10 +23,28 @@
 #include "logic_decode.h"
 #include "record_window.h"
 #include "trend.h"
+#include "config.h"
+#include "buttons.h"
+#include "input.h"
 
 #define ZERO_POINT 128
 
 static int g_failures = 0;
+
+// What input.c reaches for. The clock is driven by the test rather than read,
+// so the double-click window can be crossed without sleeping; the flag it
+// blits into the status corner has nowhere to go here.
+Config config;
+static uint32_t g_input_now;
+
+uint32_t timer_ms(void) { return g_input_now; }
+void timer_add(int *timer) { (void)timer; }
+void timer_remove(int *timer) { (void)timer; }
+
+void lcd_draw_buf(int x, int y, int w, int h, const uint16_t *buf)
+{
+  (void)x; (void)y; (void)w; (void)h; (void)buf;
+}
 
 static void check_near(const char *name, double got, double want, double tol_pct)
 {
@@ -6626,6 +6644,98 @@ int main(void)
 
     trend_reset();
     check_near("reset: empty", trend_count(), 0, 0);
+  }
+
+  // ============================ sticky shift ============================
+  //
+  // buttons.c reports the whole debounced key state on every change, not one
+  // key event, so SHIFT is set in the chord itself and again when the other
+  // key is released. Counting those towards the double click armed sticky
+  // shift off a single later tap, and the key after it went through shifted
+  // with nothing to explain it - which is what these first cases pin down.
+  printf("sticky shift:\n");
+  {
+    config.shift_mode_enabled = true;
+    config.key_remapping_enabled = false;
+    g_input_now = 0;
+    input_init();
+
+    // A plain SHIFT+LEFT: press SHIFT, press LEFT, release LEFT, release SHIFT
+    g_input_now += 10;   input_translate(BTN_SHIFT);
+    g_input_now += 100;  input_translate(BTN_SHIFT | BTN_LEFT);
+    g_input_now += 100;  input_translate(BTN_SHIFT);
+    g_input_now += 100;  input_translate(0);
+    check_near("chord does not arm", shift_mode_is_active(), 0, 0);
+
+    // ...and neither does one deliberate tap after it
+    g_input_now += 100;  input_translate(BTN_SHIFT);
+    g_input_now += 50;   input_translate(0);
+    check_near("tap after a chord does not arm", shift_mode_is_active(), 0, 0);
+
+    g_input_now += 100;
+    check_near("so the next key is unshifted",
+        !(input_translate(BTN_UP) & BTN_SHIFT), 1, 0);
+    g_input_now += 50;   input_translate(0);
+
+    // Two solo taps inside the window: the double click the feature is for
+    g_input_now += 1000; input_translate(BTN_SHIFT);
+    g_input_now += 60;   input_translate(0);
+    g_input_now += 60;   input_translate(BTN_SHIFT);
+    g_input_now += 60;   input_translate(0);
+    check_near("two solo taps arm", shift_mode_is_active(), 1, 0);
+
+    g_input_now += 100;
+    check_near("the next key is shifted",
+        (input_translate(BTN_LEFT) & BTN_SHIFT) != 0, 1, 0);
+    check_near("and it disarms", shift_mode_is_active(), 0, 0);
+
+    // Holding that key has to keep the shift: acting shifted once and then
+    // unshifted means the arrows change the timebase and then start panning
+    g_input_now += 100;
+    check_near("auto-repeat stays shifted",
+        (input_translate(BTN_LEFT | BTN_REPEAT) & BTN_SHIFT) != 0, 1, 0);
+    g_input_now += 100;  input_translate(0);
+    g_input_now += 100;
+    check_near("a press after the release is not",
+        !(input_translate(BTN_LEFT) & BTN_SHIFT), 1, 0);
+    g_input_now += 50;   input_translate(0);
+
+    // Too slow, and it is two separate taps
+    g_input_now += 1000; input_translate(BTN_SHIFT);
+    g_input_now += 60;   input_translate(0);
+    g_input_now += 900;  input_translate(BTN_SHIFT);
+    g_input_now += 60;   input_translate(0);
+    check_near("taps outside the window do not arm",
+        shift_mode_is_active(), 0, 0);
+
+    // Holding SHIFT down is one press however many repeats it generates
+    g_input_now += 1000; input_translate(BTN_SHIFT);
+    g_input_now += 60;   input_translate(BTN_SHIFT | BTN_REPEAT);
+    g_input_now += 60;   input_translate(BTN_SHIFT | BTN_REPEAT);
+    g_input_now += 60;   input_translate(0);
+    check_near("held SHIFT does not arm itself",
+        shift_mode_is_active(), 0, 0);
+
+    // A second double click cancels
+    g_input_now += 1000; input_translate(BTN_SHIFT);
+    g_input_now += 60;   input_translate(0);
+    g_input_now += 60;   input_translate(BTN_SHIFT);
+    g_input_now += 60;   input_translate(0);
+    check_near("armed again", shift_mode_is_active(), 1, 0);
+    g_input_now += 60;   input_translate(BTN_SHIFT);
+    g_input_now += 60;   input_translate(0);
+    g_input_now += 60;   input_translate(BTN_SHIFT);
+    g_input_now += 60;   input_translate(0);
+    check_near("a second double click cancels",
+        shift_mode_is_active(), 0, 0);
+
+    config.shift_mode_enabled = false;
+    g_input_now += 1000; input_translate(BTN_SHIFT);
+    g_input_now += 60;   input_translate(0);
+    g_input_now += 60;   input_translate(BTN_SHIFT);
+    g_input_now += 60;   input_translate(0);
+    check_near("nothing arms while the feature is off",
+        shift_mode_is_active(), 0, 0);
   }
 
   printf("\n%s (%d failures)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
