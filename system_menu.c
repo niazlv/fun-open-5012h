@@ -257,10 +257,11 @@ static void body_system_info(void)
 //-----------------------------------------------------------------------------
 static const char *const g_key_bindings_lines[] =
 {
+  INFO_HEAD "Menus",
   "UP/DOWN     - Navigate",
   "LEFT/RIGHT  - Adjust / enter submenu",
   "MODE        - Select / confirm",
-  "MENU        - System menu (over any application)",
+  "MENU        - System menu over any application",
   "SHIFT+MENU  - Leave the application",
   "SHIFT x2    - Sticky shift (if enabled)",
   "",
@@ -268,11 +269,20 @@ static const char *const g_key_bindings_lines[] =
   "the running application. Its keys, and every",
   "other read-only page, are under Help.",
   "",
-  "Remappable keys:",
+  INFO_HEAD "Text pages",
+  "UP/DOWN     - One line",
+  "LEFT/RIGHT  - One screen",
+  "TRIG_UP/DN  - Previous / next section",
+  "MODE        - Close, and so does any other key",
+  "",
+  "A page that fits on the screen has nothing to",
+  "scroll and closes on any key at all.",
+  "",
+  INFO_HEAD "Remappable keys",
   "  F1 F2 SAVE AUTO AC/DC 1X/10X",
   "  STOP EDGE 50% TRIG TRIG_UP/DOWN",
   "",
-  "Protected system keys:",
+  INFO_HEAD "Protected system keys",
   "  UP DOWN LEFT RIGHT MODE MENU SHIFT",
 };
 

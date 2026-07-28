@@ -38,8 +38,21 @@
 #define INFO_BG               LCD_COLOR(240, 240, 240)
 #define INFO_FG               LCD_COLOR(0, 0, 0)
 #define INFO_TITLE            LCD_COLOR(0, 70, 150)
+#define INFO_DIM              LCD_COLOR(110, 110, 110)
+#define INFO_HEAD_BG          LCD_COLOR(200, 216, 236)
+#define INFO_BAR_BG           LCD_COLOR(206, 206, 212)
+#define INFO_BAR_FG           LCD_COLOR(0, 120, 215)
+#define INFO_TITLE_Y          20
 #define INFO_FOOTER_Y         (LCD_HEIGHT - 25)
-#define INFO_BODY_BOTTOM      (INFO_FOOTER_Y - 6)
+#define INFO_BODY_BOTTOM      (INFO_FOOTER_Y - 11) // last line origin
+#define INFO_TEXT_R           (LCD_WIDTH - 24) // right edge of the text column
+#define INFO_BAR_X            (LCD_WIDTH - 20)
+#define INFO_BAR_W            4
+
+// A page that scrolls gets a tighter grid: four more lines per screen, and
+// the pages that need them are the long ones
+#define INFO_SCROLL_Y         40
+#define INFO_SCROLL_LINE_H    10
 
 // Fullscreen style (launcher)
 #define FS_TITLE_H            40
@@ -75,8 +88,24 @@ typedef struct
   int x, y, w, h;
 } menu_inst_t;
 
+// Info page state. The page itself is const in flash; where we are in it is
+// not, and one instance is enough because an info page is the end of the
+// road: it is modal, nothing opens on top of it, and any key that is not a
+// scroll key closes it.
+typedef struct
+{
+  const info_page_t *page;
+  int count;   // text lines, 0 for a page that only has a body()
+  int top;     // first visible line
+  int vis;     // lines on one screen
+  int line_h;
+  int y0;      // origin of the first visible line
+  int heads;   // section headings in the page, 0 = no sections
+} info_inst_t;
+
 /*- Variables ---------------------------------------------------------------*/
 static menu_inst_t g_inst[MENU_MAX_OPEN];
+static info_inst_t g_info;
 
 /*- Forward Declarations ----------------------------------------------------*/
 static void menu_leave(void *ctx);
@@ -505,63 +534,231 @@ void menu_open_popup(const menu_def_t *def, int x, int y)
 }
 
 //-----------------------------------------------------------------------------
-// Info page: modal fullscreen text, any button closes it
+// Info page: modal fullscreen text.
+//
+// It scrolls, so there is no length a page has to stay under - a help text
+// that grew into a manual is still readable to its last line. A line that
+// starts with INFO_HEAD is a section heading: drawn as a band, named under
+// the title while it is the section on screen, and a jump target, which is
+// what makes six hundred lines navigable at all.
+//
+// A page that fits keeps the layout and the contract it always had: roomy
+// spacing, no scrollbar, any button closes it.
+//-----------------------------------------------------------------------------
+static bool info_is_head(const char *line)
+{
+  return line && INFO_HEAD[0] == line[0];
+}
+
+//-----------------------------------------------------------------------------
+// The heading that line belongs under, -1 if it is above the first one
+static int info_head_at(const info_inst_t *in, int line)
+{
+  for (int i = line; i >= 0; i--)
+  {
+    if (info_is_head(in->page->lines[i]))
+      return i;
+  }
+
+  return -1;
+}
+
+//-----------------------------------------------------------------------------
+static void info_draw_line(const char *line, int y)
+{
+  if (!line)
+    return;
+
+  if (info_is_head(line))
+  {
+    lcd_fill_rect(INFO_X - 5, y - 1, INFO_TEXT_R - INFO_X + 10, 10,
+        INFO_HEAD_BG);
+    lcd_set_color(INFO_HEAD_BG, INFO_TITLE);
+    lcd_puts(INFO_X, y, line + 1);
+    lcd_set_color(INFO_BG, INFO_FG);
+    return;
+  }
+
+  lcd_puts(INFO_X, y, line);
+}
+
+//-----------------------------------------------------------------------------
+// Thumb size is the share of the page on screen, so a 600-line page says so
+// before a single key is pressed
+static void info_draw_bar(const info_inst_t *in)
+{
+  int y = in->y0 - 2;
+  int h = INFO_BODY_BOTTOM + 9 - y;
+  int thumb = h * in->vis / in->count;
+  int pos;
+
+  if (thumb < 8)
+    thumb = 8;
+
+  pos = (h - thumb) * in->top / (in->count - in->vis);
+
+  lcd_fill_rect(INFO_BAR_X, y, INFO_BAR_W, h, INFO_BAR_BG);
+  lcd_fill_rect(INFO_BAR_X, y + pos, INFO_BAR_W, thumb, INFO_BAR_FG);
+}
+
+//-----------------------------------------------------------------------------
+// Where we are, in the two places that help: the section name beside the
+// title, and how far through the page in the footer
+static void info_draw_position(const info_inst_t *in)
+{
+  const char *title = in->page->title ? in->page->title : "";
+  int head = in->heads ? info_head_at(in, in->top) : -1;
+  const char *name = (head >= 0) ? in->page->lines[head] + 1 : "";
+  int erase_x = INFO_X + (int)strlen(title) * FW_LARGE + 8;
+  char buf[8];
+
+  lcd_set_font(FONT_SMALL);
+  lcd_set_color(INFO_BG, INFO_DIM);
+
+  lcd_fill_rect(erase_x, INFO_TITLE_Y, INFO_TEXT_R - erase_x, 12, INFO_BG);
+  lcd_puts(INFO_TEXT_R - (int)strlen(name) * FW_SMALL, INFO_TITLE_Y + 4, name);
+
+  snprintf(buf, sizeof(buf), "%d%%", 100 * in->top / (in->count - in->vis));
+  lcd_fill_rect(INFO_TEXT_R - 30, INFO_FOOTER_Y, 30, 8, INFO_BG);
+  lcd_puts(INFO_TEXT_R - (int)strlen(buf) * FW_SMALL, INFO_FOOTER_Y, buf);
+}
+
+//-----------------------------------------------------------------------------
+// Everything that changes when the page scrolls, and nothing else: the frame,
+// the title and the key hints are painted once by the full draw
+static void info_draw_body(const info_inst_t *in)
+{
+  int y = in->y0 - 2;
+
+  lcd_fill_rect(11, y, LCD_WIDTH - 22, INFO_BODY_BOTTOM + 9 - y, INFO_BG);
+
+  lcd_set_font(FONT_SMALL);
+  lcd_set_color(INFO_BG, INFO_FG);
+
+  for (int i = 0; i < in->vis && in->top + i < in->count; i++)
+    info_draw_line(in->page->lines[in->top + i], in->y0 + i * in->line_h);
+
+  if (in->count > in->vis)
+  {
+    info_draw_bar(in);
+    info_draw_position(in);
+  }
+}
+
 //-----------------------------------------------------------------------------
 static void info_draw(void *ctx, bool full)
 {
-  const info_page_t *p = (const info_page_t *)ctx;
+  const info_inst_t *in = (const info_inst_t *)ctx;
+  const info_page_t *p = in->page;
 
-  (void)full;
-
-  lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, INFO_BG);
-  lcd_draw_rect(10, 10, LCD_WIDTH - 21, LCD_HEIGHT - 21, INFO_FG);
-
-  lcd_set_font(FONT_LARGE);
-  lcd_set_color(INFO_BG, INFO_TITLE);
-  lcd_puts(INFO_X, 20, p->title ? p->title : "");
-
-  lcd_set_font(FONT_SMALL);
-  lcd_set_color(INFO_BG, INFO_FG);
-
-  if (p->lines && p->count > 0)
+  if (full)
   {
-    int line_h = INFO_LINE_H;
-    int avail = INFO_BODY_BOTTOM - INFO_Y;
+    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, INFO_BG);
+    lcd_draw_rect(10, 10, LCD_WIDTH - 21, LCD_HEIGHT - 21, INFO_FG);
 
-    // Squeeze the spacing rather than truncate a page that is a few lines
-    // too long; below 9 px the 6x8 font starts to touch
-    if (p->count > 1 && avail / p->count < line_h)
-      line_h = avail / p->count;
+    lcd_set_font(FONT_LARGE);
+    lcd_set_color(INFO_BG, INFO_TITLE);
+    lcd_puts(INFO_X, INFO_TITLE_Y, p->title ? p->title : "");
 
-    if (line_h < 9)
-      line_h = 9;
+    lcd_set_font(FONT_SMALL);
+    lcd_set_color(INFO_BG, INFO_DIM);
 
-    for (int i = 0; i < p->count; i++)
-    {
-      int y = INFO_Y + i * line_h;
-
-      if (y > INFO_BODY_BOTTOM)
-        break;
-
-      if (p->lines[i])
-        lcd_puts(INFO_X, y, p->lines[i]);
-    }
+    if (in->count <= in->vis)
+      lcd_puts(INFO_X, INFO_FOOTER_Y, "Press any button to close");
+    else if (in->heads)
+      lcd_puts(INFO_X, INFO_FOOTER_Y,
+          "U/D line  L/R page  TRIG sect  MODE close");
+    else
+      lcd_puts(INFO_X, INFO_FOOTER_Y, "U/D line  L/R page  MODE close");
   }
+
+  info_draw_body(in);
 
   if (p->body)
     p->body();
+}
 
-  lcd_set_font(FONT_SMALL);
-  lcd_set_color(INFO_BG, INFO_FG);
-  lcd_puts(INFO_X, INFO_FOOTER_Y, "Press any button to close");
+//-----------------------------------------------------------------------------
+static void info_scroll(info_inst_t *in, int delta)
+{
+  int max = in->count - in->vis;
+  int top = in->top + delta;
+
+  if (top > max)
+    top = max;
+
+  if (top < 0)
+    top = 0;
+
+  if (top == in->top)
+    return;
+
+  in->top = top;
+  ui_request_redraw();
+}
+
+//-----------------------------------------------------------------------------
+// To the heading above or below the one on screen, whichever way dir points
+static void info_jump_section(info_inst_t *in, int dir)
+{
+  int i;
+
+  for (i = in->top + dir; i > 0 && i < in->count; i += dir)
+  {
+    if (info_is_head(in->page->lines[i]))
+      break;
+  }
+
+  if (i >= in->count)
+    i = in->count - 1; // past the last section: the end of the page
+
+  if (i < 0)
+    i = 0;
+
+  info_scroll(in, i - in->top);
 }
 
 //-----------------------------------------------------------------------------
 static bool info_input(void *ctx, int buttons)
 {
-  (void)ctx;
+  info_inst_t *in = (info_inst_t *)ctx;
+  int page = (in->vis > 2) ? in->vis - 2 : 1;
 
-  if (buttons && !(buttons & BTN_REPEAT))
+  if (0 == buttons)
+    return true;
+
+  // Only a page that scrolls spends the arrows on scrolling; on one that
+  // fits, every button still closes it
+  if (in->count > in->vis)
+  {
+    if (buttons & (BTN_UP | BTN_DOWN))
+    {
+      info_scroll(in, (buttons & BTN_UP) ? -1 : 1);
+      return true;
+    }
+
+    if (buttons & (BTN_LEFT | BTN_RIGHT))
+    {
+      info_scroll(in, (buttons & BTN_LEFT) ? -page : page);
+      return true;
+    }
+
+    if (buttons & (BTN_TRIG_UP | BTN_TRIG_DOWN))
+    {
+      int dir = (buttons & BTN_TRIG_UP) ? -1 : 1;
+
+      // Without sections there is nothing to jump to, and the pair of keys
+      // is more useful as a second page up/down than as nothing at all
+      if (in->heads)
+        info_jump_section(in, dir);
+      else
+        info_scroll(in, dir * page);
+
+      return true;
+    }
+  }
+
+  if (!(buttons & BTN_REPEAT))
     ui_pop();
 
   return true;
@@ -577,7 +774,43 @@ static const ui_screen_t info_screen =
 //-----------------------------------------------------------------------------
 void menu_open_info(const info_page_t *page)
 {
-  ui_push(&info_screen, (void *)(uintptr_t)page);
+  info_inst_t *in = &g_info;
+
+  in->page = page;
+  in->count = (page->lines && page->count > 0) ? page->count : 0;
+  in->top = 0;
+  in->heads = 0;
+  in->y0 = INFO_Y;
+  in->line_h = INFO_LINE_H;
+  in->vis = (INFO_BODY_BOTTOM - in->y0) / in->line_h + 1;
+
+  // Longer than one screen: the tighter grid, a scrollbar, and the sections
+  // it turns out to have. A page that fits is left exactly as it was, body()
+  // pages included - those draw on the roomy grid at their own coordinates.
+  if (in->count > in->vis)
+  {
+    int avail = INFO_BODY_BOTTOM - INFO_SCROLL_Y;
+
+    in->y0 = INFO_SCROLL_Y;
+    in->line_h = INFO_SCROLL_LINE_H;
+    in->vis = avail / in->line_h + 1;
+
+    // A page a line or two over the grid is squeezed onto it rather than
+    // made to scroll for them; below 9 px the 6x8 font starts to touch
+    if (in->count > in->vis && in->count <= avail / 9 + 1)
+    {
+      in->line_h = 9;
+      in->vis = in->count;
+    }
+
+    for (int i = 0; i < in->count; i++)
+    {
+      if (info_is_head(page->lines[i]))
+        in->heads++;
+    }
+  }
+
+  ui_push(&info_screen, in);
 }
 
 //-----------------------------------------------------------------------------

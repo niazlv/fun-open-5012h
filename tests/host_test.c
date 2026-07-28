@@ -949,7 +949,7 @@ static void swo_g_bytes(SwoGen *g, const uint8_t *b, int n)
 // the decoder must therefore ignore rather than read.
 typedef struct
 {
-  uint8_t *buf; int size; double t; double sps_bit; int last;
+  uint8_t *buf; int size; double t; double sps_bit; int last; double drift;
 } SwdGen;
 
 static void swd_g(SwdGen *g, uint8_t *buf, int size, double period_ns,
@@ -960,6 +960,7 @@ static void swd_g(SwdGen *g, uint8_t *buf, int size, double period_ns,
   g->sps_bit = 1e9 / hz / period_ns;
   g->t = 20 * g->sps_bit;
   g->last = 0;
+  g->drift = 0.0;
 
   memset(buf, 56, (size_t)size);          // the host holds SWDIO low at rest
 }
@@ -974,6 +975,7 @@ static void swd_g_bit(SwdGen *g, int b)
 
   g->last = b;
   g->t += g->sps_bit;
+  g->sps_bit *= 1.0 + g->drift;           // a bit-banged master slowing down
 }
 
 static void swd_g_trn(SwdGen *g)          // undriven: the line stays put
@@ -988,9 +990,11 @@ static void swd_g_idle(SwdGen *g, int n)
 }
 
 // One transaction. `a` is the register index A[3:2], `ack` is 1 OK, 2 WAIT,
-// 4 FAULT, and `flip` breaks the data parity on purpose.
-static void swd_g_tx(SwdGen *g, int ap, int write, int a, uint32_t data,
-    int ack, int flip)
+// 4 FAULT, `flip` breaks the data parity on purpose, and `idle` is how many
+// idle cycles follow it - zero being legal and the case that leaves the next
+// packet's start bit with no rising edge of its own.
+static void swd_g_txi(SwdGen *g, int ap, int write, int a, uint32_t data,
+    int ack, int flip, int idle)
 {
   int rnw = write ? 0 : 1;
   int a2 = a & 1, a3 = (a >> 1) & 1;
@@ -1013,7 +1017,7 @@ static void swd_g_tx(SwdGen *g, int ap, int write, int a, uint32_t data,
   if (1 != ack)
   {
     swd_g_trn(g);
-    swd_g_idle(g, 8);
+    swd_g_idle(g, idle);
 
     return;                               // WAIT and FAULT have no data phase
   }
@@ -1034,7 +1038,13 @@ static void swd_g_tx(SwdGen *g, int ap, int write, int a, uint32_t data,
   if (!write)
     swd_g_trn(g);
 
-  swd_g_idle(g, 8);
+  swd_g_idle(g, idle);
+}
+
+static void swd_g_tx(SwdGen *g, int ap, int write, int a, uint32_t data,
+    int ack, int flip)
+{
+  swd_g_txi(g, ap, write, a, data, ack, flip, 8);
 }
 
 static void swd_g_reset(SwdGen *g)        // fifty-two clocks of ones
@@ -6190,6 +6200,58 @@ int main(void)
           swd_decode(buf, SIZE, 0, 100, &scratch, &lr), 0, 0);
 
       swd_decode_set_clock(0);
+    }
+
+    // A packet may follow the one before it with NO idle cycles, and then
+    // the previous turnaround left the line high and the start bit has no
+    // rising edge to be found by. What every packet does have is its stop and
+    // park bits - 0 then 1, a rising edge at bit 7 whatever the data says -
+    // so an edge that heads no packet is tried again as that one.
+    printf("swd, packets back to back with no idle:\n");
+    {
+      SwdGen g;
+
+      swd_g(&g, buf, SIZE, 100.0, 1000000.0);
+      // Data ending in a 1 bit and an odd parity: the trailing turnaround
+      // holds the line high, so the next start bit is not an edge at all
+      swd_g_txi(&g, 0, 0, 0, 0x8BA01477, 1, 0, 0);
+      swd_g_txi(&g, 0, 0, 3, 0x80000001, 1, 0, 0);
+      swd_g_txi(&g, 0, 1, 1, 0x50000000, 1, 0, 8);
+
+      logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      const SwdAnalysis *a = swd_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_SWD, 0);
+      check_near("all three, none swallowed", a->txs, 3, 0);
+      check_near("every one of them clean", a->ok_txs, 3, 0);
+      check_near("nothing between them", a->gap_bad, 0, 0);
+      check_near("the second one's data, least byte first",
+          lr.bytes[6], 0x01, 0);
+      check_near("...read right through to its top", lr.bytes[9], 0x80, 0);
+    }
+
+    // A bit-banged master does not hold one rate: its loop takes longer as
+    // the packet goes on, and no single bit time fits the whole of it. The
+    // reader keeps its PHASE and re-anchors on the edges it finds, which is
+    // what lets a packet like this come back at all - stepping a fixed grid
+    // walks half a bit out by the parity, and the parity is what the decoder
+    // rests on.
+    printf("swd, a master whose rate drifts:\n");
+    {
+      SwdGen g;
+
+      swd_g(&g, buf, SIZE, 100.0, 1000000.0);
+      g.drift = 0.002;                          // 0.2% longer every bit
+      swd_g_tx(&g, 0, 0, 0, 0x2BA01477, 1, 0);
+      swd_g_tx(&g, 0, 1, 1, 0x50000000, 1, 0);
+
+      swd_decode(buf, SIZE, 0, 100, &scratch, &lr);
+      const SwdAnalysis *a = swd_analysis();
+
+      check_near("both transactions", a->txs, 2, 0);
+      check_near("both with the parity agreeing", a->ok_txs, 2, 0);
+      check_near("and the value is right", lr.bytes[1], 0x77, 0);
+      check_near("...to the last byte", lr.bytes[4], 0x2B, 0);
     }
 
     printf("swd rejects the rest:\n");

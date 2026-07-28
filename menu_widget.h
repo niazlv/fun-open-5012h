@@ -11,7 +11,8 @@
  *
  * The same file provides the info page: a modal, fullscreen text screen used
  * for every help and info dialog, so an application only has to supply the
- * text.
+ * text. A page that does not fit on the screen scrolls, so there is no length
+ * an application has to keep its text under.
  */
 
 #ifndef _MENU_WIDGET_H_
@@ -22,12 +23,20 @@
 #include <stdbool.h>
 
 /*- Definitions -------------------------------------------------------------*/
-// Info page body: first line origin. Line spacing shrinks automatically when
-// a page has more lines than fit, so pages with a custom body() can place
-// their own text on the same grid.
+// Info page body: first line origin. This is the grid of a page that fits on
+// one screen, which is the grid a custom body() draws on. A page longer than
+// that scrolls on a tighter grid of its own; a body() page never does.
 #define INFO_X         20
 #define INFO_Y         45
 #define INFO_LINE_H    13
+
+// Section heading. A line that starts with this marker is drawn as a heading
+// and becomes a jump target, so a page the size of a manual is read in
+// sections instead of by holding an arrow down:
+//
+//   INFO_HEAD "CAN",
+//   "CAN reads either wire of the pair:",
+#define INFO_HEAD      "\1"
 
 /*- Types -------------------------------------------------------------------*/
 typedef enum

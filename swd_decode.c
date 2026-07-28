@@ -60,10 +60,12 @@
 #define SWD_SHORT_BITS       13     // ...when the ack was not OK
 #define SWD_RESET_BITS       50     // a line reset is at least this many ones
 
-// The bit time is searched around its estimate: a frequency measured on SWCLK
-// carries its own error, and forty-six bits of drift at one percent already
-// costs half a bit by the end of a packet. Nine steps of one percent.
-#define SWD_TRIM_STEPS        4
+// The bit time is searched around its estimate, one percent to a step. A
+// measured frequency carries its own error and one worked out of the runs
+// assumes the record holds a single-clock run somewhere; the reader itself
+// re-anchors on edges, so this only has to get close enough for the first
+// eight bits to land, not for all forty-six.
+#define SWD_TRIM_STEPS        6
 
 /*- Variables ---------------------------------------------------------------*/
 // Shared with every other decoder: only one analysis is live at a time, and
@@ -145,47 +147,120 @@ static void swd_reg_name(bool ap, bool write, int a, uint32_t select,
 }
 
 //-----------------------------------------------------------------------------
-// Try to read one transaction whose start bit's rising edge is run `r0`.
-// Returns the bit count consumed, or 0 when this edge does not head a packet.
-static int swd_try(const LogicScratch *s, int runs, int size, int r0,
-    int64_t bit_x256, SwdTx *tx)
+// A bit reader that keeps its PHASE rather than stepping a fixed grid.
+//
+// Forty-six bits is long enough for arithmetic to drift out of the packet: a
+// bit time one percent off is half a bit out by the parity, and the parity is
+// what the whole decoder rests on. So after every bit the reader looks for a
+// real edge where the bit ought to end and, finding one within tolerance,
+// takes it. That is sound here in a way it is not on most buses: on SWD every
+// edge IS a clock boundary, because the line only changes when the clock says
+// so. A measured edge beats a running total every time.
+//
+// Same technique the Manchester reader uses, and for the same reason.
+typedef struct
 {
-  int64_t p0 = (int64_t)s->pos[r0] * 256;
-  int cur = r0;
+  const LogicScratch *s;
+  int      runs;
+  int      size;
+  int64_t  bit;
+  int64_t  tol;
+  int64_t  pos;     // leading edge of the next bit, x256
+  int      cur;     // run cursor; only ever moves forward
+} SwdRd;
+
+//-----------------------------------------------------------------------------
+static void swd_rd_init(SwdRd *rd, const LogicScratch *s, int runs, int size,
+    int64_t bit_x256, int64_t start_x256)
+{
+  rd->s = s;
+  rd->runs = runs;
+  rd->size = size;
+  rd->bit = bit_x256;
+  rd->tol = bit_x256 * 3 / 8;
+  rd->pos = start_x256;
+  rd->cur = 0;
+}
+
+//-----------------------------------------------------------------------------
+// The next bit, or -1 when the record runs out inside it
+static int swd_rd_bit(SwdRd *rd)
+{
+  int64_t mid = rd->pos + rd->bit / 2;
+
+  if (rd->pos < 0 || mid / 256 >= rd->size)
+    return -1;
+
+  while (rd->cur + 1 < rd->runs &&
+      (int64_t)rd->s->pos[rd->cur + 1] * 256 <= mid)
+    rd->cur++;
+
+  int v = rd->s->lvl[rd->cur];
+  int64_t want = rd->pos + rd->bit;
+  int k = rd->cur;
+
+  // The first run boundary that could be this bit's end
+  while (k + 1 < rd->runs &&
+      (int64_t)rd->s->pos[k + 1] * 256 < want - rd->tol)
+    k++;
+
+  if (k + 1 < rd->runs)
+  {
+    int64_t b = (int64_t)rd->s->pos[k + 1] * 256;
+
+    if (b <= want + rd->tol)
+      want = b;                   // an edge here: that IS the boundary
+  }
+
+  rd->pos = want;
+
+  return v;
+}
+
+//-----------------------------------------------------------------------------
+// Try to read one transaction starting at `p0` (x256 samples). Returns true
+// on a packet, with `end` receiving where it finished - which is not p0 plus
+// a bit count, because the phase has been re-anchored along the way.
+static bool swd_try(const LogicScratch *s, int runs, int size, int64_t p0,
+    int64_t bit_x256, SwdTx *tx, int64_t *data_pos, int64_t *end)
+{
+  SwdRd rd;
   int b[SWD_REQ_BITS];
 
-  // Every sample position is a bit centre: p0 + (k + 1/2) * T
+  swd_rd_init(&rd, s, runs, size, bit_x256, p0);
+
   for (int k = 0; k < SWD_REQ_BITS; k++)
   {
-    int64_t p = p0 + bit_x256 * (2 * k + 1) / 2;
+    b[k] = swd_rd_bit(&rd);
 
-    if (p / 256 >= size)
-      return 0;
-
-    b[k] = swd_level(s, runs, &cur, p);
+    if (b[k] < 0)
+      return false;
   }
 
   if (1 != b[0] || 0 != b[6] || 1 != b[7])
-    return 0;                     // start, stop and park are not negotiable
+    return false;                 // start, stop and park are not negotiable
 
   if (b[5] != ((b[1] ^ b[2] ^ b[3] ^ b[4]) & 1))
-    return 0;                     // ...nor is the parity over the four in the
+    return false;                 // ...nor is the parity over the four in the
                                   // middle, which is what makes this a packet
                                   // rather than eight bits that look like one
+  if (swd_rd_bit(&rd) < 0)
+    return false;                 // turnaround: undriven, so never read
+
   int ack = 0;
 
   for (int k = 0; k < 3; k++)
   {
-    int64_t p = p0 + bit_x256 * (2 * (9 + k) + 1) / 2;
+    int v = swd_rd_bit(&rd);
 
-    if (p / 256 >= size)
-      return 0;
+    if (v < 0)
+      return false;
 
-    ack |= swd_level(s, runs, &cur, p) << k;
+    ack |= v << k;
   }
 
   if (1 != ack && 2 != ack && 4 != ack)
-    return 0;                     // 000 and 111 mean nobody drove the line,
+    return false;                 // 000 and 111 mean nobody drove the line,
                                   // and the rest are not defined at all
 
   tx->req = (uint8_t)(b[0] | (b[1] << 1) | (b[2] << 2) | (b[3] << 3) |
@@ -199,39 +274,53 @@ static int swd_try(const LogicScratch *s, int runs, int size, int r0,
   tx->has_data = false;
 
   if (1 != ack)
-    return SWD_SHORT_BITS;        // WAIT or FAULT: no data phase follows
+  {
+    if (swd_rd_bit(&rd) < 0)      // the turnaround that ends it
+      return false;
+
+    *end = rd.pos;
+
+    return true;                  // WAIT or FAULT: no data phase follows
+  }
 
   // A read puts the data straight after the acknowledgement; a write has to
   // hand the line back first, so its data starts one cycle later
-  int first = tx->write ? 13 : 12;
+  if (tx->write && swd_rd_bit(&rd) < 0)
+    return false;
+
+  *data_pos = rd.pos;             // where the thirty-two bits actually begin
+
   uint32_t data = 0;
 
   for (int k = 0; k < 32; k++)
   {
-    int64_t p = p0 + bit_x256 * (2 * (first + k) + 1) / 2;
+    int v = swd_rd_bit(&rd);
 
-    if (p / 256 >= size)
-      return 0;
+    if (v < 0)
+      return false;
 
-    data |= (uint32_t)swd_level(s, runs, &cur, p) << k;
+    data |= (uint32_t)v << k;
   }
 
-  int64_t pp = p0 + bit_x256 * (2 * (first + 32) + 1) / 2;
+  int par = swd_rd_bit(&rd);
 
-  if (pp / 256 >= size)
-    return 0;
-
-  int par = swd_level(s, runs, &cur, pp);
+  if (par < 0)
+    return false;
 
   tx->data = data;
   tx->has_data = true;
   tx->par_ok = (par == (swd_parity(data, 32) ? 1 : 0));
 
+  if (!tx->write)
+    swd_rd_bit(&rd);              // the trailing turnaround; may run off the
+                                  // end of the record, which is not a fault
+  *end = rd.pos;
+
   // The parity is REPORTED, not required. A packet that got this far has
   // already passed five checks, so a failed data parity is a fact about the
   // traffic - a marginal signal, a probe on a long lead - and hiding the
   // transaction would hide exactly the fault worth seeing.
-  return SWD_TX_BITS;
+  return true;
 }
 
 //-----------------------------------------------------------------------------
@@ -359,17 +448,35 @@ static int swd_pass(const LogicScratch *s, int runs, int size,
     }
 
     if (0 == s->lvl[r] || 0 != s->lvl[r - 1])
-      continue;                   // the start bit is a one, and this has to be
-                                  // its leading edge
-
-    if ((int64_t)s->pos[r] * 256 < consumed)
-      continue;                   // inside a packet already read
+      continue;                   // every anchor here is a RISING edge
 
     SwdTx tx;
-    int used = swd_try(s, runs, size, r, bit_x256, &tx);
+    int64_t data_pos = 0, end = 0;
+    int64_t edge = (int64_t)s->pos[r] * 256;
+    int64_t pstart = edge;
 
-    if (0 == used)
-      continue;
+    // Two readings of the same edge, and the second is what makes back-to-back
+    // packets readable at all.
+    //
+    // The obvious one is that this edge is the START bit. It usually is: a
+    // host holds SWDIO low through its idle cycles, so a packet opens with a
+    // rise. But it does not have to - a packet may follow the one before it
+    // with no idle at all, and then the previous turnaround left the line
+    // high and there is NO edge at the start bit to anchor on.
+    //
+    // What every packet does have is the stop bit and the park bit, which are
+    // 0 and 1 by definition: a rising edge at bit 7, always, whatever the data
+    // and whatever came before. So an edge that heads no packet is tried again
+    // as that one, seven bit times further in.
+    if (edge < consumed || !swd_try(s, runs, size, edge, bit_x256, &tx,
+        &data_pos, &end))
+    {
+      pstart = edge - bit_x256 * 7;
+
+      if (pstart < 0 || pstart < consumed ||
+          !swd_try(s, runs, size, pstart, bit_x256, &tx, &data_pos, &end))
+        continue;
+    }
 
     txs++;
 
@@ -408,8 +515,7 @@ static int swd_pass(const LogicScratch *s, int runs, int size,
         for (int k = 0; k < r; k++)
         {
           if ((int64_t)s->pos[k] * 256 >= consumed &&
-              (int64_t)s->pos[k] * 256 < (int64_t)s->pos[r] * 256 &&
-              0 != s->lvl[k])
+              (int64_t)s->pos[k] * 256 < pstart && 0 != s->lvl[k])
             a->gap_bad++;
         }
       }
@@ -417,7 +523,7 @@ static int swd_pass(const LogicScratch *s, int runs, int size,
 
     if (out)
     {
-      int64_t p0 = (int64_t)s->pos[r] * 256;
+      int64_t p0 = pstart;
       int first = out->count;
 
       if (out->count >= LOGIC_MAX_BYTES)
@@ -441,7 +547,11 @@ static int swd_pass(const LogicScratch *s, int runs, int size,
 
       if (tx.has_data)
       {
-        int64_t d0 = p0 + bit_x256 * (tx.write ? 13 : 12);
+        // Where the data phase really started, as the reader found it - not
+        // p0 plus twelve or thirteen bit times. Those two numbers differ by
+        // however much the phase was re-anchored on the way, and the marks
+        // on the trace have to sit where the decoder actually looked.
+        int64_t d0 = data_pos;
 
         for (int k = 0; k < 4 && out->count < LOGIC_MAX_BYTES; k++)
         {
@@ -470,7 +580,7 @@ static int swd_pass(const LogicScratch *s, int runs, int size,
     if (a && a->txs < SWD_MAX_TX)
       a->txs++;
 
-    consumed = (int64_t)s->pos[r] * 256 + bit_x256 * used;
+    consumed = end;
   }
 
   return oks * 4 + txs;
