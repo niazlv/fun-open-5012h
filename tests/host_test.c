@@ -9,7 +9,9 @@
  *   cc -O2 -I. tests/host_test.c measure.c fft.c classify.c uart_decode.c \
  *      logic_decode.c nec_decode.c onewire_decode.c ws2812_decode.c \
  *      servo_decode.c can_decode.c dht_decode.c sent_decode.c \
- *      midi_decode.c lin_decode.c \
+ *      midi_decode.c lin_decode.c ev1527_decode.c dshot_decode.c \
+ *      spi_decode.c manchester_decode.c rc5_decode.c dali_decode.c \
+ *      knx_decode.c \
  *      record_window.c trend.c -lm -o /tmp/scope_test && /tmp/scope_test
  */
 
@@ -519,6 +521,382 @@ static void lin_g_frame(LinGen *g, uint8_t id, const uint8_t *d, int n,
 
   lin_g_byte(g, lin_g_csum(d, n, lin_g_pid(id), enhanced));
   lin_g_run(g, 1, 8);                     // inter-frame space
+}
+
+// EV1527: idle LOW, pulses high, everything measured in T. Sync is 1T high
+// and 31T low; a '0' is 1T high and 3T low, a '1' the other way round. Twenty
+// bits of address then four of buttons, most significant first.
+typedef struct { uint8_t *buf; int size; double t; double sps_t; int inv; } EvGen;
+
+static void ev_g_run(EvGen *g, int high, double ticks)
+{
+  int a = (int)(g->t + 0.5);
+
+  g->t += ticks * g->sps_t;
+
+  int b = (int)(g->t + 0.5);
+  int v = ((high ^ g->inv) & 1) ? 200 : 56;
+
+  for (int i = a; i < b && i < g->size; i++)
+    g->buf[i] = (uint8_t)v;
+}
+
+static void ev_g(EvGen *g, uint8_t *buf, int size, double period_ns,
+    double t_us, int inv)
+{
+  g->buf = buf;
+  g->size = size;
+  g->t = 0;
+  g->sps_t = t_us * 1000.0 / period_ns;
+  g->inv = inv;
+
+  memset(buf, inv ? 200 : 56, (size_t)size);
+
+  ev_g_run(g, 0, 40);                     // the line at rest
+}
+
+static void ev_g_frame(EvGen *g, uint32_t addr, uint8_t key)
+{
+  uint32_t v = ((addr & 0xFFFFF) << 4) | (key & 0x0F);
+
+  ev_g_run(g, 1, 1);                      // sync: 1T of pulse...
+  ev_g_run(g, 0, 31);                     // ...and 31T of gap
+
+  for (int i = 23; i >= 0; i--)           // MSB first
+  {
+    int bit = (v >> i) & 1;
+
+    ev_g_run(g, 1, bit ? 3 : 1);
+    ev_g_run(g, 0, bit ? 1 : 3);
+  }
+}
+
+// DShot: sixteen bits, constant period, the duty carries the value. High for
+// 3/8 of the bit is a zero and for 3/4 a one; the line rests low and the
+// frame is followed by idle until the next control loop.
+typedef struct { uint8_t *buf; int size; double t; double sps_bit; int inv; } DsGen;
+
+static void ds_g_run(DsGen *g, int high, double bits)
+{
+  int a = (int)(g->t + 0.5);
+
+  g->t += bits * g->sps_bit;
+
+  int b = (int)(g->t + 0.5);
+  int v = ((high ^ g->inv) & 1) ? 200 : 56;
+
+  for (int i = a; i < b && i < g->size; i++)
+    g->buf[i] = (uint8_t)v;
+}
+
+static void ds_g(DsGen *g, uint8_t *buf, int size, double period_ns,
+    double kbit, int inv)
+{
+  g->buf = buf;
+  g->size = size;
+  g->t = 0;
+  g->sps_bit = 1e6 / kbit / period_ns;
+  g->inv = inv;
+
+  memset(buf, inv ? 200 : 56, (size_t)size);
+
+  ds_g_run(g, 0, 20);                     // the line at rest
+}
+
+static uint16_t ds_g_crc(uint16_t d, int inverted)
+{
+  uint8_t c = (uint8_t)((d ^ (d >> 4) ^ (d >> 8)) & 0x0F);
+
+  return inverted ? (uint8_t)(~c & 0x0F) : c;
+}
+
+// value: 11 bits of throttle or command; telem: the request flag
+static void ds_g_frame(DsGen *g, uint16_t value, int telem, int inverted)
+{
+  uint16_t d = (uint16_t)(((value & 0x7FF) << 1) | (telem ? 1 : 0));
+  uint16_t frame = (uint16_t)((d << 4) | ds_g_crc(d, inverted));
+
+  for (int i = 15; i >= 0; i--)           // MSB first
+  {
+    int one = (frame >> i) & 1;
+
+    ds_g_run(g, 1, one ? 0.75 : 0.375);
+    ds_g_run(g, 0, one ? 0.25 : 0.625);
+  }
+
+  ds_g_run(g, 0, 30);                     // idle until the next control loop
+}
+
+// An SPI master's MOSI line and nothing else: bits at a constant rate, MSB
+// first, with an optional pause between bytes the way a bit-banged master
+// leaves one. The clock is NOT generated - that is the whole point.
+typedef struct { uint8_t *buf; int size; double t; double sps_bit; } SpiGen;
+
+static void spi_g_level(SpiGen *g, int high, double bits)
+{
+  int a = (int)(g->t + 0.5);
+
+  g->t += bits * g->sps_bit;
+
+  int b = (int)(g->t + 0.5);
+
+  for (int i = a; i < b && i < g->size; i++)
+    g->buf[i] = high ? (uint8_t)200 : (uint8_t)56;
+}
+
+static void spi_g(SpiGen *g, uint8_t *buf, int size, double period_ns,
+    double clock_hz)
+{
+  g->buf = buf;
+  g->size = size;
+  g->t = 0;
+  g->sps_bit = 1e9 / clock_hz / period_ns;
+
+  memset(buf, 200, (size_t)size);       // the line idles high
+
+  spi_g_level(g, 1, 20);
+}
+
+// gap_bits of idle after the byte: 0 for a hardware master running bytes
+// back to back, more for a bit-banged one
+static void spi_g_byte(SpiGen *g, uint8_t v, double gap_bits)
+{
+  for (int b = 7; b >= 0; b--)          // MSB first
+    spi_g_level(g, (v >> b) & 1, 1);
+
+  if (gap_bits > 0)
+    spi_g_level(g, 1, gap_bits);
+}
+
+// Manchester: a transition in the middle of every bit, and one on the
+// boundary only when two adjacent bits are the same. Generated in the G.E.
+// Thomas convention - a rising mid-bit edge is a one - which is RC5's.
+typedef struct { uint8_t *buf; int size; double t; double sps_half; } ManGen;
+
+static void man_g_level(ManGen *g, int high, double halves)
+{
+  int a = (int)(g->t + 0.5);
+
+  g->t += halves * g->sps_half;
+
+  int b = (int)(g->t + 0.5);
+
+  for (int i = a; i < b && i < g->size; i++)
+    g->buf[i] = high ? (uint8_t)200 : (uint8_t)56;
+}
+
+static void man_g(ManGen *g, uint8_t *buf, int size, double period_ns,
+    double bps)
+{
+  g->buf = buf;
+  g->size = size;
+  g->t = 0;
+  g->sps_half = 1e9 / bps / 2.0 / period_ns;
+
+  memset(buf, 200, (size_t)size);       // the line rests high
+
+  man_g_level(g, 1, 20);
+}
+
+static void man_g_bit(ManGen *g, int bit)
+{
+  man_g_level(g, bit ? 0 : 1, 1);       // first half...
+  man_g_level(g, bit ? 1 : 0, 1);       // ...and the transition that IS the bit
+}
+
+// `nbits` of `value`, most significant first. `flat` is the index of a bit
+// sent with NO transition in its middle - an encoding violation - or -1.
+static void man_g_bits(ManGen *g, uint32_t value, int nbits, int flat)
+{
+  for (int i = nbits - 1; i >= 0; i--)
+  {
+    int k = nbits - 1 - i;
+    int bit = (value >> i) & 1;
+
+    if (k == flat)
+      man_g_level(g, bit ? 0 : 1, 2);   // the whole bit at its first level
+    else
+      man_g_bit(g, bit);
+  }
+
+  man_g_level(g, 1, 40);                // ...and the line goes back to rest
+}
+
+static void man_g_frame(ManGen *g, uint32_t value, int nbits)
+{
+  man_g_bits(g, value, nbits, -1);
+}
+
+// RC5 / RC6 off an infrared demodulator: the output rests HIGH and a mark -
+// carrier present - pulls it low. RC5 sends a one as silence then carrier,
+// RC6 the other way round, which is the whole of the difference between them
+// once the leader is past.
+typedef struct { uint8_t *buf; int size; double t; double sps_bit; } IrGen;
+
+static void ir_g_level(IrGen *g, int mark, double bits)
+{
+  int a = (int)(g->t + 0.5);
+
+  g->t += bits * g->sps_bit;
+
+  int b = (int)(g->t + 0.5);
+
+  for (int i = a; i < b && i < g->size; i++)
+    g->buf[i] = mark ? (uint8_t)56 : (uint8_t)200;
+}
+
+static void ir_g(IrGen *g, uint8_t *buf, int size, double period_ns,
+    double bit_us)
+{
+  g->buf = buf;
+  g->size = size;
+  g->t = 0;
+  g->sps_bit = bit_us * 1000.0 / period_ns;
+
+  memset(buf, 200, (size_t)size);      // no carrier: the output rests high
+
+  ir_g_level(g, 0, 8);
+}
+
+// RC5: a one is silence then carrier
+static void rc5_g_frame(IrGen *g, uint32_t value, int nbits)
+{
+  for (int i = nbits - 1; i >= 0; i--)
+  {
+    int one = (value >> i) & 1;
+
+    ir_g_level(g, one ? 0 : 1, 0.5);
+    ir_g_level(g, one ? 1 : 0, 0.5);
+  }
+
+  ir_g_level(g, 0, 20);
+}
+
+// RC6 mode 0: leader, then 21 bits of which the trailer is twice as wide,
+// and a one is carrier then silence
+static void rc6_g_frame(IrGen *g, uint32_t value, int nbits, int wide)
+{
+  ir_g_level(g, 1, 3.0);               // 2.666 ms of carrier
+  ir_g_level(g, 0, 1.0);               // ...and 0.889 of silence
+
+  for (int i = nbits - 1; i >= 0; i--)
+  {
+    int one = (value >> i) & 1;
+    double h = (nbits - 1 - i == wide) ? 1.0 : 0.5;
+
+    ir_g_level(g, one ? 1 : 0, h);
+    ir_g_level(g, one ? 0 : 1, h);
+  }
+
+  ir_g_level(g, 0, 20);
+}
+
+// DALI on the pair: the bus rests HIGH and a transmitter pulls it down. A
+// one is a low-to-high transition in the middle of the bit, a zero the other
+// way round, and the two stop bits are the bus simply left alone.
+typedef struct { uint8_t *buf; int size; double t; double sps_bit; } DaliGen;
+
+static void dali_g_level(DaliGen *g, int high, double bits)
+{
+  int a = (int)(g->t + 0.5);
+
+  g->t += bits * g->sps_bit;
+
+  int b = (int)(g->t + 0.5);
+
+  for (int i = a; i < b && i < g->size; i++)
+    g->buf[i] = high ? (uint8_t)200 : (uint8_t)56;
+}
+
+static void dali_g(DaliGen *g, uint8_t *buf, int size, double period_ns)
+{
+  g->buf = buf;
+  g->size = size;
+  g->t = 0;
+  g->sps_bit = 1e9 / 1200.0 / period_ns;
+
+  memset(buf, 200, (size_t)size);
+  dali_g_level(g, 1, 10);
+}
+
+static void dali_g_frame(DaliGen *g, uint32_t value, int nbits)
+{
+  for (int i = nbits - 1; i >= 0; i--)
+  {
+    int one = (value >> i) & 1;
+
+    dali_g_level(g, one ? 0 : 1, 0.5);
+    dali_g_level(g, one ? 1 : 0, 0.5);
+  }
+
+  dali_g_level(g, 1, 12);              // the stop bits and then some
+}
+
+// A forward frame: start bit, address byte, data byte
+static void dali_g_fwd(DaliGen *g, uint8_t addr, uint8_t d)
+{
+  dali_g_frame(g, (1u << 16) | ((uint32_t)addr << 8) | d, 17);
+}
+
+// KNX TP1: 9600, and the line code is pulse PRESENCE. A zero is a ~35 us
+// active pulse at the start of its bit period; a one is nothing at all. The
+// bus rests high and a pulse pulls it down.
+typedef struct { uint8_t *buf; int size; double t; double sps_bit; } KnxGen;
+
+static void knx_g(KnxGen *g, uint8_t *buf, int size, double period_ns)
+{
+  g->buf = buf;
+  g->size = size;
+  g->sps_bit = 104167.0 / period_ns;
+  g->t = 20 * g->sps_bit;
+
+  memset(buf, 200, (size_t)size);
+}
+
+// One character: start(0), 8 data least significant first, even parity, stop
+static void knx_g_char(KnxGen *g, uint8_t v)
+{
+  int bits[11];
+  int ones = 0;
+
+  bits[0] = 0;
+
+  for (int k = 0; k < 8; k++)
+  {
+    bits[1 + k] = (v >> k) & 1;
+    ones += bits[1 + k];
+  }
+
+  bits[9] = (ones & 1);                // even parity over data + parity
+  bits[10] = 1;
+
+  for (int k = 0; k < 11; k++)
+  {
+    if (bits[k])
+      continue;                        // a one is silence
+
+    int a = (int)(g->t + k * g->sps_bit + 0.5);
+    int e = a + (int)(35000.0 / 104167.0 * g->sps_bit + 0.5);
+
+    for (int i = a; i < e && i < g->size; i++)
+      g->buf[i] = 56;
+  }
+
+  g->t += 13 * g->sps_bit;             // 11 slots and two of gap
+}
+
+// A whole telegram, with the check octet added
+static void knx_g_telegram(KnxGen *g, const uint8_t *b, int n)
+{
+  uint8_t x = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    knx_g_char(g, b[i]);
+    x ^= b[i];
+  }
+
+  knx_g_char(g, (uint8_t)~x);
 }
 
 static double fn_sine(double ph, void *arg)     { (void)arg; return sin(2 * M_PI * ph); }
@@ -1445,13 +1823,209 @@ int main(void)
           !strcmp(a->device, "DS1990 key"), 1, 0);
       check_near("not a thermometer", a->thermometer, 0, 0);
       check_near("no temperature", a->temp_valid, 0, 0);
-      check_near("header", !strcmp(lr.info, "DS1990 key ROM ok"), 1, 0);
+      // The whole conversation a DS1990 can have is this one: reset, READ
+      // ROM, eight bytes. There is nothing missing from the record, so what
+      // it holds is an EVENT - a key touched to a reader - and the header
+      // says that and prints the number written on the key, six serial bytes
+      // most significant first, the way a reader prints it.
+      check_near("read as a touch", a->ibutton, 1, 0);
+      check_near("header",
+          !strcmp(lr.info, "iButton CDAB89674523"), 1, 0);
 
       char lab[16];
       onewire_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
       check_near("family byte labelled", !strcmp(lab, "DS1990 key"), 1, 0);
       onewire_byte_label(a, 8, lr.bytes[8], lab, sizeof(lab));
       check_near("CRC byte labelled", !strcmp(lab, "CRC"), 1, 0);
+    }
+
+    // 0x81 is a DS1420 - a ROM and nothing else, functionally a DS1990 sold
+    // as an identity token. Caught on the bench as "fam 81", which is the
+    // decoder reporting its own table rather than the bus.
+    printf("1-wire a serial ID button:\n");
+    {
+      OwGen g = { buf, SIZE, 0 };
+      uint8_t rom[8] = { 0x81, 0x0A, 0x1B, 0x2C, 0x3D, 0x4E, 0x5F, 0 };
+
+      rom[7] = ow_crc(rom, 7);
+      memset(buf, 200, SIZE);
+
+      ow_reset(&g);
+      ow_byte(&g, 0x33);
+      ow_bytes(&g, rom, 8);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const OwAnalysis *a = onewire_analysis();
+      char lab[16];
+
+      check_near("named", a->device && !strcmp(a->device, "DS1420 ID"), 1, 0);
+      check_near("read as a touch", a->ibutton, 1, 0);
+      check_near("header", !strcmp(lr.info, "iButton 5F4E3D2C1B0A"), 1, 0);
+      onewire_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("family byte", !strcmp(lab, "DS1420 ID"), 1, 0);
+    }
+
+    // ...and a family this decoder has no name for at all. The transaction is
+    // still one complete thing - an identity was asked for and given - so the
+    // identity is what to show, rather than how much the table knows.
+    printf("1-wire an unknown family, ROM only:\n");
+    {
+      OwGen g = { buf, SIZE, 0 };
+      uint8_t rom[8] = { 0x77, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0 };
+
+      rom[7] = ow_crc(rom, 7);
+      memset(buf, 200, SIZE);
+
+      ow_reset(&g);
+      ow_byte(&g, 0x33);
+      ow_bytes(&g, rom, 8);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const OwAnalysis *a = onewire_analysis();
+
+      check_near("ROM checks out", a->rom_valid, 1, 0);
+      check_near("no name for it", a->device == NULL, 1, 0);
+      check_near("...but the identity is the answer", a->id_only, 1, 0);
+      check_near("header",
+          !strcmp(lr.info, "1-Wire 77 665544332211"), 1, 0);
+    }
+
+    // Every family code in the table has to name something, and the table is
+    // indexed linearly - so a duplicate or a stray zero would be a silent
+    // shadow. Sweeping the whole byte range is cheap and catches both.
+    printf("1-wire family table:\n");
+    {
+      int named = 0, thermometers = 0, keys = 0;
+
+      for (int code = 0; code < 256; code++)
+      {
+        OwGen g = { buf, SIZE, 0 };
+        uint8_t rom[8] = { (uint8_t)code, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x66, 0 };
+
+        rom[7] = ow_crc(rom, 7);
+        memset(buf, 200, SIZE);
+
+        ow_reset(&g);
+        ow_byte(&g, 0x33);
+        ow_bytes(&g, rom, 8);
+
+        if (onewire_decode(buf, SIZE, 0, 1000, &scratch, &lr) < 9)
+          continue;
+
+        const OwAnalysis *a = onewire_analysis();
+
+        if (!a->rom_valid || a->family != (uint8_t)code)
+          continue;
+
+        if (a->device)
+          named++;
+
+        if (a->thermometer)
+          thermometers++;
+
+        if (a->ibutton)
+          keys++;
+
+        // Named or not, an identity read always yields the identity
+        if (!a->device && !a->id_only)
+          named = -1000;              // an unnamed family that said nothing
+      }
+
+      check_near("families named", named, 55, 0);
+      // 10 18S20, 21 1921, 22 1822, 28 18B20, 3B 1825, 41 1922, 42 28EA00
+      check_near("...of which thermometers", thermometers, 7, 0);
+      // 01 DS1990 and 81 DS1420: the two that are a ROM and nothing else
+      check_near("...and read as a touch", keys, 2, 0);
+    }
+
+    // The MagSafe chip, and the reason it is worth telling the switches
+    // apart: 0xF5 reads two pins on a DS2413, eight channels on a DS2408 and
+    // memory on a DS2406. Naming it from the family is the only way that
+    // byte gets the right word under it.
+    printf("1-wire DS2413 switch:\n");
+    {
+      OwGen g = { buf, SIZE, 0 };
+      uint8_t rom[8] = { 0x3A, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0 };
+      // PIOA reading low and PIOB reading high, with the top nibble the
+      // complement of the bottom - which is what makes the byte a PIO answer
+      // rather than a bus nobody is driving. Bit 0 is A's pin and bit 2 is
+      // B's; the odd bits are the output latches.
+      uint8_t pio = 0x0E | (uint8_t)((~0x0E & 0x0F) << 4);
+
+      rom[7] = ow_crc(rom, 7);
+      memset(buf, 200, SIZE);
+
+      ow_reset(&g);
+      ow_byte(&g, 0x33);
+      ow_bytes(&g, rom, 8);
+      ow_reset(&g);
+      ow_byte(&g, 0xCC);
+      ow_byte(&g, 0xF5);          // PIO ACCESS READ
+      ow_byte(&g, pio);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const OwAnalysis *a = onewire_analysis();
+      char lab[16];
+
+      check_near("family named", a->device &&
+          !strcmp(a->device, "DS2413 sw"), 1, 0);
+      check_near("not a touch: it was told to do something", a->ibutton, 0, 0);
+      check_near("the pins were read", a->pio_valid, 1, 0);
+      check_near("header", !strcmp(lr.info, "DS2413 sw A=0 B=1"), 1, 0);
+
+      onewire_byte_label(a, 10, lr.bytes[10], lab, sizeof(lab));
+      check_near("command named for THIS family",
+          !strcmp(lab, "PIO READ"), 1, 0);
+      onewire_byte_label(a, 11, lr.bytes[11], lab, sizeof(lab));
+      check_near("and the pins read off", !strcmp(lab, "A=0 B=1"), 1, 0);
+    }
+
+    // ...and the same opcode on a part that is not a DS2413 gets that part's
+    // name, not this one's
+    printf("1-wire the same opcode on another family:\n");
+    {
+      OwGen g = { buf, SIZE, 0 };
+      uint8_t rom[8] = { 0x29, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0 };
+
+      rom[7] = ow_crc(rom, 7);
+      memset(buf, 200, SIZE);
+
+      ow_reset(&g);
+      ow_byte(&g, 0x33);
+      ow_bytes(&g, rom, 8);
+      ow_reset(&g);
+      ow_byte(&g, 0xCC);
+      ow_byte(&g, 0xF5);
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const OwAnalysis *a = onewire_analysis();
+      char lab[16];
+
+      check_near("a DS2408", a->device &&
+          !strcmp(a->device, "DS2408 sw"), 1, 0);
+      onewire_byte_label(a, 10, lr.bytes[10], lab, sizeof(lab));
+      check_near("0xF5 is channel access here",
+          !strcmp(lab, "CH READ"), 1, 0);
+      check_near("and no pins were invented", a->pio_valid, 0, 0);
+    }
+
+    // With no ROM on the wire there is no family, so a function byte is named
+    // from the only reading worth offering - and says it is a guess
+    printf("1-wire a function byte with no ROM behind it:\n");
+    {
+      OwGen g = { buf, SIZE, 0 };
+      char lab[16];
+
+      memset(buf, 200, SIZE);
+      ow_reset(&g);
+      ow_byte(&g, 0xCC);          // SKIP ROM: nobody said what this is
+      ow_byte(&g, 0x44);          // CONVERT T - probably
+
+      logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      onewire_byte_label(onewire_analysis(), 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("named, with a question mark",
+          !strcmp(lab, "CONVERT?"), 1, 0);
     }
 
     printf("1-wire ds18b20 by ROM:\n");
@@ -3450,6 +4024,1602 @@ int main(void)
             100, PROTO_AUTO, &scratch, &lr) > 0 && lr.proto == PROTO_SENT,
             1, 0);
       }
+    }
+
+    // =========================== EV1527 decoder ===========================
+    //
+    // No checksum anywhere in the protocol, so the shape has to carry the
+    // identification on its own - and it can: T comes out of one 1:31 sync
+    // ratio, and then all 24 bits have to be exactly 4T long, which is 24
+    // independent checks of a constant nothing else here holds.
+    printf("ev1527, one frame:\n");
+    {
+      EvGen g;
+      char lab[16];
+
+      ev_g(&g, buf, SIZE, 4000.0, 320.0, 0);
+      ev_g_frame(&g, 0x5A3C7, 1);
+
+      int n = logic_decode(buf, SIZE, 0, 4000, PROTO_AUTO, &scratch, &lr);
+      const Ev1527Analysis *a = ev1527_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_EV1527, 0);
+      check_near("three bytes for 24 bits", n, 3, 0);
+      check_near("address", a->frame[0].addr, 0x5A3C7, 0);
+      check_near("key", a->frame[0].key, 1, 0);
+      check_near("T found from the sync", lr.rate, 320000, 2);
+      // The bus rests low, which is upside down from everything else here
+      check_near("idle is low", lr.idle_high, 0, 0);
+      check_near("header", !strcmp(lr.info, "EV1527 5A3C7 K1 320us"), 1, 0);
+
+      // MSB first into three bytes, so the hex dump reads the address and
+      // the buttons straight off: 5A3C7 with key 1 is "5A 3C 71"
+      check_near("hex reads the address", lr.bytes[0], 0x5A, 0);
+      check_near("...", lr.bytes[1], 0x3C, 0);
+      check_near("...and the key", lr.bytes[2], 0x71, 0);
+
+      int gs, gl;
+
+      ev1527_group_at(a, 1, &gs, &gl);
+      check_near("one frame is one group", gs, 0, 0);
+      check_near("...of three bytes", gl, 3, 0);
+
+      ev1527_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("group reads both", !strcmp(lab, "5A3C7 K1"), 1, 0);
+      ev1527_field_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("last byte is address and key",
+          !strcmp(lab, "A3-0+K"), 1, 0);
+      ev1527_field_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("first is the top of the address",
+          !strcmp(lab, "A19-12"), 1, 0);
+    }
+
+    // A held button repeats the frame, and with no checksum in the protocol
+    // that repetition is the only corroboration there is
+    printf("ev1527, a button held down:\n");
+    {
+      EvGen g;
+
+      // A frame is 128 T, so four of them plus the lead-in need a record of
+      // some 550 T: 8 us a sample puts that inside the 24K buffer at 40
+      // samples to the T, which is still far more than the split needs
+      ev_g(&g, buf, SIZE, 8000.0, 320.0, 0);
+
+      for (int i = 0; i < 4; i++)
+        ev_g_frame(&g, 0x5A3C7, 8);
+
+      logic_decode(buf, SIZE, 0, 8000, PROTO_AUTO, &scratch, &lr);
+      const Ev1527Analysis *a = ev1527_analysis();
+
+      check_near("four frames", a->frames, 4, 0);
+      check_near("all agreeing", a->agree, 1, 0);
+      check_near("bytes", lr.count, 12, 0);
+      check_near("header", !strcmp(lr.info, "EV1527 5A3C7 K8 x4 320us"), 1, 0);
+    }
+
+    // The four buttons of a remote, one after another. They are one-hot, so
+    // the key nibble walks 1, 2, 4, 8 - and a decoder that dropped or shifted
+    // a bit anywhere in the 24 would show it here and nowhere else.
+    printf("ev1527, the buttons in turn:\n");
+    {
+      const uint8_t key[4] = { 1, 2, 4, 8 };
+
+      for (int i = 0; i < 4; i++)
+      {
+        EvGen g;
+
+        ev_g(&g, buf, SIZE, 4000.0, 320.0, 0);
+        ev_g_frame(&g, 0x5A3C7, key[i]);
+        ev_g_frame(&g, 0x5A3C7, key[i]);
+
+        logic_decode(buf, SIZE, 0, 4000, PROTO_AUTO, &scratch, &lr);
+        const Ev1527Analysis *a = ev1527_analysis();
+
+        check_near("address holds", a->frame[0].addr, 0x5A3C7, 0);
+        check_near("button", a->frame[0].key, key[i], 0);
+        check_near("both repeats agree", a->agree, 1, 0);
+      }
+    }
+
+    // Two different buttons in one record is not a fault - a finger moved -
+    // so the header stops claiming one reading and the frames keep their own
+    printf("ev1527, the button changing mid-record:\n");
+    {
+      EvGen g;
+      char lab[16];
+
+      ev_g(&g, buf, SIZE, 4000.0, 320.0, 0);
+      ev_g_frame(&g, 0x5A3C7, 1);
+      ev_g_frame(&g, 0x5A3C7, 2);
+
+      logic_decode(buf, SIZE, 0, 4000, PROTO_AUTO, &scratch, &lr);
+      const Ev1527Analysis *a = ev1527_analysis();
+
+      check_near("two frames", a->frames, 2, 0);
+      check_near("...that do not agree", a->agree, 0, 0);
+      check_near("no error is claimed", lr.errors, 0, 0);
+      check_near("header", !strcmp(lr.info, "EV1527 2 frames 320us"), 1, 0);
+
+      ev1527_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("first frame keeps its key", !strcmp(lab, "5A3C7 K1"), 1, 0);
+      ev1527_byte_label(a, 5, lr.bytes[5], lab, sizeof(lab));
+      check_near("second keeps its own", !strcmp(lab, "5A3C7 K2"), 1, 0);
+    }
+
+    // T is set by a resistor and no two remotes agree, so it is measured and
+    // never assumed - and an inverting receiver module costs one more pass
+    printf("ev1527 at several unit times, and inverted:\n");
+    {
+      const double t_us[3] = { 130.0, 320.0, 800.0 };
+
+      for (int i = 0; i < 3; i++)
+      {
+        EvGen g;
+        // Forty samples to the T whatever T is, so the record holds the same
+        // two frames each time and only the unit time under test changes
+        double per = t_us[i] * 1000.0 / 40.0;
+
+        ev_g(&g, buf, SIZE, per, t_us[i], 0);
+        ev_g_frame(&g, 0x12345, 4);
+        ev_g_frame(&g, 0x12345, 4);
+
+        logic_decode(buf, SIZE, 0, (int)per, PROTO_AUTO, &scratch, &lr);
+
+        check_near("still EV1527", lr.proto, PROTO_EV1527, 0);
+        check_near("T measured", lr.rate, t_us[i] * 1000.0, 4);
+        check_near("address", ev1527_analysis()->frame[0].addr, 0x12345, 0);
+      }
+
+      EvGen g;
+
+      ev_g(&g, buf, SIZE, 4000.0, 320.0, 1);
+      ev_g_frame(&g, 0x12345, 4);
+
+      logic_decode(buf, SIZE, 0, 4000, PROTO_AUTO, &scratch, &lr);
+      check_near("inverted still decodes", lr.proto, PROTO_EV1527, 0);
+      check_near("and says the pulses are low", lr.idle_high, 1, 0);
+      check_near("address", ev1527_analysis()->frame[0].addr, 0x12345, 0);
+    }
+
+    // NEC is the one signal EV1527 could be confused with: both open with a
+    // pulse and a long gap, and absolute durations cannot separate them at
+    // all - T runs 100..400 us in the wild, so 31T covers 3..12 ms and NEC's
+    // 9 ms leader sits inside that. The SHAPE separates them completely, in
+    // two independent ways, and this is the test that says so.
+    printf("ev1527 and NEC are not each other:\n");
+    {
+      // A NEC frame, built the way nec_decode's own test does: 9 ms leader,
+      // 4.5 ms space, then 32 bits of constant 560 us mark
+      const uint8_t nec[4] = { 0x00, 0xFF, 0x15, 0xEA };
+      int pos = 0;
+
+      memset(buf, 200, SIZE);
+
+      for (int i = 0; i < 9000 && pos < SIZE; i++, pos++)
+        buf[pos] = 56;                    // leader mark, active low
+
+      for (int i = 0; i < 4500 && pos < SIZE; i++, pos++)
+        buf[pos] = 200;
+
+      for (int by = 0; by < 4; by++)
+      {
+        for (int b = 0; b < 8; b++)
+        {
+          int one = (nec[by] >> b) & 1;
+
+          for (int i = 0; i < 560 && pos < SIZE; i++, pos++)
+            buf[pos] = 56;
+
+          for (int i = 0; i < (one ? 1690 : 560) && pos < SIZE; i++, pos++)
+            buf[pos] = 200;
+        }
+      }
+
+      for (int i = 0; i < 560 && pos < SIZE; i++, pos++)
+        buf[pos] = 56;
+
+      check_near("nec is not ev1527",
+          ev1527_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+      check_near("...and is still nec", logic_decode(buf, SIZE, 0, 1000,
+          PROTO_AUTO, &scratch, &lr) > 0 && lr.proto == PROTO_NEC, 1, 0);
+
+      // ...and the other way: an EV1527 frame whose 31T gap is 9.9 ms, right
+      // on top of a NEC leader, must not come out as NEC
+      EvGen g;
+
+      ev_g(&g, buf, SIZE, 4000.0, 320.0, 0);
+      ev_g_frame(&g, 0x5A3C7, 2);
+      ev_g_frame(&g, 0x5A3C7, 2);
+
+      check_near("ev1527 is not nec",
+          nec_decode(buf, SIZE, 0, 4000, &scratch, &lr), 0, 0);
+    }
+
+    printf("ev1527 rejects the rest:\n");
+    {
+      EvGen g;
+
+      // It runs ahead of LIN, 1-Wire, WS2812, DHT, SENT, MIDI, servo and
+      // UART, and each of those has a long dominant field its sync could be
+      // mistaken for. None of them has 24 bits of constant period behind it.
+      synth_uart(buf, SIZE, 1000.0, 9600.0, "MILKV-UART-TEST 9600", 20000.0);
+      check_near("uart is not ev1527",
+          ev1527_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      check_near("sine is not ev1527",
+          ev1527_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      double duty = 0.075;
+      synth(buf, SIZE, 0, fn_square, &duty, 50.0, 10000.0, 90.0, ZERO_POINT);
+      check_near("servo is not ev1527",
+          ev1527_decode(buf, SIZE, 0, 10000, &scratch, &lr), 0, 0);
+
+      {
+        const uint8_t d[2] = { 0x11, 0x22 };
+        LinGen lg;
+
+        lin_g(&lg, buf, SIZE, 1000.0, 19200.0, 0);
+        lin_g_frame(&lg, 0x2A, d, 2, 1);
+        lin_g_frame(&lg, 0x2A, d, 2, 1);
+        check_near("lin is not ev1527",
+            ev1527_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+      }
+
+      {
+        const uint8_t by[5] = { 45, 0, 23, 0, 68 };
+        DhtGen dg = { buf, SIZE, 0 };
+
+        memset(buf, 200, SIZE);
+        dht_g_frame(&dg, by, 18000);
+        check_near("dht is not ev1527",
+            ev1527_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+      }
+
+      // ...and nobody takes an EV1527 record either
+      ev_g(&g, buf, SIZE, 4000.0, 320.0, 0);
+      ev_g_frame(&g, 0x5A3C7, 4);
+      ev_g_frame(&g, 0x5A3C7, 4);
+
+      check_near("ev1527 is not lin",
+          lin_decode(buf, SIZE, 0, 4000, &scratch, &lr), 0, 0);
+      check_near("ev1527 is not 1-wire",
+          onewire_decode(buf, SIZE, 0, 4000, &scratch, &lr), 0, 0);
+      check_near("ev1527 is not dht",
+          dht_decode(buf, SIZE, 0, 4000, &scratch, &lr), 0, 0);
+      check_near("ev1527 is not sent",
+          sent_decode(buf, SIZE, 0, 4000, &scratch, &lr), 0, 0);
+      check_near("ev1527 is not ws2812",
+          ws2812_decode(buf, SIZE, 0, 4000, &scratch, &lr), 0, 0);
+    }
+
+    // ============================ DShot decoder ===========================
+    //
+    // Sixteen bits, one number, and a CRC-4 that has to agree before anything
+    // is reported. No sync field: what delimits a frame is the idle on both
+    // sides of it, and that turns out to be what tells it from WS2812.
+    printf("dshot600, mid throttle:\n");
+    {
+      DsGen g;
+      char lab[16];
+
+      ds_g(&g, buf, SIZE, 20.0, 600.0, 0);
+      ds_g_frame(&g, 1047, 0, 0);
+
+      int n = logic_decode(buf, SIZE, 0, 20, PROTO_AUTO, &scratch, &lr);
+      const DshotAnalysis *a = dshot_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_DSHOT, 0);
+      check_near("two bytes for 16 bits", n, 2, 0);
+      check_near("one frame", a->frames, 1, 0);
+      check_near("throttle", a->frame[0].value, 1047, 0);
+      check_near("no telemetry asked", a->frame[0].telem, 0, 0);
+      check_near("crc checks", a->frame[0].crc_ok, 1, 0);
+      check_near("not the inverted flavour", a->bidir, 0, 0);
+      check_near("rate", lr.rate, 600000, 3);
+      check_near("idle is low", lr.idle_high, 0, 0);
+      // 1047 is 999 above the bottom of the 48..2047 band, so just under half
+      check_near("header", !strcmp(lr.info, "DShot600 1047 49%"), 1, 0);
+
+      int gs, gl;
+
+      dshot_group_at(a, 1, &gs, &gl);
+      check_near("one frame is one group", gs, 0, 0);
+      check_near("...of two bytes", gl, 2, 0);
+
+      dshot_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("group reads the throttle", !strcmp(lab, "1047 49%"), 1, 0);
+      dshot_field_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("first byte is throttle", !strcmp(lab, "THR10-3"), 1, 0);
+      dshot_field_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("second carries the crc", !strcmp(lab, "CRC"), 1, 0);
+    }
+
+    // The name IS the rate, and the rate is measured off the frame rather
+    // than assumed: the four that exist all have to come out right
+    printf("dshot at all four rates:\n");
+    {
+      const double kbit[4] = { 150.0, 300.0, 600.0, 1200.0 };
+      const char *name[4] =
+          { "DShot150", "DShot300", "DShot600", "DShot1200" };
+
+      for (int i = 0; i < 4; i++)
+      {
+        DsGen g;
+        // Twenty samples to the bit whatever the rate, so only the rate under
+        // test changes and the record holds the same three frames
+        double per = 1e6 / kbit[i] / 20.0;
+
+        ds_g(&g, buf, SIZE, per, kbit[i], 0);
+        ds_g_frame(&g, 500, 0, 0);
+        ds_g_frame(&g, 500, 0, 0);
+        ds_g_frame(&g, 500, 0, 0);
+
+        logic_decode(buf, SIZE, 0, (int)per, PROTO_AUTO, &scratch, &lr);
+
+        check_near("still DShot", lr.proto, PROTO_DSHOT, 0);
+        check_near("rate", lr.rate, kbit[i] * 1000.0, 4);
+        check_near("three frames", dshot_analysis()->frames, 3, 0);
+        check_near("named by its rate",
+            NULL != strstr(lr.info, name[i]), 1, 0);
+      }
+    }
+
+    printf("dshot, the ends of the range and the commands:\n");
+    {
+      struct { uint16_t v; const char *reads; } t[] =
+      {
+        {    0, "disarm" },     // nothing armed, and not 0 % throttle
+        {    1, "BEEP1" },      // 1..47 are commands and not throttle at all
+        {   12, "SAVE" },
+        {   21, "DIR REV" },
+        {   17, "CMD 17" },     // a command with no name is still a command
+        {   48, "48 0%" },      // the bottom of the throttle band IS zero
+        { 2047, "2047 100%" },
+      };
+
+      for (unsigned i = 0; i < sizeof(t) / sizeof(t[0]); i++)
+      {
+        DsGen g;
+        char lab[16];
+
+        ds_g(&g, buf, SIZE, 20.0, 600.0, 0);
+        ds_g_frame(&g, t[i].v, 0, 0);
+
+        logic_decode(buf, SIZE, 0, 20, PROTO_AUTO, &scratch, &lr);
+        const DshotAnalysis *a = dshot_analysis();
+
+        check_near("value", a->frame[0].value, t[i].v, 0);
+        dshot_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+        check_near("reads", !strcmp(lab, t[i].reads), 1, 0);
+      }
+    }
+
+    printf("dshot, telemetry requested:\n");
+    {
+      DsGen g;
+      char lab[16];
+
+      ds_g(&g, buf, SIZE, 20.0, 600.0, 0);
+      ds_g_frame(&g, 1000, 1, 0);
+
+      logic_decode(buf, SIZE, 0, 20, PROTO_AUTO, &scratch, &lr);
+      const DshotAnalysis *a = dshot_analysis();
+
+      check_near("flag read", a->frame[0].telem, 1, 0);
+      check_near("crc still checks", a->frame[0].crc_ok, 1, 0);
+      dshot_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("and shown", !strcmp(lab, "1000 47% tel"), 1, 0);
+    }
+
+    // Bidirectional DShot inverts the line AND the CRC. Both have to be
+    // spotted, and the inverted CRC is what says which flavour it is - an
+    // inverting buffer on a normal link would invert the line and nothing
+    // else.
+    printf("dshot bidirectional:\n");
+    {
+      DsGen g;
+
+      ds_g(&g, buf, SIZE, 20.0, 600.0, 1);
+      ds_g_frame(&g, 1500, 0, 1);
+      ds_g_frame(&g, 1500, 0, 1);
+
+      logic_decode(buf, SIZE, 0, 20, PROTO_AUTO, &scratch, &lr);
+      const DshotAnalysis *a = dshot_analysis();
+
+      check_near("still DShot", lr.proto, PROTO_DSHOT, 0);
+      check_near("throttle", a->frame[0].value, 1500, 0);
+      check_near("crc checks", a->frame[0].crc_ok, 1, 0);
+      check_near("the inverted one", a->bidir, 1, 0);
+      check_near("line is inverted too", lr.idle_high, 1, 0);
+      check_near("header says so",
+          NULL != strstr(lr.info, "DShot600bd"), 1, 0);
+    }
+
+    printf("dshot, a frame with a broken crc:\n");
+    {
+      DsGen g;
+      uint16_t d = (uint16_t)(1000 << 1);
+      uint16_t frame = (uint16_t)((d << 4) | ((ds_g_crc(d, 0) + 1) & 0x0F));
+
+      ds_g(&g, buf, SIZE, 20.0, 600.0, 0);
+
+      for (int i = 15; i >= 0; i--)
+      {
+        int one = (frame >> i) & 1;
+
+        ds_g_run(&g, 1, one ? 0.75 : 0.375);
+        ds_g_run(&g, 0, one ? 0.25 : 0.625);
+      }
+
+      ds_g_run(&g, 0, 30);
+
+      // Nothing is reported without its CRC behind it: a throttle command
+      // read wrongly is a motor told the wrong thing, and a caveat under it
+      // is not good enough
+      check_near("refused outright",
+          dshot_decode(buf, SIZE, 0, 20, &scratch, &lr), 0, 0);
+    }
+
+    // The one that matters. WS2812 is constant-period and duty-encoded at
+    // very nearly DShot600's rate, and a naive decoder reads one as the
+    // other. Three things separate them and all three are tested.
+    printf("dshot and WS2812 are not each other:\n");
+    {
+      // A strip: 1.25 us bit, 0.35 us high for a zero and 0.7 for a one -
+      // 28 % and 56 %, where DShot uses 37.5 % and 75 %
+      const uint8_t px[9] =
+          { 0x11, 0x22, 0x33, 0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x00 };
+      int pos = 0;
+      double sps = 1250.0 / 20.0;   // 20 ns a sample: 62.5 samples per bit
+
+      memset(buf, 56, SIZE);
+      pos = (int)(50000.0 / 20.0);  // the reset gap in front of it
+
+      for (int by = 0; by < 9; by++)
+      {
+        for (int b = 7; b >= 0; b--)
+        {
+          int one = (px[by] >> b) & 1;
+          int hi = (int)(sps * (one ? 0.56 : 0.28) + 0.5);
+          int lo = (int)(sps + 0.5) - hi;
+
+          for (int i = 0; i < hi && pos < SIZE; i++, pos++)
+            buf[pos] = 200;
+
+          for (int i = 0; i < lo && pos < SIZE; i++, pos++)
+            buf[pos] = 56;
+        }
+      }
+
+      check_near("ws2812 is not dshot",
+          dshot_decode(buf, SIZE, 0, 20, &scratch, &lr), 0, 0);
+      check_near("...and is still ws2812", logic_decode(buf, SIZE, 0, 20,
+          PROTO_AUTO, &scratch, &lr) > 0 && lr.proto == PROTO_WS2812, 1, 0);
+
+      // A black strip sends nothing but zeros, which is the same waveform a
+      // disarmed ESC sends. Only the frame boundary separates those: after
+      // sixteen WS2812 bits comes the seventeenth, not an idle line.
+      memset(buf, 56, SIZE);
+      pos = (int)(50000.0 / 20.0);
+
+      for (int b = 0; b < 24 * 4; b++)
+      {
+        int hi = (int)(sps * 0.28 + 0.5);
+        int lo = (int)(sps + 0.5) - hi;
+
+        for (int i = 0; i < hi && pos < SIZE; i++, pos++)
+          buf[pos] = 200;
+
+        for (int i = 0; i < lo && pos < SIZE; i++, pos++)
+          buf[pos] = 56;
+      }
+
+      check_near("a black strip is not a disarmed esc",
+          dshot_decode(buf, SIZE, 0, 20, &scratch, &lr), 0, 0);
+
+      // ...and the other way round: a DShot record must not be read as a
+      // strip of LEDs, which is why DShot runs first
+      DsGen g;
+
+      ds_g(&g, buf, SIZE, 20.0, 600.0, 0);
+      ds_g_frame(&g, 1047, 0, 0);
+      ds_g_frame(&g, 1047, 0, 0);
+
+      logic_decode(buf, SIZE, 0, 20, PROTO_AUTO, &scratch, &lr);
+      check_near("dshot is not read as ws2812", lr.proto, PROTO_DSHOT, 0);
+    }
+
+    printf("dshot rejects the rest:\n");
+    {
+      synth_uart(buf, SIZE, 20.0, 1000000.0, "MILKV-UART", 4000.0);
+      check_near("uart is not dshot",
+          dshot_decode(buf, SIZE, 0, 20, &scratch, &lr), 0, 0);
+
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      check_near("sine is not dshot",
+          dshot_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      double duty = 0.075;
+      synth(buf, SIZE, 0, fn_square, &duty, 50.0, 10000.0, 90.0, ZERO_POINT);
+      check_near("servo is not dshot",
+          dshot_decode(buf, SIZE, 0, 10000, &scratch, &lr), 0, 0);
+
+      // A 37.5 % square wave is every DShot zero bit in a row, forever, and
+      // has no frame boundary anywhere in it
+      duty = 0.375;
+      synth(buf, SIZE, 0, fn_square, &duty, 600000.0, 20.0, 90.0, ZERO_POINT);
+      check_near("a 37.5% square wave is not dshot",
+          dshot_decode(buf, SIZE, 0, 20, &scratch, &lr), 0, 0);
+    }
+
+    // ====================== SPI on one probe ==============================
+    //
+    // Not a decode. SPI is a clocked protocol and this instrument has one
+    // probe, so the timing is an ASSUMPTION and the byte boundary is one of
+    // eight guesses. What is tested here is that the assumptions are stated,
+    // that being TOLD the clock beats guessing it, and above all that this
+    // decoder never takes a record in auto mode.
+    printf("spi, told the clock:\n");
+    {
+      // The first byte's top bit is a zero on purpose. The line idles HIGH,
+      // so a first bit of one would be inside the same run as the idle - and
+      // that run is cut by the start of the record, which makes its length a
+      // fact about the buffer rather than about the signal. Where the idle
+      // and the first bit share a level, that bit is not recoverable at all,
+      // and no decoder can pretend otherwise.
+      const uint8_t msg[6] = { 0x03, 0x00, 0x10, 0x00, 0x5A, 0x7E };
+      SpiGen g;
+
+      spi_g(&g, buf, SIZE, 1000.0, 20000.0);   // 20 kHz, 50 samples a bit
+
+      for (int i = 0; i < 6; i++)
+        spi_g_byte(&g, msg[i], 0);             // back to back, no gaps
+
+      spi_g_level(&g, 1, 40);
+
+      spi_decode_set_clock(20000);
+      spi_decode_set_order(0);
+
+      int n = spi_decode(buf, SIZE, 0, 1000, &scratch, &lr);
+      const SpiAnalysis *a = spi_analysis();
+
+      check_near("bytes come out", n >= 6, 1, 0);
+      check_near("the rate is the one it was told", lr.rate, 20000, 2);
+      check_near("...and it says it was told", a->told, 1, 0);
+      check_near("msb first", a->msb_first, 1, 0);
+
+      // The record opens on the idle line, so the first edge is the first
+      // bit of the first byte and the reconstruction starts there
+      check_near("first byte", lr.bytes[0], 0x03, 0);
+      check_near("second", lr.bytes[1], 0x00, 0);
+      check_near("fifth", lr.bytes[4], 0x5A, 0);
+      check_near("sixth", lr.bytes[5], 0x7E, 0);
+    }
+
+    // The one thing that must never happen: a data line without its clock
+    // quantises into bits just as happily as anything else does, so this
+    // decoder is reported ambiguous EVERY time and auto mode always passes
+    // over it. It exists to be asked for by name.
+    printf("spi is never chosen by itself:\n");
+    {
+      const uint8_t msg[4] = { 0x03, 0x00, 0x10, 0x00 };
+      SpiGen g;
+
+      spi_g(&g, buf, SIZE, 1000.0, 20000.0);
+
+      for (int i = 0; i < 4; i++)
+        spi_g_byte(&g, msg[i], 4);
+
+      spi_g_level(&g, 1, 40);
+
+      spi_decode_set_clock(20000);
+
+      check_near("it decodes when asked",
+          spi_decode(buf, SIZE, 0, 1000, &scratch, &lr) > 0, 1, 0);
+      check_near("and says it is ambiguous", lr.ambiguous, 1, 0);
+      check_near("auto never takes it", logic_decode(buf, SIZE, 0, 1000,
+          PROTO_AUTO, &scratch, &lr) > 0 && lr.proto == PROTO_SPI, 0, 0);
+      check_near("named, it comes back", logic_decode(buf, SIZE, 0, 1000,
+          PROTO_SPI, &scratch, &lr) > 0 && lr.proto == PROTO_SPI, 1, 0);
+    }
+
+    // A bit-banged master pauses between bytes, and a pause is a byte
+    // boundary for free - the one piece of EVIDENCE in this whole decoder
+    // rather than a heuristic. The header has to say which of the two it was.
+    printf("spi, byte boundaries from the gaps:\n");
+    {
+      // Every one of these has its top bit clear on purpose. The pause is the
+      // line at REST - high here - so a byte starting with a one merges into
+      // the pause in front of it, and where the pause ends is then not
+      // observable at all. No decoder recovers that byte, and this one does
+      // not pretend to: it is the same limit as the very first bit of the
+      // record, for the same reason.
+      const uint8_t msg[5] = { 0x12, 0x34, 0x56, 0x78, 0x5A };
+      SpiGen g;
+
+      spi_g(&g, buf, SIZE, 1000.0, 20000.0);
+
+      for (int i = 0; i < 5; i++)
+        spi_g_byte(&g, msg[i], 16);            // a clear pause after each
+
+      spi_g_level(&g, 1, 40);
+
+      spi_decode_set_clock(20000);
+      spi_decode_set_order(1);
+
+      int n = spi_decode(buf, SIZE, 0, 1000, &scratch, &lr);
+      const SpiAnalysis *a = spi_analysis();
+
+      check_near("gaps were found", a->anchors >= 4, 1, 0);
+      check_near("...and pinned the phase", a->pinned, 1, 0);
+      check_near("the header says so",
+          NULL != strstr(lr.info, " g"), 1, 0);
+      check_near("bytes", n > 0, 1, 0);
+
+      // With the boundary pinned the bytes are the bytes, not a rotation of
+      // them - the gap makes this the one case that is not a guess
+      // The pause is not skipped, and must not be: with no chip select on
+      // the probe there is nothing that says a run of ones is idle rather
+      // than 0xFF on the wire. So the gaps come out as filler between the
+      // message bytes - two bytes of 0xFF to each sixteen-bit pause - and
+      // the message is every third byte.
+      int hit = 0;
+
+      for (int i = 0; i + 12 < lr.count; i++)
+      {
+        if (0x12 == lr.bytes[i] && 0x34 == lr.bytes[i + 3] &&
+            0x56 == lr.bytes[i + 6] && 0x78 == lr.bytes[i + 9] &&
+            0x5A == lr.bytes[i + 12])
+          hit = 1;
+      }
+
+      check_near("the message is in there whole", hit, 1, 0);
+      check_near("and the pause came out as filler",
+          0xFF == lr.bytes[1] && 0xFF == lr.bytes[2], 1, 0);
+    }
+
+    // Without a gap anywhere, the phase is scored rather than known, and the
+    // header must NOT claim otherwise
+    // A flash transaction, the way one actually goes past: chip select drops,
+    // an opcode, three bytes of address, then the data - and a pause before
+    // the next one. The pauses are what make the opcode readable at all.
+    printf("spi, a flash transaction:\n");
+    {
+      const uint8_t tx[8] = { 0x03, 0x00, 0x10, 0x00, 0xDE, 0xAD, 0xBE, 0xEF };
+      SpiGen g;
+      char lab[16];
+
+      spi_g(&g, buf, SIZE, 1000.0, 20000.0);
+
+      for (int rep = 0; rep < 2; rep++)
+      {
+        for (int i = 0; i < 8; i++)
+          spi_g_byte(&g, tx[i], 0);       // the transaction runs back to back
+
+        spi_g_level(&g, 1, 20);           // ...and the bus rests between them
+      }
+
+      spi_g_level(&g, 1, 40);
+
+      spi_decode_set_clock(20000);
+      spi_decode_set_order(0);
+      spi_decode(buf, SIZE, 0, 1000, &scratch, &lr);
+      const SpiAnalysis *a = spi_analysis();
+
+      check_near("the pauses pinned it", a->pinned, 1, 0);
+      check_near("the opcode was recognised", a->cmds >= 1, 1, 0);
+      check_near("...and the order settled with it", a->msb_first, 1, 0);
+
+      // Find the byte the pauses called a command
+      int c = -1;
+
+      for (int i = 0; i < lr.count; i++)
+      {
+        if (SPI_R_CMD == a->role[i])
+          c = i;
+      }
+
+      check_near("a command was marked", c >= 0, 1, 0);
+
+      if (c >= 0)
+      {
+        check_near("it is the READ opcode", lr.bytes[c], 0x03, 0);
+        spi_byte_label(a, c, lr.bytes[c], lab, sizeof(lab));
+        check_near("named", !strcmp(lab, "READ"), 1, 0);
+        spi_field_label(a, c, lr.bytes[c], lab, sizeof(lab));
+        check_near("...as a command", !strcmp(lab, "CMD"), 1, 0);
+
+        // The three bytes after it are one number and are shown as one
+        int gs, gl;
+
+        spi_group_at(a, c + 2, &gs, &gl);
+        check_near("address groups", gs, c + 1, 0);
+        check_near("...as three bytes", gl, 3, 0);
+
+        spi_byte_label(a, c + 3, lr.bytes[c + 3], lab, sizeof(lab));
+        check_near("address assembled", !strcmp(lab, "A=001000"), 1, 0);
+        spi_field_label(a, c + 1, lr.bytes[c + 1], lab, sizeof(lab));
+        check_near("its bytes numbered", !strcmp(lab, "A2"), 1, 0);
+      }
+
+      // The payload is not a command and is not pretended to be
+      if (c >= 0 && c + 4 < lr.count)
+        check_near("payload has no role", a->role[c + 4], SPI_R_NONE, 0);
+    }
+
+    // ...and where nothing pinned the byte boundary, NOTHING is named a
+    // command. The phase is already a preference; hanging "READ" off it would
+    // make a reading look confirmed by the very thing it was chosen for.
+    printf("spi names no commands it cannot place:\n");
+    {
+      const uint8_t tx[8] = { 0x03, 0x00, 0x10, 0x00, 0xDE, 0xAD, 0xBE, 0xEF };
+      SpiGen g;
+
+      spi_g(&g, buf, SIZE, 1000.0, 20000.0);
+
+      for (int rep = 0; rep < 4; rep++)
+        for (int i = 0; i < 8; i++)
+          spi_g_byte(&g, tx[i], 0);       // no pauses anywhere
+
+      spi_g_level(&g, 1, 40);
+
+      spi_decode_set_clock(20000);
+      spi_decode_set_order(1);
+      spi_decode(buf, SIZE, 0, 1000, &scratch, &lr);
+      const SpiAnalysis *a = spi_analysis();
+
+      check_near("nothing pinned it", a->pinned, 0, 0);
+      check_near("so nothing is called a command", a->cmds, 0, 0);
+
+      int roles = 0;
+
+      for (int i = 0; i < lr.count; i++)
+      {
+        if (SPI_R_NONE != a->role[i])
+          roles++;
+      }
+
+      check_near("and no byte carries a role", roles, 0, 0);
+      check_near("the header says it was scored",
+          NULL != strstr(lr.info, " ?"), 1, 0);
+    }
+
+    printf("spi, no gaps to go on:\n");
+    {
+      const uint8_t msg[6] = { 'H', 'e', 'l', 'l', 'o', '!' };
+      SpiGen g;
+
+      spi_g(&g, buf, SIZE, 1000.0, 20000.0);
+
+      for (int i = 0; i < 6; i++)
+        spi_g_byte(&g, msg[i], 0);
+
+      spi_g_level(&g, 1, 40);
+
+      spi_decode_set_clock(20000);
+      spi_decode_set_order(1);
+      spi_decode(buf, SIZE, 0, 1000, &scratch, &lr);
+
+      check_near("nothing pinned it", spi_analysis()->pinned, 0, 0);
+      check_near("and the header admits it",
+          NULL != strstr(lr.info, " ?"), 1, 0);
+      // ...and the doubt is in the NAME, every time, whatever else the line
+      // says: this is a reconstruction of a bus the instrument cannot see
+      check_near("the name is marked",
+          0 == strncmp(lr.info, "SPI!", 4), 1, 0);
+      // ASCII is what the scoring has to work with, and here it is enough
+      check_near("text found anyway",
+          NULL != memchr(lr.bytes, 'H', (size_t)lr.count), 1, 0);
+    }
+
+    // Being told the clock is the point of the two-pass workflow. Guessing it
+    // from the data works when the data has a single-bit run in it somewhere
+    // and fails when it does not - a stream of 0x0F has runs of four bits and
+    // nothing shorter, so the guess comes out four times too slow and every
+    // byte with it.
+    printf("spi, told beats guessed:\n");
+    {
+      SpiGen g;
+
+      spi_g(&g, buf, SIZE, 1000.0, 20000.0);
+
+      for (int i = 0; i < 12; i++)
+        spi_g_byte(&g, 0x0F, 0);
+
+      spi_g_level(&g, 1, 40);
+
+      spi_decode_set_order(1);
+
+      // Told: the bit time is a fact, and 96 bits come out of the record.
+      //
+      // The byte VALUE is deliberately not asserted, because it is genuinely
+      // not determined: 0F 0F 0F... and 3C 3C 3C... and 78 78 78... are the
+      // same bits cut in different places, and nothing in a data line
+      // without its clock says which cut is the right one. The scoring
+      // prefers the printable one, and that is a preference and not
+      // knowledge - which is what "p3 ?" in the header is there to admit.
+      spi_decode_set_clock(20000);
+      spi_decode(buf, SIZE, 0, 1000, &scratch, &lr);
+      check_near("told: rate", lr.rate, 20000, 2);
+      check_near("told: says so", spi_analysis()->told, 1, 0);
+      check_near("told: bits", spi_analysis()->bits, 92, 3);
+      check_near("told: nothing pinned the phase",
+          spi_analysis()->pinned, 0, 0);
+
+      // ...and whatever cut it chose, the stream is one value repeating,
+      // which is what four-bit runs at the right rate have to come out as
+      int same = 1;
+
+      for (int i = 1; i < lr.count; i++)
+      {
+        if (lr.bytes[i] != lr.bytes[0])
+          same = 0;
+      }
+
+      check_near("told: one value, repeating", same, 1, 0);
+      check_near("told: eleven bytes of it", lr.count, 11, 10);
+
+      // Guessed: every run is four bits long, so the shortest run IS four
+      // bits and the estimate is a quarter of the truth. Nothing in the
+      // record says otherwise, and the header's '~' is the only warning
+      // there can be.
+      spi_decode_set_clock(0);
+      spi_decode(buf, SIZE, 0, 1000, &scratch, &lr);
+      // Every run in this record is four bits long, so the shortest run IS
+      // four bits and the estimate comes out a quarter of the truth. There
+      // is nothing in the data that says otherwise, which is the whole
+      // argument for measuring the clock on SCK first.
+      check_near("guessed: comes out four times slow", lr.rate, 5000, 5);
+      check_near("guessed: a quarter of the bits, too",
+          spi_analysis()->bits, 23, 10);
+      check_near("guessed: and marks the rate as its own",
+          NULL != strstr(lr.info, "~"), 1, 0);
+      check_near("guessed: says it was not told", spi_analysis()->told, 0, 0);
+
+      spi_decode_set_clock(0);
+      spi_decode_set_order(0);
+    }
+
+    printf("spi refuses what it cannot quantise:\n");
+    {
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      spi_decode_set_clock(0);
+      // A thresholded sine IS a square wave and a square wave IS a bit
+      // stream, so this one does decode - and is ambiguous, like everything
+      // else this decoder returns
+      check_near("a sine quantises like anything else",
+          spi_decode(buf, SIZE, 0, 1000, &scratch, &lr) > 0 && lr.ambiguous,
+          1, 0);
+
+      // Flat line: no edges, nothing to quantise, nothing to say
+      memset(buf, 128, SIZE);
+      check_near("a flat line is refused",
+          spi_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      // Told a clock so slow that the record holds under two bytes of it:
+      // sixteen bits is the least that is a reading of anything
+      SpiGen g;
+
+      spi_g(&g, buf, SIZE, 1000.0, 20000.0);
+
+      for (int i = 0; i < 6; i++)
+        spi_g_byte(&g, 0xA5, 0);
+
+      spi_decode_set_clock(200);
+      check_near("a bit that wide is refused",
+          spi_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+      spi_decode_set_clock(0);
+    }
+
+    // ========================= Manchester / bi-phase ======================
+    //
+    // A line code and not a protocol - the brick RC5, DALI, EM4100 tags and
+    // most 433 MHz weather sensors are built out of. The structural claim is
+    // that every run is half a bit or a whole one and nothing else, and that
+    // is checked before a single bit is read.
+    printf("manchester, an RC5-shaped frame:\n");
+    {
+      // 14 bits, 1.778 ms each: start, field, toggle, 5 of address, 6 of
+      // command. The value has adjacent equal bits in it, so the record
+      // contains half-bit runs and the rate can be found either way.
+      ManGen g;
+      char lab[16];
+
+      man_g(&g, buf, SIZE, 20000.0, 562.0);
+      man_g_frame(&g, 0x300C, 14);
+
+      manchester_decode_set_rate(562);
+      manchester_decode_set_polarity(0);
+
+      int n = logic_decode(buf, SIZE, 0, 20000, PROTO_AUTO, &scratch, &lr);
+      const ManAnalysis *a = manchester_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_MANCH, 0);
+      check_near("one frame", a->frames, 1, 0);
+      check_near("fourteen bits", a->frame[0].bits, 14, 0);
+      check_near("...and their value", a->frame[0].value, 0x300C, 0);
+      check_near("rate", lr.rate, 562, 3);
+      check_near("told", a->told, 1, 0);
+      check_near("two bytes for fourteen bits", n, 2, 0);
+      check_near("header", !strcmp(lr.info, "MAN 562 14b 300C"), 1, 0);
+
+      // The frame is one number, so it is one thing on the screen - the two
+      // bytes it packed into are where eight bits happened to land
+      int gs, gl;
+
+      manchester_group_at(a, 1, &gs, &gl);
+      check_near("group start", gs, 0, 0);
+      check_near("...of two bytes", gl, 2, 0);
+
+      manchester_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("reads bits and value", !strcmp(lab, "14b 300C"), 1, 0);
+      manchester_field_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("first byte\'s bits", !strcmp(lab, "b13-6"), 1, 0);
+      manchester_field_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("...and the last six", !strcmp(lab, "b5-0"), 1, 0);
+    }
+
+    // Which way round a bit reads is NOT in the waveform: G.E. Thomas and
+    // IEEE 802.3 are exact inverses of each other, RC5 uses one and DALI the
+    // other. It is a setting, and flipping it flips every bit.
+    printf("manchester, the other convention:\n");
+    {
+      ManGen g;
+
+      man_g(&g, buf, SIZE, 20000.0, 1200.0);
+      man_g_frame(&g, 0x5A5A5, 19);      // a DALI-shaped forward frame
+
+      manchester_decode_set_rate(1200);
+      manchester_decode_set_polarity(0);
+      logic_decode(buf, SIZE, 0, 20000, PROTO_AUTO, &scratch, &lr);
+      check_near("as generated", manchester_analysis()->frame[0].value,
+          0x5A5A5, 0);
+      check_near("nineteen bits", manchester_analysis()->frame[0].bits, 19, 0);
+
+      manchester_decode_set_polarity(1);
+      logic_decode(buf, SIZE, 0, 20000, PROTO_AUTO, &scratch, &lr);
+      check_near("inverted reads the complement",
+          manchester_analysis()->frame[0].value, (~0x5A5A5u) & 0x7FFFFu, 0);
+      check_near("and says which it used",
+          NULL != strstr(lr.info, "inv"), 1, 0);
+
+      manchester_decode_set_polarity(0);
+    }
+
+    // Auto: the shortest run is half a bit only if two adjacent bits are ever
+    // equal. When they are, the two populations settle the rate outright.
+    printf("manchester, rate off the record:\n");
+    {
+      ManGen g;
+
+      man_g(&g, buf, SIZE, 20000.0, 1200.0);
+      man_g_frame(&g, 0x3C0F3, 19);      // plenty of adjacent equal bits
+
+      manchester_decode_set_rate(0);
+      logic_decode(buf, SIZE, 0, 20000, PROTO_AUTO, &scratch, &lr);
+      const ManAnalysis *a = manchester_analysis();
+
+      check_near("found it", lr.rate, 1200, 5);
+      check_near("says it was not told", a->told, 0, 0);
+      check_near("value", a->frame[0].value, 0x3C0F3, 0);
+      check_near("both run lengths were there, so it is sure",
+          lr.ambiguous, 0, 0);
+      check_near("the rate is marked as its own",
+          NULL != strstr(lr.info, "~"), 1, 0);
+    }
+
+    // ...and when they are never equal, there is no half-bit run anywhere and
+    // the estimate lands at twice the bit period with nothing in the data to
+    // contradict it. That is the whole argument for the rate being a setting.
+    printf("manchester, the factor of two it cannot close:\n");
+    {
+      ManGen g;
+
+      // Strictly alternating, AND opening with a bit whose first half is at
+      // the resting level so it merges into the idle: then there is not one
+      // half-bit run anywhere in the record, and the shortest run is a whole
+      // bit. The estimate lands at twice the bit period and the data cannot
+      // say otherwise.
+      man_g(&g, buf, SIZE, 20000.0, 1200.0);
+      man_g_frame(&g, 0x15555, 18);
+
+      manchester_decode_set_rate(0);
+      int n = logic_decode(buf, SIZE, 0, 20000, PROTO_AUTO, &scratch, &lr);
+
+      check_near("auto does not claim it", n > 0 && lr.proto == PROTO_MANCH,
+          0, 0);
+
+      manchester_decode(buf, SIZE, 0, 20000, &scratch, &lr);
+      check_near("named, it decodes", lr.count > 0, 1, 0);
+      check_near("...and says it is unsure", lr.ambiguous, 1, 0);
+
+      // Told the rate, the bits come out right - which is what being told
+      // buys. It does NOT buy certainty: a record of strictly alternating
+      // bits is a square wave, and a square wave is also a stream of 0x55
+      // out of a UART and a clock, with nothing in the samples to choose
+      // between them. So it stays out of auto mode either way, and the
+      // difference is that by name it now reads correctly.
+      manchester_decode_set_rate(1200);
+      manchester_decode(buf, SIZE, 0, 20000, &scratch, &lr);
+      check_near("told, the value is right",
+          manchester_analysis()->frame[0].value, 0x15555, 0);
+      check_near("...and the rate is the one given", lr.rate, 1200, 0);
+      check_near("still not claimed in auto", lr.ambiguous, 1, 0);
+      manchester_decode_set_rate(0);
+    }
+
+    // The bench's examination, and the two halves of it that matter. The
+    // same payload goes out in both conventions and then once more with an
+    // encoding violation in it.
+    printf("manchester, the other convention found from the preamble:\n");
+    {
+      // 0x55 preamble then 0xA5C3 - the shape nearly every Manchester
+      // protocol opens with, and the reason a preamble is there at all
+      ManGen g;
+
+      man_g(&g, buf, SIZE, 20000.0, 1000.0);
+      man_g_frame(&g, 0x55A5C3, 24);
+
+      manchester_decode_set_rate(1000);
+
+      // Told the wrong convention, it reads the complement of everything -
+      // which is not a fault, it is what the other convention IS
+      manchester_decode_set_polarity(1);
+      manchester_decode(buf, SIZE, 0, 20000, &scratch, &lr);
+      check_near("read the wrong way round", lr.bytes[0], 0xAA, 0);
+
+      // A record already the right way up is left alone
+      manchester_decode_set_polarity(MAN_POL_AUTO);
+      manchester_decode(buf, SIZE, 0, 20000, &scratch, &lr);
+      check_near("nothing to flip", manchester_analysis()->auto_inv, 0, 0);
+      check_near("still 55", lr.bytes[0], 0x55, 0);
+
+      // ...and now the SAME message sent in the other convention. Inverting
+      // the levels is the same as inverting the data, so a Thomas generator
+      // fed the complement puts exactly an IEEE frame on the wire.
+      man_g(&g, buf, SIZE, 20000.0, 1000.0);
+      man_g_frame(&g, (~0x55A5C3u) & 0xFFFFFFu, 24);
+
+      manchester_decode_set_polarity(MAN_POL_AUTO);
+      manchester_decode(buf, SIZE, 0, 20000, &scratch, &lr);
+      const ManAnalysis *a = manchester_analysis();
+
+      check_near("preamble back to 55", lr.bytes[0], 0x55, 0);
+      check_near("...and the payload with it", lr.bytes[1], 0xA5, 0);
+      check_near("...", lr.bytes[2], 0xC3, 0);
+      check_near("it says it inferred that", a->auto_inv, 1, 0);
+      check_near("header marks it", NULL != strstr(lr.info, "inv?"), 1, 0);
+
+      manchester_decode_set_polarity(0);
+    }
+
+    // A bit with no transition in its middle. The frame is Manchester and one
+    // of its bits is broken, and those are different statements - so the
+    // record must come back WITH an error on it, not fail to come back. That
+    // is the same line already drawn for a MIDI byte nobody should have sent.
+    printf("manchester, a bit with no middle:\n");
+    {
+      ManGen g;
+      char lab[16];
+
+      man_g(&g, buf, SIZE, 20000.0, 1000.0);
+      man_g_bits(&g, 0x55A5C3, 24, 15);   // the last bit of the 0xA5 byte
+
+      manchester_decode_set_rate(1000);
+      manchester_decode_set_polarity(0);
+
+      int n = manchester_decode(buf, SIZE, 0, 20000, &scratch, &lr);
+      const ManAnalysis *a = manchester_analysis();
+
+      check_near("the frame is still there", n > 0, 1, 0);
+      check_near("all 24 bits of it", a->frame[0].bits, 24, 0);
+      check_near("the violation is counted", a->frame[0].viol, 1, 0);
+      check_near("...and named", a->frame[0].viol_bit, 15, 0);
+      check_near("counted as an error", lr.errors, 1, 0);
+      check_near("header says which bit",
+          NULL != strstr(lr.info, "!b15"), 1, 0);
+
+      // The bits either side of it are unaffected: the reader keeps the
+      // phase through the broken bit instead of slipping half a bit and
+      // turning the rest of the frame into porridge
+      check_near("preamble intact", lr.bytes[0], 0x55, 0);
+      check_near("and the last byte too", lr.bytes[2], 0xC3, 0);
+
+      manchester_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("the frame label carries it",
+          NULL != strchr(lab, '!'), 1, 0);
+
+      // A record whose ONLY frame is broken is reported and not CLAIMED:
+      // "Manchester with a fault in it" and "something else that fits
+      // Manchester badly" look identical from one frame, so the cascade
+      // waits for a clean one and this is shown when picked by name.
+      check_near("not claimed on a broken frame alone", lr.ambiguous, 1, 0);
+      check_near("auto keeps off it", logic_decode(buf, SIZE, 0, 20000,
+          PROTO_AUTO, &scratch, &lr) > 0 && lr.proto == PROTO_MANCH, 0, 0);
+
+      // ...but a clean frame beside it settles the record, and the broken one
+      // still comes back with its violation
+      man_g(&g, buf, SIZE, 20000.0, 1000.0);
+      man_g_frame(&g, 0x55A5C3, 24);
+      man_g_bits(&g, 0x55A5C3, 24, 15);
+
+      logic_decode(buf, SIZE, 0, 20000, PROTO_AUTO, &scratch, &lr);
+      const ManAnalysis *b = manchester_analysis();
+
+      check_near("auto takes it now", lr.proto, PROTO_MANCH, 0);
+      check_near("two frames", b->frames, 2, 0);
+      check_near("the first is clean", b->frame[0].viol, 0, 0);
+      check_near("the second is not", b->frame[1].viol, 1, 0);
+      check_near("...on the same bit", b->frame[1].viol_bit, 15, 0);
+      check_near("and the error is counted", lr.errors, 1, 0);
+    }
+
+    printf("manchester rejects the rest:\n");
+    {
+      // NEC\'s runs stand in a 1:3 ratio, not 1:2 - three halves cannot pass
+      // for two, and that is what the tolerance is set to guarantee
+      const uint8_t nec[4] = { 0x00, 0xFF, 0x15, 0xEA };
+      int pos = 0;
+
+      memset(buf, 200, SIZE);
+
+      for (int i = 0; i < 9000 && pos < SIZE; i++, pos++)
+        buf[pos] = 56;
+
+      for (int i = 0; i < 4500 && pos < SIZE; i++, pos++)
+        buf[pos] = 200;
+
+      for (int by = 0; by < 4; by++)
+      {
+        for (int b = 0; b < 8; b++)
+        {
+          int one = (nec[by] >> b) & 1;
+
+          for (int i = 0; i < 560 && pos < SIZE; i++, pos++)
+            buf[pos] = 56;
+
+          for (int i = 0; i < (one ? 1690 : 560) && pos < SIZE; i++, pos++)
+            buf[pos] = 200;
+        }
+      }
+
+      manchester_decode_set_rate(0);
+      check_near("nec is not manchester", logic_decode(buf, SIZE, 0, 1000,
+          PROTO_AUTO, &scratch, &lr) > 0 && lr.proto == PROTO_MANCH, 0, 0);
+      check_near("...and is still nec", lr.proto, PROTO_NEC, 0);
+
+      synth_uart(buf, SIZE, 1000.0, 9600.0, "MILKV-UART-TEST 9600", 20000.0);
+      check_near("uart is not manchester", logic_decode(buf, SIZE, 0, 1000,
+          PROTO_AUTO, &scratch, &lr) > 0 && lr.proto == PROTO_MANCH, 0, 0);
+
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      check_near("a sine is a square wave, so it is not sure",
+          manchester_decode(buf, SIZE, 0, 1000, &scratch, &lr) > 0 &&
+          !lr.ambiguous, 0, 0);
+      check_near("and auto keeps off it", logic_decode(buf, SIZE, 0, 1000,
+          PROTO_AUTO, &scratch, &lr) > 0 && lr.proto == PROTO_MANCH, 0, 0);
+    }
+
+    // ======================== RC5 / RC5X / RC6 ============================
+    //
+    // The bi-phase half of the infrared world. The generic Manchester decoder
+    // already reads RC5's bits; what these do is read the MESSAGE - address,
+    // command, and the toggle bit that tells a fresh press from a held key.
+    printf("rc5:\n");
+    {
+      // S1=1 S2=1 T=1 A=00101 C=110101 -> address 5, command 53
+      uint32_t frame = (1u << 13) | (1u << 12) | (1u << 11) |
+          (5u << 6) | 53u;
+      IrGen g;
+      char lab[16];
+
+      ir_g(&g, buf, SIZE, 20000.0, 1778.0);
+      rc5_g_frame(&g, frame, 14);
+
+      int n = logic_decode(buf, SIZE, 0, 20000, PROTO_AUTO, &scratch, &lr);
+      const Rc5Analysis *a = rc5_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_RC5, 0);
+      check_near("plain RC5", a->kind, RC5_KIND_RC5, 0);
+      check_near("address", a->addr, 5, 0);
+      check_near("command", a->cmd, 53, 0);
+      check_near("toggle", a->toggle, 1, 0);
+      check_near("fourteen bits", a->bits, 14, 0);
+      check_near("bit time", a->bit_ns, 1778000, 5);
+      check_near("two bytes", n, 2, 0);
+      check_near("header", !strcmp(lr.info, "RC5 a5 c53 t1"), 1, 0);
+
+      rc5_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("reads as a message", !strcmp(lab, "a5 c53 t1"), 1, 0);
+
+      int gs, gl;
+
+      rc5_group_at(a, 1, &gs, &gl);
+      check_near("one frame, one group", gs, 0, 0);
+      check_near("...of two bytes", gl, 2, 0);
+    }
+
+    // RC5X: the second start bit is the INVERTED seventh command bit, which
+    // is how a six-bit field came to hold 128 commands. A decoder that just
+    // read S2 as "a start bit" would report command 35 instead of 99.
+    printf("rc5x, the command that does not fit six bits:\n");
+    {
+      uint32_t frame = (1u << 13) | (0u << 12) | (0u << 11) |
+          (5u << 6) | 35u;
+      IrGen g;
+
+      ir_g(&g, buf, SIZE, 20000.0, 1778.0);
+      rc5_g_frame(&g, frame, 14);
+
+      logic_decode(buf, SIZE, 0, 20000, PROTO_AUTO, &scratch, &lr);
+      const Rc5Analysis *a = rc5_analysis();
+
+      check_near("recognised as RC5X", a->kind, RC5_KIND_RC5X, 0);
+      check_near("command carries the seventh bit", a->cmd, 35 + 64, 0);
+      check_near("address still", a->addr, 5, 0);
+      check_near("header", !strcmp(lr.info, "RC5X a5 c99 t0"), 1, 0);
+    }
+
+    // The toggle bit is the whole point of RC5 on a bench: it says a key was
+    // pressed AGAIN rather than held down, and nothing else in the frame does
+    printf("rc5, the toggle bit:\n");
+    {
+      uint32_t base = (1u << 13) | (1u << 12) | (5u << 6) | 53u;
+      IrGen g;
+
+      ir_g(&g, buf, SIZE, 20000.0, 1778.0);
+      rc5_g_frame(&g, base, 14);        // toggle clear
+      logic_decode(buf, SIZE, 0, 20000, PROTO_AUTO, &scratch, &lr);
+      check_near("held: toggle clear", rc5_analysis()->toggle, 0, 0);
+      check_near("...and the key is the same", rc5_analysis()->cmd, 53, 0);
+    }
+
+    // RC6 mode 0: a leader, and a trailer bit twice as wide as the rest. The
+    // generic Manchester reader cannot follow that - on the trailer its runs
+    // are two halves and four - which is exactly why this decoder exists.
+    printf("rc6:\n");
+    {
+      // start=1 mode=000 trailer=1 addr=0x12 cmd=0x34
+      uint32_t frame = (1u << 20) | (0u << 17) | (1u << 16) |
+          (0x12u << 8) | 0x34u;
+      IrGen g;
+
+      ir_g(&g, buf, SIZE, 20000.0, 889.0);
+      rc6_g_frame(&g, frame, 21, 4);
+
+      int n = logic_decode(buf, SIZE, 0, 20000, PROTO_AUTO, &scratch, &lr);
+      const Rc5Analysis *a = rc5_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_RC5, 0);
+      check_near("recognised as RC6", a->kind, RC5_KIND_RC6, 0);
+      check_near("mode 0", a->mode, 0, 0);
+      check_near("address", a->addr, 0x12, 0);
+      check_near("command", a->cmd, 0x34, 0);
+      check_near("toggle", a->toggle, 1, 0);
+      check_near("twenty-one bits", a->bits, 21, 0);
+      check_near("three bytes", n, 3, 0);
+      check_near("bit time", a->bit_ns, 889000, 6);
+      check_near("header", !strcmp(lr.info, "RC6 m0 a18 c52 t1"), 1, 0);
+
+      // ...and the double-width bit is why the generic reader is not enough
+      manchester_decode_set_rate(0);
+      check_near("the generic reader does not get all of it",
+          manchester_decode(buf, SIZE, 0, 20000, &scratch, &lr) > 0 &&
+          21 == manchester_analysis()->frame[0].bits, 0, 0);
+    }
+
+    printf("rc5 rejects the rest:\n");
+    {
+      // NEC is pulse-coded and not bi-phase at all - one of the family that
+      // the bench list groups with RC5 and that has nothing to do with it
+      const uint8_t nec[4] = { 0x00, 0xFF, 0x15, 0xEA };
+      int pos = 0;
+
+      memset(buf, 200, SIZE);
+
+      for (int i = 0; i < 9000 && pos < SIZE; i++, pos++)
+        buf[pos] = 56;
+
+      for (int i = 0; i < 4500 && pos < SIZE; i++, pos++)
+        buf[pos] = 200;
+
+      for (int by = 0; by < 4; by++)
+      {
+        for (int b = 0; b < 8; b++)
+        {
+          int one = (nec[by] >> b) & 1;
+
+          for (int i = 0; i < 560 && pos < SIZE; i++, pos++)
+            buf[pos] = 56;
+
+          for (int i = 0; i < (one ? 1690 : 560) && pos < SIZE; i++, pos++)
+            buf[pos] = 200;
+        }
+      }
+
+      check_near("nec is not rc5",
+          rc5_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+      check_near("...and is still nec", logic_decode(buf, SIZE, 0, 1000,
+          PROTO_AUTO, &scratch, &lr) > 0 && lr.proto == PROTO_NEC, 1, 0);
+
+      synth_uart(buf, SIZE, 1000.0, 9600.0, "MILKV-UART-TEST", 20000.0);
+      check_near("uart is not rc5",
+          rc5_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      check_near("sine is not rc5",
+          rc5_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      // A DALI-shaped Manchester frame is bi-phase too, and is not RC5: the
+      // bit time is nowhere near 1.778 ms and there are not fourteen of them
+      ManGen mg;
+
+      man_g(&mg, buf, SIZE, 20000.0, 1200.0);
+      man_g_frame(&mg, 0x5A5A5, 19);
+      check_near("dali-shaped manchester is not rc5",
+          rc5_decode(buf, SIZE, 0, 20000, &scratch, &lr), 0, 0);
+    }
+
+    // ============================== DALI ==================================
+    //
+    // Manchester at 1200, which the generic decoder already reads as bits.
+    // What is tested here is the reading a lighting bus is looked at for:
+    // which ballast, and what it was told.
+    printf("dali, a level to one ballast:\n");
+    {
+      DaliGen g;
+      char lab[16];
+
+      // 0x0A = 0000101 0: short address 5, selector clear -> the data byte
+      // is an arc power level
+      dali_g(&g, buf, SIZE, 20000.0);
+      dali_g_fwd(&g, 0x0A, 128);
+
+      int n = logic_decode(buf, SIZE, 0, 20000, PROTO_AUTO, &scratch, &lr);
+      const DaliAnalysis *a = dali_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_DALI, 0);
+      check_near("one frame", a->frames, 1, 0);
+      check_near("seventeen bits", a->frame[0].bits, 17, 0);
+      check_near("short address", a->frame[0].kind, DALI_SHORT, 0);
+      check_near("ballast 5", a->frame[0].target, 5, 0);
+      check_near("...and it is a level, not a command",
+          a->frame[0].cmd, 0, 0);
+      check_near("level", a->frame[0].data, 128, 0);
+      check_near("two bytes", n, 2, 0);
+      check_near("rate", lr.rate, 1200, 5);
+      check_near("header", !strcmp(lr.info, "DALI a5 lvl 128"), 1, 0);
+
+      dali_field_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("first byte is the address", !strcmp(lab, "ADDR"), 1, 0);
+      dali_field_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("second is a level", !strcmp(lab, "LEVEL"), 1, 0);
+    }
+
+    // The selector bit is the whole trap: the SAME data byte is "off" one way
+    // and "level zero" the other, and a decoder that shows the byte and stops
+    // has left the reader to do the part that matters
+    printf("dali, the selector bit:\n");
+    {
+      DaliGen g;
+
+      dali_g(&g, buf, SIZE, 20000.0);
+      dali_g_fwd(&g, 0x0B, 0);          // short address 5, selector SET
+      logic_decode(buf, SIZE, 0, 20000, PROTO_AUTO, &scratch, &lr);
+      check_near("a command this time", dali_analysis()->frame[0].cmd, 1, 0);
+      check_near("and it is OFF", !strcmp(lr.info, "DALI a5 OFF"), 1, 0);
+
+      dali_g(&g, buf, SIZE, 20000.0);
+      dali_g_fwd(&g, 0x0A, 0);          // ...the same byte, selector clear
+      logic_decode(buf, SIZE, 0, 20000, PROTO_AUTO, &scratch, &lr);
+      check_near("same byte, different meaning",
+          !strcmp(lr.info, "DALI a5 lvl 0"), 1, 0);
+    }
+
+    printf("dali, groups, broadcast and the commissioning set:\n");
+    {
+      DaliGen g;
+
+      // 0x87 = 100 0011 1: group 3, selector set
+      dali_g(&g, buf, SIZE, 20000.0);
+      dali_g_fwd(&g, 0x87, 18);         // GO TO SCENE 2
+      logic_decode(buf, SIZE, 0, 20000, PROTO_AUTO, &scratch, &lr);
+      check_near("group", dali_analysis()->frame[0].kind, DALI_GROUP, 0);
+      check_near("number", dali_analysis()->frame[0].target, 3, 0);
+      check_near("scene named", !strcmp(lr.info, "DALI g3 SCENE 2"), 1, 0);
+
+      dali_g(&g, buf, SIZE, 20000.0);
+      dali_g_fwd(&g, 0xFF, 32);         // broadcast RESET
+      logic_decode(buf, SIZE, 0, 20000, PROTO_AUTO, &scratch, &lr);
+      check_near("broadcast", dali_analysis()->frame[0].kind,
+          DALI_BROADCAST, 0);
+      check_near("named", !strcmp(lr.info, "DALI all RESET"), 1, 0);
+
+      // Special commands live in the ADDRESS byte, not the data byte
+      dali_g(&g, buf, SIZE, 20000.0);
+      dali_g_fwd(&g, 0xA5, 0);          // INITIALISE
+      logic_decode(buf, SIZE, 0, 20000, PROTO_AUTO, &scratch, &lr);
+      check_near("special", dali_analysis()->frame[0].kind, DALI_SPECIAL, 0);
+      check_near("named", !strcmp(lr.info, "DALI INITIALISE 0"), 1, 0);
+    }
+
+    // A query and the answer to it is the commonest pair on the bus, and the
+    // answer is a SHORTER frame - nine bits against seventeen
+    printf("dali, a query and its answer:\n");
+    {
+      DaliGen g;
+      char lab[16];
+
+      dali_g(&g, buf, SIZE, 20000.0);
+      dali_g_fwd(&g, 0x0B, 144);        // QUERY STATUS of ballast 5
+      dali_g_frame(&g, (1u << 8) | 0xFF, 9);   // ...and the backward frame
+
+      int n = logic_decode(buf, SIZE, 0, 20000, PROTO_AUTO, &scratch, &lr);
+      const DaliAnalysis *a = dali_analysis();
+
+      check_near("two frames", a->frames, 2, 0);
+      check_near("the query is seventeen bits", a->frame[0].bits, 17, 0);
+      check_near("the answer is nine", a->frame[1].bits, 9, 0);
+      check_near("...and is a backward frame", a->frame[1].kind,
+          DALI_BACKWARD, 0);
+      check_near("three bytes in all", n, 3, 0);
+      check_near("header keeps the question",
+          !strcmp(lr.info, "DALI a5 Q STATUS +1"), 1, 0);
+
+      dali_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("the answer reads as one", !strcmp(lab, "ans YES"), 1, 0);
+      dali_field_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("...and is named so", !strcmp(lab, "ANS"), 1, 0);
+
+      int gs, gl;
+
+      dali_group_at(a, 1, &gs, &gl);
+      check_near("the query groups", gs, 0, 0);
+      check_near("...as two bytes", gl, 2, 0);
+      dali_group_at(a, 2, &gs, &gl);
+      check_near("the answer stands alone", gs, 2, 0);
+      check_near("...as one", gl, 1, 0);
+    }
+
+    printf("dali rejects the rest:\n");
+    {
+      // An RC5 frame is bi-phase too, at 1.778 ms - not 833 us, and fourteen
+      // bits rather than seventeen or nine
+      IrGen ig;
+
+      ir_g(&ig, buf, SIZE, 20000.0, 1778.0);
+      rc5_g_frame(&ig, (1u << 13) | (1u << 12) | (5u << 6) | 53u, 14);
+      check_near("rc5 is not dali",
+          dali_decode(buf, SIZE, 0, 20000, &scratch, &lr), 0, 0);
+
+      synth_uart(buf, SIZE, 1000.0, 9600.0, "MILKV-UART-TEST", 20000.0);
+      check_near("uart is not dali",
+          dali_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      check_near("sine is not dali",
+          dali_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+    }
+
+    // ============================= KNX TP1 ================================
+    //
+    // NOT Manchester, whatever it gets grouped with: a zero is a short pulse
+    // at the start of its bit and a one is nothing at all, so there is no
+    // mid-bit transition to step to and the slots are counted from the start
+    // bit. What confirms it is a parity bit per character and a check octet
+    // over the telegram.
+    printf("knx, a group write:\n");
+    {
+      // 1.1.5 tells group 1/2/3 to switch on
+      const uint8_t tg[7] =
+          { 0xBC, 0x11, 0x05, 0x0A, 0x03, 0xE1, 0x81 };
+      KnxGen g;
+      char lab[16];
+
+      knx_g(&g, buf, SIZE, 4000.0);
+      knx_g_telegram(&g, tg, 7);
+
+      int n = logic_decode(buf, SIZE, 0, 4000, PROTO_AUTO, &scratch, &lr);
+      const KnxAnalysis *a = knx_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_KNX, 0);
+      check_near("eight octets", n, 8, 0);
+      check_near("no parity errors", a->parity_err, 0, 0);
+      check_near("the check octet agrees", a->fcs_ok, 1, 0);
+      check_near("rate", lr.rate, 9600, 0);
+
+      // 0x1105 as an individual address is 1.1.5; 0x0A03 as a GROUP address
+      // is 1/2/3 - the same sixteen bits split 5/3/8 instead of 4/4/8
+      check_near("source", a->src, 0x1105, 0);
+      check_near("destination", a->dst, 0x0A03, 0);
+      check_near("...and it is a group", a->group, 1, 0);
+      check_near("length", a->len, 1, 0);
+      check_near("header", !strcmp(lr.info, "KNX 1.1.5>1/2/3 1B"), 1, 0);
+
+      knx_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("source reads as an address", !strcmp(lab, "1.1.5"), 1, 0);
+      knx_byte_label(a, 4, lr.bytes[4], lab, sizeof(lab));
+      check_near("destination as a group", !strcmp(lab, "1/2/3"), 1, 0);
+      knx_field_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("its octets named", !strcmp(lab, "SRC-H"), 1, 0);
+      knx_byte_label(a, 7, lr.bytes[7], lab, sizeof(lab));
+      check_near("check octet named", !strcmp(lab, "FCS"), 1, 0);
+
+      // Two octets are one address and are shown as one
+      int gs, gl;
+
+      knx_group_at(a, 2, &gs, &gl);
+      check_near("source groups", gs, 1, 0);
+      check_near("...as two", gl, 2, 0);
+    }
+
+    // An individual destination is the SAME sixteen bits read 4/4/8 instead
+    // of 5/3/8, and the flag that decides is in the length octet
+    printf("knx, an individual destination:\n");
+    {
+      const uint8_t tg[7] =
+          { 0xBC, 0x11, 0x05, 0x11, 0x0A, 0x60, 0x80 };
+      KnxGen g;
+      char lab[16];
+
+      knx_g(&g, buf, SIZE, 4000.0);
+      knx_g_telegram(&g, tg, 7);
+
+      logic_decode(buf, SIZE, 0, 4000, PROTO_AUTO, &scratch, &lr);
+      const KnxAnalysis *a = knx_analysis();
+
+      check_near("not a group", a->group, 0, 0);
+      knx_byte_label(a, 4, lr.bytes[4], lab, sizeof(lab));
+      check_near("read as a device", !strcmp(lab, "1.1.10"), 1, 0);
+      check_near("header", !strcmp(lr.info, "KNX 1.1.5>1.1.10 0B"), 1, 0);
+    }
+
+    // The check octet is what says these are one telegram and not a run of
+    // characters that happened to have good parity
+    printf("knx, a broken check octet:\n");
+    {
+      uint8_t tg[8] = { 0xBC, 0x11, 0x05, 0x0A, 0x03, 0xE1, 0x81, 0x00 };
+      KnxGen g;
+      uint8_t x = 0;
+
+      for (int i = 0; i < 7; i++)
+        x ^= tg[i];
+
+      tg[7] = (uint8_t)(~x ^ 0x01);    // one bit out
+
+      knx_g(&g, buf, SIZE, 4000.0);
+
+      for (int i = 0; i < 8; i++)
+        knx_g_char(&g, tg[i]);
+
+      int n = knx_decode(buf, SIZE, 0, 4000, &scratch, &lr);
+
+      check_near("still decodes", n, 8, 0);
+      check_near("but the check octet is flagged",
+          knx_analysis()->fcs_ok, 0, 0);
+      check_near("counted as an error", lr.errors, 1, 0);
+      check_near("header says so", NULL != strstr(lr.info, "FCS!"), 1, 0);
+      check_near("and auto keeps off it", logic_decode(buf, SIZE, 0, 4000,
+          PROTO_AUTO, &scratch, &lr) > 0 && lr.proto == PROTO_KNX, 0, 0);
+    }
+
+    printf("knx rejects the rest:\n");
+    {
+      DaliGen dg;
+
+      dali_g(&dg, buf, SIZE, 20000.0);
+      dali_g_fwd(&dg, 0x0A, 128);
+      check_near("dali is not knx",
+          knx_decode(buf, SIZE, 0, 20000, &scratch, &lr), 0, 0);
+
+      synth_uart(buf, SIZE, 1000.0, 9600.0, "MILKV-UART-TEST", 20000.0);
+      check_near("uart at the same rate is not knx",
+          knx_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      check_near("sine is not knx",
+          knx_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
     }
 
     // ----- structured decoders must all reject a sine -----
