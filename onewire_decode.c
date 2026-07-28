@@ -48,54 +48,155 @@ enum
   EXP_SP,
   EXP_WRSP,
   EXP_SEARCH,
+  EXP_PIO,       // a DS2413's answer to PIO ACCESS READ
 };
 
 /*- Variables ---------------------------------------------------------------*/
-static OwAnalysis g_ow;
+// Shared with every other decoder: only one analysis is live at a time, and
+// the cascade guarantees this one is it. See LogicAnalysis in logic_decode.h.
+#define g_ow    (g_logic_analysis.ow)
 
-// The commands worth naming: the ROM layer, which every device on every bus
-// speaks identically, and the DS18x20 function codes, because a temperature
-// sensor is what a 1-Wire bus is nearly always for. Anything else is device
-// specific and stays a number.
+// The ROM layer: eight commands that every device on every bus speaks
+// identically, whatever it is. These are the only 1-Wire opcodes that mean
+// one thing everywhere.
 static const struct { uint8_t v; const char *name; } g_ow_cmd[] =
 {
   { 0x33, "READ ROM" }, { 0x0F, "READ ROM" }, { 0x55, "MATCH" },
   { 0xCC, "SKIP" },     { 0xF0, "SEARCH" },   { 0xEC, "ALARM" },
   { 0x69, "OD MATCH" }, { 0x3C, "OD SKIP" },
-  { 0x44, "CONVERT" },  { 0xBE, "READ SP" },  { 0x4E, "WRITE SP" },
-  { 0x48, "COPY SP" },  { 0xB8, "RECALL" },   { 0xB4, "READ PWR" },
+};
+
+// ...and the FUNCTION layer, which does not. Above the ROM every family
+// invents its own opcodes, and they collide: 0xF5 reads eight channels on a
+// DS2408 and two pins on a DS2413, 0xF0 reads memory on an EEPROM and the
+// PIO registers on a switch, 0xAA is READ SCRATCHPAD on one part and READ
+// STATUS on another. A single table of "1-Wire commands" therefore cannot
+// exist, and one that pretends to will name half of them wrongly.
+//
+// So the family code decides. It came past in the ROM, eight bytes with a
+// CRC over them, which is the one thing on this bus that says WHAT is
+// answering - and until it has, a function byte stays a number.
+typedef enum
+{
+  OWC_UNKNOWN = 0,
+  OWC_KEY,       // a serial number and nothing else: iButtons, DS2401
+  OWC_THERM,     // DS18x20 and the parts that share its scratchpad
+  OWC_NVRAM,     // the memory iButtons: scratchpad, then copy
+  OWC_EEPROM,    // DS2431/2433/28E04: the same shape, different sizes
+  OWC_EPROM,     // add-only memory: DS1982, DS2502/5/6
+  OWC_SWITCH,    // DS2408, eight channels
+  OWC_SWITCH2,   // DS2413, two - the one inside a MagSafe connector
+  OWC_SWITCH1,   // DS2405/2406/2407
+  OWC_ADC,       // DS2450
+  OWC_BATT,      // DS2438, DS2760
+  OWC_COUNTER,   // DS2423
+  OWC_RTC,
+} ow_class_t;
+
+static const struct { uint8_t cls; uint8_t v; const char *name; } g_ow_fn[] =
+{
+  { OWC_THERM,   0x44, "CONVERT" },   { OWC_THERM,   0xBE, "READ SP" },
+  { OWC_THERM,   0x4E, "WRITE SP" },  { OWC_THERM,   0x48, "COPY SP" },
+  { OWC_THERM,   0xB8, "RECALL" },    { OWC_THERM,   0xB4, "READ PWR" },
+
+  { OWC_SWITCH,  0xF0, "READ PIO" },  { OWC_SWITCH,  0xF5, "CH READ" },
+  { OWC_SWITCH,  0x5A, "CH WRITE" },  { OWC_SWITCH,  0xC3, "RST LATCH" },
+  { OWC_SWITCH,  0xCC, "WR COND" },
+
+  { OWC_SWITCH2, 0xF5, "PIO READ" },  { OWC_SWITCH2, 0x5A, "PIO WRITE" },
+
+  { OWC_SWITCH1, 0xF0, "READ MEM" },  { OWC_SWITCH1, 0xF5, "CH ACCESS" },
+  { OWC_SWITCH1, 0xAA, "READ ST" },   { OWC_SWITCH1, 0x55, "WRITE ST" },
+
+  { OWC_EEPROM,  0x0F, "WRITE SP" },  { OWC_EEPROM,  0xAA, "READ SP" },
+  { OWC_EEPROM,  0x55, "COPY SP" },   { OWC_EEPROM,  0xF0, "READ MEM" },
+
+  { OWC_NVRAM,   0x0F, "WRITE SP" },  { OWC_NVRAM,   0xAA, "READ SP" },
+  { OWC_NVRAM,   0x55, "COPY SP" },   { OWC_NVRAM,   0xF0, "READ MEM" },
+
+  { OWC_EPROM,   0xF0, "READ MEM" },  { OWC_EPROM,   0xC3, "READ ST" },
+  { OWC_EPROM,   0xA5, "READ CRC" },  { OWC_EPROM,   0x0F, "WRITE MEM" },
+  { OWC_EPROM,   0x55, "WRITE ST" },
+
+  { OWC_ADC,     0xAA, "READ MEM" },  { OWC_ADC,     0x55, "WRITE MEM" },
+  { OWC_ADC,     0x3C, "CONVERT" },
+
+  { OWC_BATT,    0x4E, "WRITE SP" },  { OWC_BATT,    0xBE, "READ SP" },
+  { OWC_BATT,    0x48, "COPY SP" },   { OWC_BATT,    0xB8, "RECALL" },
+  { OWC_BATT,    0x44, "CONVERT T" }, { OWC_BATT,    0xB4, "CONVERT V" },
+
+  { OWC_COUNTER, 0xA5, "READ CNT" },  { OWC_COUNTER, 0xF0, "READ MEM" },
+  { OWC_COUNTER, 0x0F, "WRITE SP" },  { OWC_COUNTER, 0xAA, "READ SP" },
+  { OWC_COUNTER, 0x5A, "COPY SP" },
 };
 
 // Family codes: the first ROM byte, and the whole point of reading a ROM.
 // Names are short because they end up in a 32-character panel header next to
 // a temperature.
-static const struct { uint8_t code; const char *name; } g_ow_family[] =
+static const struct { uint8_t code; uint8_t cls; const char *name; }
+    g_ow_family[] =
 {
-  { 0x01, "DS1990 key" },  // iButton serial number: what a door intercom reads
-  { 0x02, "DS1991 key" },
-  { 0x04, "DS2404 RTC" },
-  { 0x05, "DS2405 sw" },
-  { 0x06, "DS1993 mem" },
-  { 0x08, "DS1992 mem" },
-  { 0x09, "DS1982 mem" },
-  { 0x0A, "DS1995 mem" },
-  { 0x0C, "DS1996 mem" },
-  { 0x10, "DS18S20" },     // thermometer, 0.5 C steps
-  { 0x12, "DS2406 sw" },
-  { 0x14, "DS2430 eep" },
-  { 0x1D, "DS2423 cnt" },
-  { 0x20, "DS2450 adc" },
-  { 0x22, "DS1822" },      // thermometer, DS18B20 scratchpad
-  { 0x23, "DS2433 eep" },
-  { 0x26, "DS2438 batt" },
-  { 0x28, "DS18B20" },
-  { 0x29, "DS2408 sw" },
-  { 0x2D, "DS2431 eep" },
-  { 0x30, "DS2760 batt" },
-  { 0x3A, "DS2413 sw" },
-  { 0x3B, "DS1825" },      // thermometer
-  { 0x42, "DS28EA00" },    // thermometer
+  { 0x01, OWC_KEY,     "DS1990 key" },  // and DS2401/DS2411: a serial number
+  { 0x02, OWC_NVRAM,   "DS1991 key" },  // MultiKey, three secure subkeys
+  { 0x04, OWC_RTC,     "DS1994 RTC" },  // and DS2404: 4Kb NVRAM and a clock
+  { 0x05, OWC_SWITCH1, "DS2405 sw" },
+  { 0x06, OWC_NVRAM,   "DS1993 mem" },  // 4Kb
+  { 0x08, OWC_NVRAM,   "DS1992 mem" },  // 1Kb
+  { 0x09, OWC_EPROM,   "DS1982 mem" },  // and DS2502: 1Kb, write once
+  { 0x0A, OWC_NVRAM,   "DS1995 mem" },  // 16Kb
+  { 0x0B, OWC_EPROM,   "DS2505 eep" },  // and DS1985: 16Kb
+  { 0x0C, OWC_NVRAM,   "DS1996 mem" },  // 64Kb
+  { 0x0F, OWC_EPROM,   "DS2506 eep" },  // and DS1986: 64Kb
+  { 0x10, OWC_THERM,   "DS18S20" },     // and DS1920: half-degree steps
+  { 0x12, OWC_SWITCH1, "DS2406 sw" },   // and DS2407
+  { 0x14, OWC_EEPROM,  "DS2430 eep" },  // and DS1971: 256 bits
+  { 0x16, OWC_NVRAM,   "DS1954 java" }, // the cryptographic Java iButton
+  { 0x18, OWC_NVRAM,   "DS1963S" },     // the monetary iButton, SHA-1
+  { 0x19, OWC_UNKNOWN, "DS28E17 i2c" }, // a 1-Wire to I2C bridge
+  { 0x1A, OWC_NVRAM,   "DS1963L" },
+  { 0x1B, OWC_COUNTER, "DS2436 batt" },
+  { 0x1C, OWC_EEPROM,  "DS28E04 eep" }, // 4Kb and two PIO
+  { 0x1D, OWC_COUNTER, "DS2423 cnt" },  // 4Kb NVRAM and four counters
+  { 0x1E, OWC_BATT,    "DS2437 batt" },
+  { 0x1F, OWC_SWITCH1, "DS2409 hub" },  // the coupler that branches a net
+  { 0x20, OWC_ADC,     "DS2450 adc" },  // four channels
+  { 0x21, OWC_THERM,   "DS1921 log" },  // Thermochron
+  { 0x22, OWC_THERM,   "DS1822" },
+  { 0x23, OWC_EEPROM,  "DS2433 eep" },  // and DS1973: 4Kb
+  { 0x24, OWC_RTC,     "DS1904 RTC" },  // and DS2415
+  { 0x26, OWC_BATT,    "DS2438 batt" },
+  { 0x27, OWC_RTC,     "DS2417 RTC" },
+  { 0x28, OWC_THERM,   "DS18B20" },     // and MAX31820
+  { 0x29, OWC_SWITCH,  "DS2408 sw" },   // eight channels
+  { 0x2C, OWC_ADC,     "DS2890 pot" },
+  { 0x2D, OWC_EEPROM,  "DS2431 eep" },  // and DS1972: 1Kb
+  { 0x2E, OWC_BATT,    "DS2770 batt" },
+  { 0x30, OWC_BATT,    "DS2760 batt" }, // and DS2761/DS2762
+  { 0x31, OWC_BATT,    "DS2720 batt" },
+  { 0x32, OWC_BATT,    "DS2780 batt" },
+  { 0x33, OWC_EEPROM,  "DS1961S key" }, // and DS2432: 1Kb with SHA-1
+  { 0x34, OWC_BATT,    "DS2703 auth" },
+  { 0x35, OWC_BATT,    "DS2755 batt" },
+  { 0x36, OWC_BATT,    "DS2740 batt" },
+  { 0x37, OWC_EPROM,   "DS1977 mem" },  // 32Kb behind a password
+  { 0x3A, OWC_SWITCH2, "DS2413 sw" },   // ...and what a MagSafe plug has
+  { 0x3B, OWC_THERM,   "DS1825" },      // MAX31826 and MAX31850 share it
+  { 0x41, OWC_THERM,   "DS1922 log" },  // and DS1923/DS2422
+  { 0x42, OWC_THERM,   "DS28EA00" },    // temperature with PIO and chain
+  { 0x43, OWC_EEPROM,  "DS28EC20 eep" },// 20Kb
+  { 0x44, OWC_EEPROM,  "DS28E10 auth" },
+  { 0x51, OWC_BATT,    "DS2751 batt" },
+  // The high half is the same silicon in other packages, plus one part that
+  // turns up on its own: 0x81 is a DS1420, a ROM and nothing else -
+  // functionally a DS1990 sold as an identity token rather than as a key,
+  // and what a DS9097U adapter has inside it.
+  { 0x81, OWC_KEY,     "DS1420 ID" },
+  { 0x84, OWC_RTC,     "DS2404S RTC" },
+  { 0x89, OWC_EPROM,   "DS2502-E48" },  // an EPROM holding a MAC address
+  { 0x8B, OWC_EPROM,   "DS1985U mem" },
+  { 0x8F, OWC_EPROM,   "DS1986U mem" },
 };
+
 
 // Scratchpad layout, DS18B20: temperature, the two alarm bytes, the
 // configuration register, three reserved bytes and a CRC over all eight.
@@ -167,10 +268,49 @@ static const char *ow_family_name(uint8_t code)
 }
 
 //-----------------------------------------------------------------------------
+static uint8_t ow_family_class(uint8_t code)
+{
+  for (unsigned i = 0; i < sizeof(g_ow_family) / sizeof(g_ow_family[0]); i++)
+  {
+    if (g_ow_family[i].code == code)
+      return g_ow_family[i].cls;
+  }
+
+  return OWC_UNKNOWN;
+}
+
+//-----------------------------------------------------------------------------
 static bool ow_family_is_thermometer(uint8_t code)
 {
-  return (0x10 == code || 0x22 == code || 0x28 == code ||
-      0x3B == code || 0x42 == code);
+  return (OWC_THERM == ow_family_class(code));
+}
+
+//-----------------------------------------------------------------------------
+// A function byte, named by the family that answered. With no ROM on the wire
+// there is no family, and the DS18x20 set is the only reading worth offering
+// - it is what a 1-Wire bus is nearly always for - but it is offered as a
+// guess and not as a fact, which is what the trailing '?' says.
+static const char *ow_fn_name(uint8_t v, uint8_t family, bool known,
+    bool *sure)
+{
+  uint8_t cls = known ? ow_family_class(family) : OWC_THERM;
+
+  *sure = known;
+
+  // A part this decoder can NAME but whose opcodes it does not have - a
+  // DS28E17 bridge, say - gets nothing rather than a guess. Offering the
+  // DS18x20 set there would be worse than saying nothing, because the family
+  // code has already ruled it out.
+  if (known && OWC_UNKNOWN == cls)
+    return NULL;
+
+  for (unsigned i = 0; i < sizeof(g_ow_fn) / sizeof(g_ow_fn[0]); i++)
+  {
+    if (g_ow_fn[i].cls == cls && g_ow_fn[i].v == v)
+      return g_ow_fn[i].name;
+  }
+
+  return NULL;
 }
 
 //-----------------------------------------------------------------------------
@@ -302,6 +442,22 @@ static void ow_analyze(const LogicResult *r, const bool *at_reset, OwAnalysis *a
             st = EXP_UNKNOWN;
             break;
 
+          case 0xF5:
+            // PIO ACCESS READ - but only on the part that has it. 0xF5 is
+            // CHANNEL ACCESS READ on a DS2408 and a memory command on a
+            // DS2406, and reading two pins out of any of those would be
+            // inventing them. The ROM has to have said DS2413 first.
+            if (a->rom_valid && 0x3A == a->rom[0])
+            {
+              st = EXP_PIO;
+              field = 0;
+            }
+            else
+            {
+              st = EXP_UNKNOWN;
+            }
+            break;
+
           default:
             a->role[i] = OW_R_NONE;
             st = EXP_UNKNOWN;
@@ -348,6 +504,26 @@ static void ow_analyze(const LogicResult *r, const bool *at_reset, OwAnalysis *a
           st = EXP_UNKNOWN;
         break;
 
+      case EXP_PIO:
+        // One byte: the two pins, their two output latches, and the same
+        // four inverted in the top nibble. That complement is what says the
+        // byte is a PIO answer and not the bus being read at the wrong
+        // moment - a device that has let go reads 0xFF, which fails it.
+        if (0 == field && ((v ^ 0xF0) >> 4) == (v & 0x0F))
+        {
+          a->pio_valid = true;
+          a->pio = v;
+          a->role[i] = OW_R_PIO;
+        }
+        else
+        {
+          a->role[i] = OW_R_NONE;
+        }
+
+        field++;
+        st = EXP_UNKNOWN;
+        break;
+
       case EXP_SEARCH:
         // One label for the whole triplet run: 24 bytes of "SRCH" under the
         // trace says nothing the first one has not already said
@@ -379,6 +555,29 @@ static void ow_analyze(const LogicResult *r, const bool *at_reset, OwAnalysis *a
     a->device = ow_family_name(a->family);
     a->sure = true;
     a->thermometer = ow_family_is_thermometer(a->family);
+  }
+
+  // A key TOUCHED to a reader. The whole conversation is a reset, READ ROM
+  // and eight bytes - a DS1990 has no function commands to send, so a record
+  // that holds one and nothing after it is not a truncated exchange, it is
+  // the complete one. Naming the event and not just the part is the point:
+  // "DS1990 key" says what is on the bus and "iButton 0000123456" says what
+  // just happened and which key did it.
+  if (a->rom_valid)
+  {
+    bool any_fn = false;
+
+    for (int k = 0; k < LOGIC_MAX_BYTES; k++)
+    {
+      if (OW_R_FNCMD == a->role[k])
+        any_fn = true;
+    }
+
+    a->ibutton = !any_fn && (OWC_KEY == ow_family_class(a->family));
+    // Only where there is no NAME to show. A DS18B20 whose record caught
+    // just the ROM read is better reported as a DS18B20 than as twelve hex
+    // digits - the name is the information there, and the serial is not.
+    a->id_only = !any_fn && !a->ibutton && (NULL == a->device);
   }
 
   if (9 == sp_len && sp_crc_ok)
@@ -494,12 +693,25 @@ void onewire_byte_label(const OwAnalysis *a, int idx, uint8_t v,
   switch (a->role[idx])
   {
     case OW_R_ROMCMD:
-    case OW_R_FNCMD:
       name = ow_cmd_name(v);
 
       if (name)
         snprintf(buf, size, "%s", name);
       break;
+
+    case OW_R_FNCMD:
+    {
+      // Above the ROM every family has its own opcodes and they collide, so
+      // this byte is named by whatever the ROM said was answering. Without a
+      // ROM the name is a guess and carries a '?' to say so.
+      bool sure = false;
+
+      name = ow_fn_name(v, a->family, a->rom_valid, &sure);
+
+      if (name)
+        snprintf(buf, size, "%s%s", name, sure ? "" : "?");
+      break;
+    }
 
     case OW_R_FAMILY:
       // The device name goes where the byte that says it is, and a question
@@ -510,6 +722,12 @@ void onewire_byte_label(const OwAnalysis *a, int idx, uint8_t v,
         snprintf(buf, size, "%s%s", name, a->rom_valid ? "" : "?");
       else
         snprintf(buf, size, "fam%02X", v);
+      break;
+
+    case OW_R_PIO:
+      // What the two pins are actually AT, which is the whole reason anyone
+      // reads a DS2413: bit 0 is PIOA's level and bit 2 is PIOB's
+      snprintf(buf, size, "A=%d B=%d", (v >> 0) & 1, (v >> 2) & 1);
       break;
 
     case OW_R_SERIAL:
@@ -646,6 +864,39 @@ static void ow_build_info(const OwAnalysis *a, bool presence, int errors,
       t = -t;
 
     snprintf(temp, sizeof(temp), "%s%d.%02dC", sign, t / 1000, (t % 1000) / 10);
+  }
+
+  // A key touched to a reader: the identity is the whole message, so it goes
+  // in the header the way a reader would print it - the six serial bytes,
+  // most significant first, which is how an iButton's number is written on
+  // the key itself
+  if (a->ibutton)
+  {
+    snprintf(buf, size, "iButton %02X%02X%02X%02X%02X%02X",
+        a->rom[6], a->rom[5], a->rom[4], a->rom[3], a->rom[2], a->rom[1]);
+
+    return;
+  }
+
+  // A ROM read and nothing else, from a family this decoder has no name for.
+  // The transaction is still exactly one thing - an identity was asked for
+  // and given - so the identity is what to show. Saying "fam 81 ok" instead
+  // reports how much the DECODER knows, when what was on the wire was a
+  // complete and perfectly readable answer.
+  if (a->id_only)
+  {
+    snprintf(buf, size, "1-Wire %02X %02X%02X%02X%02X%02X%02X", a->family,
+        a->rom[6], a->rom[5], a->rom[4], a->rom[3], a->rom[2], a->rom[1]);
+
+    return;
+  }
+
+  if (a->pio_valid && a->device)
+  {
+    snprintf(buf, size, "%s A=%d B=%d", a->device, (a->pio >> 0) & 1,
+        (a->pio >> 2) & 1);
+
+    return;
   }
 
   const char *q = a->sure ? "" : "?";
