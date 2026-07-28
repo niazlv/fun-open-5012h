@@ -97,7 +97,7 @@ static const char *const g_spi_order_labels[] = { "Auto", "MSB", "LSB" };
 
 // Which way round a Manchester bit reads. Nothing in the waveform says, so
 // this is the protocol riding on the code and has to be told.
-static const char *const g_man_pol_labels[] = { "Rise=1", "Rise=0" };
+static const char *const g_man_pol_labels[] = { "Rise=1", "Rise=0", "Auto 55" };
 
 //-----------------------------------------------------------------------------
 // Half of reading an SPI bus with one probe: write down the clock while the
@@ -625,6 +625,27 @@ static const char *const g_decoder_help_lines[] =
   "  DALI the other. Decoder >",
   "  Manchester bit picks it; 'inv' on",
   "  the header says which was used.",
+  "  'Auto 55' leans on the PROTOCOL",
+  "  instead: a preamble is there to be",
+  "  recognised and is 0x55 in nearly",
+  "  everything, so a frame reading",
+  "  0xAA was read backwards and the",
+  "  record flips. That is an",
+  "  assumption, and 'inv?' says so.",
+  "",
+  "A bit with NO transition in its",
+  "middle is an encoding violation. The",
+  "frame still comes back - the reader",
+  "keeps the bit PHASE instead of",
+  "chasing edges, so it does not slip",
+  "half a bit and turn the rest into",
+  "porridge - and the header names the",
+  "bit: '!b15'. Errors count it.",
+  "A record whose only frame is broken",
+  "is shown but not claimed: one broken",
+  "frame looks the same as something",
+  "else fitting Manchester badly, so",
+  "the cascade waits for a clean one.",
   "",
   "A frame is a BIT count, not a byte",
   "count - RC5 sends 14, DALI 19 - so",
@@ -863,7 +884,7 @@ static const menu_item_t g_decoder_items[] =
         DECODER_MAN_RATE_COUNT, NULL } },
   { .kind = MI_CHOICE, .label = "Manchester bit",
     .desc = "RC5 is Rise=1, DALI is Rise=0",
-    .u.choice = { &config.man_polarity, g_man_pol_labels, 2, NULL } },
+    .u.choice = { &config.man_polarity, g_man_pol_labels, 3, NULL } },
 };
 
 //-----------------------------------------------------------------------------

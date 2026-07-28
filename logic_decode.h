@@ -419,6 +419,12 @@ typedef struct
   uint8_t  bits;    // how many the frame held
   uint8_t  first;   // its first byte in LogicResult.bytes
   uint8_t  count;   // ...and how many they packed into
+  // Bits with no transition in their middle. That is an ENCODING violation
+  // and not a reason to stop: the frame is Manchester, one of its bits is
+  // broken, and those are different statements. The bit index of the first
+  // one is kept because "somewhere in here" is not an answer.
+  uint8_t  viol;
+  uint8_t  viol_bit;
   uint32_t value;   // the frame right-aligned, for the frames that fit
 } ManFrame;
 
@@ -432,6 +438,12 @@ typedef struct
   // Some frame held runs of BOTH lengths, which is the signature. Without it
   // the record is a square wave and every reading of one fits it.
   bool     sure;
+  // The convention was inferred from the preamble rather than told: a frame
+  // whose first byte reads 0xAA where a protocol's preamble is 0x55 was read
+  // the wrong way round. That is an assumption about the PROTOCOL and not a
+  // fact about the waveform, so it is reported as one.
+  bool     auto_inv;
+  int      viol;    // encoding violations over the whole record
   ManFrame frame[MAN_MAX_FRAMES];
 } ManAnalysis;
 
@@ -742,7 +754,15 @@ void manchester_group_at(const ManAnalysis *a, int idx, int *start, int *len);
 void manchester_decode_set_rate(int bps);
 
 // Which convention: 0 = a rising mid-bit edge is a one (G.E. Thomas, RC5),
-// 1 = it is a zero (IEEE 802.3, DALI). Nothing in the waveform decides this.
+// 1 = it is a zero (IEEE 802.3, DALI), 2 = work it out from the preamble.
+//
+// Nothing in the WAVEFORM decides this - the two conventions are exact
+// inverses and 0x55 and 0xAA are equally good data. What the third option
+// leans on is the protocol: a preamble is there to be recognised, it is
+// 0x55 in nearly everything that has one, and a frame that starts 0xAA was
+// therefore read the wrong way round. An assumption, and labelled as one.
+#define MAN_POL_AUTO  2
+
 void manchester_decode_set_polarity(int inverted);
 
 // RC5, RC5X and RC6. Bi-phase like the generic decoder, but read as MESSAGES:
