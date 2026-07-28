@@ -1,3 +1,6 @@
+# Copyright (c) 2019-2020, Alex Taradov <alex@taradov.com>
+# Copyright (c) 2026, Niaz Leushkin <niazlv03@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
 ##############################################################################
 BUILD = build
 BIN = open-5012h
@@ -50,6 +53,7 @@ SRCS += \
   ../buffer.c \
   ../record_window.c \
   ../measure.c \
+  ../trend.c \
   ../fft.c \
   ../classify.c \
   ../logic_decode.c \
