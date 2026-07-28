@@ -65,6 +65,7 @@ SRCS += \
   ../can_decode.c \
   ../dht_decode.c \
   ../sent_decode.c \
+  ../midi_decode.c \
   ../cube3d.c \
   ../engine3d.c \
   ../ui.c \
