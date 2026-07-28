@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * NEC infrared remote protocol decoder (as seen after a TSOP-style
  * demodulator: idle high, marks are low).
@@ -101,43 +102,53 @@ int nec_decode(const uint8_t *data, int size, int offset, int period_ns,
       k += 2;
     }
 
-    // The final stop mark may end the record; accept 32 bits with the
-    // command integrity check (cmd == ~cmd) as the confidence gate
-    if (bits == 32)
-    {
-      uint8_t addr = word & 0xff;
-      uint8_t naddr = (word >> 8) & 0xff;
-      uint8_t cmd = (word >> 16) & 0xff;
-      uint8_t ncmd = (word >> 24) & 0xff;
+    // Why the bit loop stopped decides what this frame is. Out of record is
+    // not out of protocol: a NEC frame is 67.5 ms end to end, which is longer
+    // than the record holds at most timebases, and refusing everything that
+    // did not fit whole means pointing the scope at a remote control and
+    // being told there is no remote control. So a lead that was followed by
+    // whole bytes reports those bytes and says the rest was cut off. A
+    // TIMING failure mid-frame is different - that is a signal which started
+    // like NEC and then was not NEC, and it stays an error.
+    bool cut = (bits < 32 && k + 1 >= runs);
+    int whole = bits / 8;
 
-      if (((cmd ^ ncmd) & 0xff) != 0xff)
+    if (bits == 32 || (cut && whole >= 1))
+    {
+      uint8_t byte[4] =
+      {
+        word & 0xff, (word >> 8) & 0xff, (word >> 16) & 0xff, (word >> 24) & 0xff
+      };
+      int n = (bits == 32) ? 4 : whole;
+
+      // Address and command are each sent with their own complement, so a
+      // whole frame carries its own integrity check
+      if (bits == 32 && ((byte[2] ^ byte[3]) & 0xff) != 0xff)
         out->errors++;
 
-      int frame_end = scratch->pos[k] + (k < runs ? scratch->len[k] : 0);
+      // k lands one past the last run the frame used, which on a frame the
+      // record cut short is one past the LIST: the end of the record is then
+      // the end of the frame, and reading scratch->pos[runs] for it was
+      // reading whatever the spare SRAM happened to hold
+      int frame_end = (k < runs) ? scratch->pos[k] + scratch->len[k] : size;
       int span = frame_end - frame_start;
 
-      out->bytes[out->count] = addr;
-      out->pos[out->count] = frame_start;
-      out->end[out->count] = frame_start + span / 4;
-      out->count++;
+      for (int i = 0; i < n && out->count < LOGIC_MAX_BYTES; i++)
+      {
+        out->bytes[out->count] = byte[i];
+        out->pos[out->count] = frame_start + span * i / 4;
+        out->end[out->count] = frame_start + span * (i + 1) / 4;
+        out->count++;
+      }
 
-      out->bytes[out->count] = naddr;
-      out->pos[out->count] = frame_start + span / 4;
-      out->end[out->count] = frame_start + span / 2;
-      out->count++;
+      if (bits == 32)
+        snprintf(out->info, sizeof(out->info), "NEC A=%02X C=%02X%s",
+            byte[0], byte[2], repeat_seen ? " rpt" : "");
+      else
+        snprintf(out->info, sizeof(out->info), "NEC A=%02X %d/32 bits",
+            byte[0], bits);
 
-      out->bytes[out->count] = cmd;
-      out->pos[out->count] = frame_start + span / 2;
-      out->end[out->count] = frame_start + span * 3 / 4;
-      out->count++;
-
-      out->bytes[out->count] = ncmd;
-      out->pos[out->count] = frame_start + span * 3 / 4;
-      out->end[out->count] = frame_end;
-      out->count++;
-
-      snprintf(out->info, sizeof(out->info), "NEC A=%02X C=%02X%s",
-          addr, cmd, repeat_seen ? " rpt" : "");
+      out->overrun = out->overrun || cut;
 
       r = k;
     }
