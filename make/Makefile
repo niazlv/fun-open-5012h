@@ -61,6 +61,7 @@ SRCS += \
   ../onewire_decode.c \
   ../ws2812_decode.c \
   ../nec_decode.c \
+  ../servo_decode.c \
   ../cube3d.c \
   ../engine3d.c \
   ../ui.c \
