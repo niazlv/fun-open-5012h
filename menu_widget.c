@@ -619,7 +619,7 @@ static void info_draw_position(const info_inst_t *in)
   lcd_puts(INFO_TEXT_R - (int)strlen(name) * FW_SMALL, INFO_TITLE_Y + 4, name);
 
   snprintf(buf, sizeof(buf), "%d%%", 100 * in->top / (in->count - in->vis));
-  lcd_fill_rect(INFO_TEXT_R - 30, INFO_FOOTER_Y, 30, 8, INFO_BG);
+  lcd_fill_rect(INFO_TEXT_R - 26, INFO_FOOTER_Y, 26, 8, INFO_BG);
   lcd_puts(INFO_TEXT_R - (int)strlen(buf) * FW_SMALL, INFO_FOOTER_Y, buf);
 }
 
