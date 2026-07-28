@@ -72,6 +72,7 @@ SRCS += \
   ../spi_decode.c \
   ../manchester_decode.c \
   ../rc5_decode.c \
+  ../dali_decode.c \
   ../cube3d.c \
   ../engine3d.c \
   ../ui.c \
