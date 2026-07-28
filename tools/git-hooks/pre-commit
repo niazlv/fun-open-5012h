@@ -1,0 +1,41 @@
+#!/bin/sh
+#
+# Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Refuse a commit that carries an iCloud Drive duplicate.
+#
+# When iCloud cannot reconcile two versions of a file it keeps both, and the
+# loser gets a space and a number appended: "measure.c" becomes "measure 2.c".
+# The copy is stale from the moment it is made, and it looks enough like a
+# real source file to be committed by a wildcard. What lands in the history
+# then is a silent revert of everything edited after the clone was taken.
+#
+# .gitignore keeps them out of "git add ."; this catches the rest - an
+# explicit "git add -f", or a path that was already tracked when the clone
+# appeared.
+#
+# Enable in a fresh clone:
+#   git config core.hooksPath tools/git-hooks
+
+# A path component ending in " <number>", with or without an extension. The
+# trailing (/|$) is what catches a cloned DIRECTORY, whose files are innocent
+# on their own: "tests/hoststub 2/capture.h".
+pattern='(^|/)[^/]* [0-9]+(\.[^/]*)?(/|$)'
+
+bad=$(git diff --cached --name-only --diff-filter=ACMR | grep -E "$pattern")
+
+if [ -n "$bad" ]; then
+  echo "pre-commit: iCloud duplicates are staged, commit refused:" >&2
+  echo "$bad" | sed 's/^/  /' >&2
+  echo >&2
+  echo "These are copies - the originals are already in the tree. Check one" >&2
+  echo "against its original before deleting, in case the newer edit is in" >&2
+  echo "the clone:" >&2
+  echo "  diff 'measure 2.c' measure.c" >&2
+  echo "  git rm --cached 'measure 2.c'; rm 'measure 2.c'" >&2
+
+  exit 1
+fi
+
+exit 0
