@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2019-2020, Alex Taradov <alex@taradov.com>
+ * Copyright (c) 2026, Niaz Leushkin <niazlv03@gmail.com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -52,6 +53,7 @@ enum
   MEASURE_VAVG,
   MEASURE_TYPE,
   MEASURE_THD,
+  MEASURE_JITTER,     // period sigma / p-p, from the per-period statistics
   MEASURE_COUNT,
 };
 
@@ -146,7 +148,18 @@ typedef struct
   // Logic decoder: forced protocol (proto_t; 0 = auto) and stop-on-decode
   int      decoder_proto;
   bool     decoder_stop;
-  bool     decoder_reserved[3];
+  // show_jitter lives in what used to be decoder_reserved[0] - NOT appended
+  // to the show_* run above: a ninth bool there pushes 3 alignment bytes in
+  // front of measure_line, shifts every later field (crc included) by 4 while
+  // sizeof stays 416, and the store then rejects and ERASES every saved
+  // entry, calibration included. That is not a theory; it happened.
+  bool     show_jitter;
+  // Narrow stop-on-decode to records that caught the line at rest first, so
+  // the freeze lands on the head of a message instead of a slice out of its
+  // middle. Carved out of decoder_reserved; false in every config saved
+  // before it existed, which is the old behaviour.
+  bool     decoder_stop_start;
+  bool     decoder_reserved[1];
 
   // Reference level, in mV, that the gain (S) calibration aims at: whatever
   // you can measure accurately and apply to the input. Carved out of padding
@@ -154,7 +167,31 @@ typedef struct
   // before this existed reads 0, which the gain step treats as "not set yet".
   int      calib_ref_mv;
 
-  uint32_t padding[17];  // Reduced padding to accommodate new fields
+  // Display processing, carved out of padding (configs saved before these
+  // existed read 0 = both off). display_persist accumulates a per-column
+  // envelope across frames; average_mode is the acquisition averaging depth,
+  // 0 = off, otherwise N = 2 << mode (1..5 -> 4, 8, 16, 32, 64).
+  bool     display_persist;
+  bool     display_reserved[3];
+  int      average_mode;
+
+  // UART decoder baud: index into the menu's rate table, 0 = auto-detect.
+  // Carved out of padding (configs saved before it existed read 0 = auto).
+  int      decoder_baud;
+
+  // Set the timebase from the decoded rate, so a whole message lands on the
+  // screen without hunting for it: 0 = on, 1 = off. Zero-is-default, like
+  // measure_panel_mode, so a config saved before this field existed gets it.
+  int      decoder_fit_mode;
+
+  // Draw the bit grid over the trace: a hairline at every bit boundary of a
+  // decoded byte and the bit's number in the cell. 0 = on, 1 = off, so a
+  // config saved before this field existed gets it - same zero-is-default as
+  // decoder_fit_mode. Carved out of padding, which is why padding shrank by
+  // one word rather than the field being appended.
+  int      decoder_bits_mode;
+
+  uint32_t padding[12];  // Reduced padding to accommodate new fields
 
   int      calib_channel_delta;
   int      calib_dac_zero;

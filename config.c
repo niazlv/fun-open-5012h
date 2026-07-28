@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2019-2020, Alex Taradov <alex@taradov.com>
+ * Copyright (c) 2026, Niaz Leushkin <niazlv03@gmail.com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -91,6 +92,17 @@ _Static_assert(CRC_LENGTH % sizeof(uint32_t) == 0,
     "CRC region must be a whole number of words for the hardware CRC unit");
 _Static_assert(CRC_LENGTH + sizeof(uint32_t) <= sizeof(Config),
     "crc must be the last field of Config");
+
+// The layout is pinned ABSOLUTELY. Alignment makes it treacherous: adding a
+// ninth bool to the show_* run once moved every field below it by 4 bytes
+// while sizeof(Config) stayed put - the store then failed every entry's CRC
+// and erased the sector, taking the calibration with it. If one of these
+// fires, the new field is padding the compiler re-arranged around: carve it
+// out of padding[] / decoder_reserved[] instead, and verify with a host
+// build that these numbers did not move.
+_Static_assert(offsetof(Config, measure_line) == 248, "layout shifted: measure_line");
+_Static_assert(offsetof(Config, calib_channel_delta) == 336, "layout shifted: calibration block");
+_Static_assert(offsetof(Config, crc) == 408, "layout shifted: crc / CRC_LENGTH");
 
 #define TIMER_INTERVAL     1000
 
@@ -622,9 +634,18 @@ void config_reset(void)
 
   config.decoder_proto          = 0; // auto
   config.decoder_stop           = false;
+  config.show_jitter            = false;
+  config.decoder_stop_start     = false;
   config.decoder_reserved[0]    = false;
-  config.decoder_reserved[1]    = false;
-  config.decoder_reserved[2]    = false;
+
+  config.display_persist        = false;
+  config.display_reserved[0]    = false;
+  config.display_reserved[1]    = false;
+  config.display_reserved[2]    = false;
+  config.average_mode           = 0;
+  config.decoder_baud           = 0; // auto-detect
+  config.decoder_fit_mode       = 0; // fit the timebase to the rate
+  config.decoder_bits_mode      = 0; // bit grid over the trace
 
   // General settings defaults
   config.screen_brightness      = 80;  // 80% default brightness
