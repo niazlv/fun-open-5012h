@@ -75,7 +75,9 @@
 #define LIN_MAX_DATA           8
 
 /*- Variables ---------------------------------------------------------------*/
-static LinAnalysis g_lin;
+// Shared with every other decoder: only one analysis is live at a time, and
+// the cascade guarantees this one is it. See LogicAnalysis in logic_decode.h.
+#define g_lin   (g_logic_analysis.lin)
 
 // The transport-layer services that ride on identifiers 0x3C and 0x3D. A
 // response uses the request's service id plus 0x40, so both directions are

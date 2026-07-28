@@ -87,7 +87,9 @@
 #define SENT_MAX_NIBBLES      12   // status + up to 6 data + CRC, with slack
 
 /*- Variables ---------------------------------------------------------------*/
-static SentAnalysis g_sent;
+// Shared with every other decoder: only one analysis is live at a time, and
+// the cascade guarantees this one is it. See LogicAnalysis in logic_decode.h.
+#define g_sent  (g_logic_analysis.sent)
 
 // Shifting a nibble of zeros through the J2716 polynomial. The whole CRC is
 // this table plus an exclusive-or per nibble.

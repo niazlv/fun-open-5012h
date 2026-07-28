@@ -57,7 +57,9 @@
 #define DHT_BITS  40
 
 /*- Variables ---------------------------------------------------------------*/
-static DhtAnalysis g_dht;
+// Shared with every other decoder: only one analysis is live at a time, and
+// the cascade guarantees this one is it. See LogicAnalysis in logic_decode.h.
+#define g_dht   (g_logic_analysis.dht)
 
 /*- Implementations ---------------------------------------------------------*/
 

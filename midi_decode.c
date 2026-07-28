@@ -70,7 +70,9 @@
 #define MIDI_VAR  0xFF   // MidiMsg.want for a system-exclusive message
 
 /*- Variables ---------------------------------------------------------------*/
-static MidiAnalysis g_midi;
+// Shared with every other decoder: only one analysis is live at a time, and
+// the cascade guarantees this one is it. See LogicAnalysis in logic_decode.h.
+#define g_midi  (g_logic_analysis.midi)
 
 // Sharps, because that is how a note number is written everywhere a note
 // number is written. Note 60 is C4: 69 is A440 and 69 is A4.

@@ -44,6 +44,15 @@ typedef enum
   PROTO_SENT,     // SAE J2716: nibbles in the time between falling edges
   PROTO_MIDI,     // MIDI 1.0: 8N1 at 31250 baud, and what the bytes say
   PROTO_LIN,      // LIN: a break, a sync byte that gives the rate, then 8N1
+  PROTO_EV1527,   // 433 MHz remotes: 24 bits, every one of them 4T long
+  PROTO_DSHOT,    // ESC throttle: 16 bits, duty carries the value, CRC-4
+  // The data line of an SPI bus WITHOUT its clock. Not a decode: a
+  // reconstruction, on assumptions it states. Never chosen automatically.
+  PROTO_SPI,
+  PROTO_MANCH,    // Manchester / bi-phase: the line code under RC5, DALI, tags
+  PROTO_RC5,      // RC5, RC5X and RC6: the Philips remotes, read as messages
+  PROTO_DALI,     // IEC 62386 lighting: Manchester at 1200, read as commands
+  PROTO_KNX,      // KNX TP1: 9600, pulse-presence coded - NOT Manchester
   PROTO_COUNT,
 } proto_t;
 
@@ -99,6 +108,7 @@ typedef enum
   // 0x10 the DS18B20 still returns came from.
   OW_R_RSV_FF,   // byte 5, reads 0xFF
   OW_R_RSV_10,   // byte 7, reads 0x10
+  OW_R_PIO,      // a DS2413's pin state, answering PIO ACCESS READ
 } ow_role_t;
 
 // The transaction read of a 1-Wire record: which device answered and what it
@@ -123,6 +133,16 @@ typedef struct
   // DS1825 keep the same one, so a part named without a ROM gets a '?'.
   const char *device;
   bool     sure;
+  // A key was TOUCHED to a reader: a reset, READ ROM, eight bytes that check
+  // out, and no function command anywhere. That is the whole conversation an
+  // iButton has, and it is worth naming as an event rather than as a device.
+  bool     ibutton;
+  // ...and the same transaction from a family with no name here. The record
+  // is not incomplete and the decoder is not confused: an identity was asked
+  // for and given, and the identity is the answer.
+  bool     id_only;
+  bool     pio_valid;   // a DS2413 answered PIO ACCESS READ
+  uint8_t  pio;
   uint8_t  role[LOGIC_MAX_BYTES];
 } OwAnalysis;
 
@@ -311,6 +331,209 @@ typedef struct
   uint8_t  fidx[LOGIC_MAX_BYTES];
 } LinAnalysis;
 
+// EV1527 and the family with it. Twenty-four bits: twenty of address burned
+// in at the factory, four of buttons. No checksum anywhere in the protocol -
+// a held button repeating the frame is all the corroboration there is.
+#define EV1527_MAX_FRAMES  8
+
+typedef struct
+{
+  uint32_t addr;    // 20 bits
+  uint8_t  key;     // 4 bits: which buttons are down
+} Ev1527Frame;
+
+typedef struct
+{
+  int      t_ns;    // the unit time, read off the frame's own sync ratio
+  int      frames;
+  bool     agree;   // every frame in the record said the same thing
+  Ev1527Frame frame[EV1527_MAX_FRAMES];
+} Ev1527Analysis;
+
+// DShot. Sixteen bits and one number: eleven of throttle (or a command), one
+// asking for telemetry, and four of CRC over the twelve.
+#define DSHOT_MAX_FRAMES  8
+
+typedef struct
+{
+  uint16_t value;   // 0 disarms, 1..47 are commands, 48..2047 is the throttle
+  uint8_t  crc;     // as received
+  bool     telem;   // the frame asked the ESC for a telemetry packet
+  bool     crc_ok;
+} DshotFrame;
+
+typedef struct
+{
+  int   rate;       // bit/s, measured over the whole frame
+  int   frames;
+  int   crc_ok;
+  // Bidirectional DShot: the line is inverted and so is the CRC. Recognised
+  // by which CRC agreed; the ESC's eRPM answer is GCR-encoded on the same
+  // wire and is not decoded here.
+  bool  bidir;
+  DshotFrame frame[DSHOT_MAX_FRAMES];
+} DshotAnalysis;
+
+// What one probe on a data line was able to work out about a clocked bus it
+// cannot see the clock of. Every field here is an assumption or the evidence
+// for one, which is the only honest way to present the result.
+// What a reconstructed byte turned out to be. Only ever filled where a PAUSE
+// said a transaction started here - see spi_decode.c for why a command name
+// anywhere else would be a guess wearing a fact's clothes.
+typedef enum
+{
+  SPI_R_NONE = 0,
+  SPI_R_CMD,      // the first byte of a transaction, and a known one
+  SPI_R_ADDR,     // one of the three address bytes that command takes
+} spi_role_t;
+
+// The addresses that were assembled, one per transaction that carried one.
+// Kept beside the roles rather than per byte: three bytes make one number and
+// there are only ever a handful of transactions in a record.
+#define SPI_MAX_TX  8
+
+typedef struct
+{
+  int  clock_hz;    // the bit rate the reconstruction used
+  int  phase;       // 0..7: where the byte boundary was put
+  int  bits;        // how many bits came out of the record
+  int  anchors;     // gaps long enough to be byte boundaries
+  int  cmds;        // known commands found at transaction starts
+  bool told;        // the rate was measured on SCK, not guessed from the data
+  bool msb_first;
+  bool pinned;      // ...and a gap agreed with the phase, so it is not a guess
+  int  txs;
+  uint8_t  tx_last[SPI_MAX_TX];   // byte index the address finishes on
+  uint32_t tx_addr[SPI_MAX_TX];
+  uint8_t role[LOGIC_MAX_BYTES];
+} SpiAnalysis;
+
+// Manchester is a line CODE and not a protocol, so a frame is a run of bits
+// and not a run of bytes: RC5 sends fourteen of them, DALI nineteen. The bit
+// count travels with the value, because two bytes of a fourteen-bit frame are
+// a packing artefact and nothing else.
+#define MAN_MAX_FRAMES  6
+
+typedef struct
+{
+  uint8_t  bits;    // how many the frame held
+  uint8_t  first;   // its first byte in LogicResult.bytes
+  uint8_t  count;   // ...and how many they packed into
+  uint32_t value;   // the frame right-aligned, for the frames that fit
+} ManFrame;
+
+typedef struct
+{
+  int      rate;    // bit/s
+  int      frames;
+  int      bits;
+  bool     told;    // the rate was picked, not guessed off the record
+  bool     inverted;// a rising mid-bit edge was read as a zero
+  // Some frame held runs of BOTH lengths, which is the signature. Without it
+  // the record is a square wave and every reading of one fits it.
+  bool     sure;
+  ManFrame frame[MAN_MAX_FRAMES];
+} ManAnalysis;
+
+// One union for every decoder's analysis, because only one of them is ever
+// live. The cascade stops at the first decoder that answers, so that decoder
+// is the LAST one to have run and its analysis is fetched immediately
+// afterwards; everything the ones before it wrote belongs to a reading nobody
+// is going to ask about. Ten separate copies held a kilobyte and a half of a
+// part that has sixty-four of them, for nine analyses of records that were
+// turned down.
+// The Philips bi-phase remotes. RC5 is fourteen bits at 1.778 ms; RC6 puts a
+// leader in front of twenty-one at 0.889 and makes its toggle bit twice as
+// wide as the rest, which is exactly what a generic Manchester reader cannot
+// follow.
+typedef enum
+{
+  RC5_KIND_RC5 = 0,
+  RC5_KIND_RC5X,   // the second start bit carries the seventh command bit
+  RC5_KIND_RC6,
+} rc5_kind_t;
+
+typedef struct
+{
+  uint8_t kind;
+  uint8_t addr;
+  uint8_t cmd;
+  uint8_t mode;    // RC6 only
+  uint8_t bits;
+  bool    toggle;  // flipped on a fresh press, held through a repeat
+  bool    field;   // RC5's second start bit; 0 makes it RC5X
+  int     bit_ns;
+} Rc5Analysis;
+
+// DALI. Which ballast, and what it was told - the address byte is not a
+// number but a shape, and its bottom bit decides what the OTHER byte means.
+typedef enum
+{
+  DALI_SHORT = 0,   // one ballast out of 64
+  DALI_GROUP,       // one group out of 16
+  DALI_BROADCAST,
+  DALI_SPECIAL,     // the commissioning set, which lives in the address byte
+  DALI_BACKWARD,    // a slave answering a query
+} dali_kind_t;
+
+#define DALI_MAX_FRAMES  4
+
+typedef struct
+{
+  uint8_t bits;     // 17 forward, 9 backward
+  uint8_t kind;
+  uint8_t addr;     // the address byte as it went past
+  uint8_t data;
+  uint8_t target;   // the short address or the group number
+  uint8_t first;
+  uint8_t count;
+  bool    cmd;      // the selector: the data byte is a command, not a level
+} DaliFrame;
+
+typedef struct
+{
+  int       rate;
+  int       frames;
+  int       bits;
+  DaliFrame frame[DALI_MAX_FRAMES];
+} DaliAnalysis;
+
+// KNX TP1. Not a line code question but an addressing one: what a person
+// wants off this bus is who told whom, and both addresses are packed fields
+// rather than numbers.
+typedef struct
+{
+  int      rate;
+  int      octets;
+  int      parity_err;   // characters turned down for their parity bit
+  uint16_t src;
+  uint16_t dst;
+  uint8_t  ctrl;
+  uint8_t  len;
+  bool     group;        // the destination is a group, not a device
+  bool     repeat;       // the sender has said this before
+  bool     fcs_ok;
+} KnxAnalysis;
+
+typedef union
+{
+  OwAnalysis     ow;
+  CanAnalysis    can;
+  DhtAnalysis    dht;
+  SentAnalysis   sent;
+  MidiAnalysis   midi;
+  LinAnalysis    lin;
+  Ev1527Analysis ev;
+  DshotAnalysis  dshot;
+  SpiAnalysis    spi;
+  ManAnalysis    man;
+  Rc5Analysis    rc5;
+  DaliAnalysis   dali;
+  KnxAnalysis    knx;
+} LogicAnalysis;
+
+extern LogicAnalysis g_logic_analysis;
+
 // Working memory (~4.5 KB) provided by the caller: the firmware puts it in
 // spare main SRAM, host tests use a static instance
 typedef struct
@@ -321,14 +544,29 @@ typedef struct
 
   // Run-split cache. Every decoder in the auto cascade thresholds the SAME
   // record, and that is two full passes over 24K samples each time; the
-  // dispatcher invalidates this once per call and the cascade then pays for
-  // the split once instead of five times.
+  // cascade pays for the split once instead of fifteen times.
+  //
+  // It is live ONLY while the dispatcher is inside one call, which `cascade`
+  // marks. That is not a shortcut, it is the only window in which reuse is
+  // sound: the record behind an unchanged (data, size, offset) is refilled by
+  // the DMA between calls. A decoder called on its own - which every one of
+  // them supports, and which is how they are all tested - therefore always
+  // splits afresh.
+  //
+  // There WAS a content fingerprint here instead, sampling the record at 64
+  // points and later 256. It could not work, and not by a narrow margin: the
+  // records this instrument takes are sparse - a KNX telegram is a handful of
+  // 35 us pulses on a flat line - so a stride that lands between the pulses
+  // reads two entirely unrelated captures as the same. That is not a
+  // theoretical collision; an infrared frame came back as three bytes of a
+  // lighting bus, and a KNX telegram with a deliberately broken check octet
+  // came back with the previous telegram's good one.
   const uint8_t *cache_data;
   int      cache_size;
   int      cache_offset;
   int      cache_runs;
   int      cache_mid;
-  uint32_t cache_hash;
+  uint32_t cascade;      // set while the dispatcher is inside one call
   uint32_t cache_valid;
 } LogicScratch;
 
@@ -435,6 +673,115 @@ int lin_decode(const uint8_t *data, int size, int offset, int period_ns,
 const LinAnalysis *lin_analysis(void);
 void lin_byte_label(const LinAnalysis *a, int idx, uint8_t v,
     char *buf, int size);
+
+// EV1527. Found from its 1:31 sync ratio and confirmed by 24 bits of
+// constant period; three result bytes per frame, MSB first, so the hex dump
+// reads the address and the buttons straight off.
+int ev1527_decode(const uint8_t *data, int size, int offset, int period_ns,
+    LogicScratch *scratch, LogicResult *out);
+const Ev1527Analysis *ev1527_analysis(void);
+void ev1527_byte_label(const Ev1527Analysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void ev1527_group_at(const Ev1527Analysis *a, int idx, int *start, int *len);
+void ev1527_field_label(const Ev1527Analysis *a, int idx, uint8_t v,
+    char *buf, int size);
+
+// DShot. Every frame is confirmed by its own CRC-4 before it is reported, so
+// this one is safe ahead of WS2812 - which is the signal it has to be told
+// apart from, both being constant-period and duty-encoded at about the same
+// rate. Two result bytes per frame.
+int dshot_decode(const uint8_t *data, int size, int offset, int period_ns,
+    LogicScratch *scratch, LogicResult *out);
+const DshotAnalysis *dshot_analysis(void);
+void dshot_byte_label(const DshotAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void dshot_group_at(const DshotAnalysis *a, int idx, int *start, int *len);
+void dshot_field_label(const DshotAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+
+// SPI with one probe on the data line. Reports itself ambiguous every time,
+// so the dispatcher never picks it in auto mode - a data line without its
+// clock is not distinguishable from any other digital signal, and this
+// decoder exists to be asked for by name.
+int spi_decode(const uint8_t *data, int size, int offset, int period_ns,
+    LogicScratch *scratch, LogicResult *out);
+const SpiAnalysis *spi_analysis(void);
+
+// The clock measured on SCK before the probe moved to the data line, in Hz.
+// 0 (the default) works the bit time out of the data itself, which drifts on
+// long runs of identical bits and cannot tell a rate from half of it.
+void spi_decode_set_clock(int hz);
+
+// 0 = try both bit orders and score them, 1 = MSB first, 2 = LSB first
+void spi_decode_set_order(int order);
+
+// What a byte turned out to be, where anything did. Empty for a byte that is
+// just a byte, which is most of them - the caller falls back to showing it as
+// a character, the way it does for a serial line.
+void spi_byte_label(const SpiAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void spi_field_label(const SpiAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void spi_group_at(const SpiAnalysis *a, int idx, int *start, int *len);
+
+// Manchester / bi-phase, the line code under RC5, DALI, EM4100 tags and most
+// of the 433 MHz weather sensors. Every bit has a transition in its middle,
+// so the line holds a level for half a bit or a whole one and never longer -
+// which is the structural check this decoder makes before reading anything.
+int manchester_decode(const uint8_t *data, int size, int offset, int period_ns,
+    LogicScratch *scratch, LogicResult *out);
+const ManAnalysis *manchester_analysis(void);
+void manchester_byte_label(const ManAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void manchester_field_label(const ManAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void manchester_group_at(const ManAnalysis *a, int idx, int *start, int *len);
+
+// The bit rate, in bit/s; 0 works it out of the record - which cannot tell a
+// rate from half of it when the data never repeats a bit
+void manchester_decode_set_rate(int bps);
+
+// Which convention: 0 = a rising mid-bit edge is a one (G.E. Thomas, RC5),
+// 1 = it is a zero (IEEE 802.3, DALI). Nothing in the waveform decides this.
+void manchester_decode_set_polarity(int inverted);
+
+// RC5, RC5X and RC6. Bi-phase like the generic decoder, but read as MESSAGES:
+// address, command and the toggle bit that says a key was pressed again
+// rather than held.
+int rc5_decode(const uint8_t *data, int size, int offset, int period_ns,
+    LogicScratch *scratch, LogicResult *out);
+const Rc5Analysis *rc5_analysis(void);
+void rc5_byte_label(const Rc5Analysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void rc5_field_label(const Rc5Analysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void rc5_group_at(const Rc5Analysis *a, int idx, int *start, int *len);
+
+// DALI. Manchester at 1200, read as lighting commands rather than as bits:
+// which ballast, and whether the data byte is an arc power level or an
+// instruction - which its address byte's bottom bit decides.
+int dali_decode(const uint8_t *data, int size, int offset, int period_ns,
+    LogicScratch *scratch, LogicResult *out);
+const DaliAnalysis *dali_analysis(void);
+void dali_frame_text(const DaliFrame *f, char *buf, int size);
+void dali_byte_label(const DaliAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void dali_field_label(const DaliAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void dali_group_at(const DaliAnalysis *a, int idx, int *start, int *len);
+
+// KNX TP1 at 9600. Pulse-presence coded and not bi-phase: a zero is a 35 us
+// pulse at the start of its bit and a one is nothing at all, so there is no
+// mid-bit transition to step to and the slots are counted from the start bit.
+int knx_decode(const uint8_t *data, int size, int offset, int period_ns,
+    LogicScratch *scratch, LogicResult *out);
+const KnxAnalysis *knx_analysis(void);
+void knx_addr_text(uint16_t a, bool group, char *buf, int size);
+void knx_byte_label(const KnxAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void knx_field_label(const KnxAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void knx_group_at(const KnxAnalysis *a, int idx, int *start, int *len);
 
 // Dispatcher: forced = PROTO_AUTO tries every decoder and keeps the best
 // fit (most bytes, then fewest errors); a specific proto runs only that one

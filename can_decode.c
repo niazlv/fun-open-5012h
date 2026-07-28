@@ -88,7 +88,9 @@ typedef struct
 enum { CAN_NO = 0, CAN_OK, CAN_CUT };
 
 /*- Variables ---------------------------------------------------------------*/
-static CanAnalysis g_can;
+// Shared with every other decoder: only one analysis is live at a time, and
+// the cascade guarantees this one is it. See LogicAnalysis in logic_decode.h.
+#define g_can   (g_logic_analysis.can)
 
 // Every rate anyone actually runs. 33.3k is the single-wire automotive one,
 // 83.3k shows up on European vehicle buses, 800k and 1M on machinery.

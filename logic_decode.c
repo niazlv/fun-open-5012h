@@ -16,6 +16,9 @@
 #include <string.h>
 #include "logic_decode.h"
 
+/*- Variables ---------------------------------------------------------------*/
+LogicAnalysis g_logic_analysis;
+
 /*- Implementations ---------------------------------------------------------*/
 
 //-----------------------------------------------------------------------------
@@ -44,24 +47,18 @@ const char *logic_proto_name(proto_t proto)
     case PROTO_SENT:    return "SENT";
     case PROTO_MIDI:    return "MIDI";
     case PROTO_LIN:     return "LIN";
+    case PROTO_EV1527:  return "EV1527";
+    case PROTO_DSHOT:   return "DShot";
+    // The mark is part of the name: this one is a reconstruction of a bus
+    // whose clock the instrument never saw
+    case PROTO_SPI:     return "SPI!";
+    case PROTO_MANCH:   return "MAN";
+    case PROTO_RC5:     return "RC5";
+    case PROTO_DALI:    return "DALI";
+    case PROTO_KNX:     return "KNX";
     case PROTO_RAW:     return "RAW";
     default:            return "----";
   }
-}
-
-//-----------------------------------------------------------------------------
-// Cheap content check for the run-split cache: 64 samples spread over the
-// record. Two records that agree on all of them are either the same record
-// or close enough that their run splits are interchangeable.
-static uint32_t record_fingerprint(const uint8_t *data, int size, int offset)
-{
-  uint32_t h = (uint32_t)size * 2654435761u + (uint32_t)offset;
-  int step = (size > 64) ? size / 64 : 1;
-
-  for (int i = 0; i < size; i += step)
-    h = h * 33u + data[i];
-
-  return h;
 }
 
 //-----------------------------------------------------------------------------
@@ -73,12 +70,14 @@ int logic_runs(const uint8_t *data, int size, int offset,
 {
   int vmin = 255, vmax = 0;
   int runs = 0;
-  uint32_t hash = record_fingerprint(data, size, offset);
 
-  // Already split this exact record for an earlier decoder in the cascade
-  if (scratch->cache_valid == LOGIC_CACHE_MAGIC &&
+  // Already split this exact record for an earlier decoder in the SAME
+  // dispatcher call. Outside one, the record may have been refilled under
+  // the same pointer and there is nothing cheap that can tell.
+  if (scratch->cascade == LOGIC_CACHE_MAGIC &&
+      scratch->cache_valid == LOGIC_CACHE_MAGIC &&
       scratch->cache_data == data && scratch->cache_size == size &&
-      scratch->cache_offset == offset && scratch->cache_hash == hash)
+      scratch->cache_offset == offset)
   {
     *mid_out = scratch->cache_mid;
     return scratch->cache_runs;
@@ -105,7 +104,6 @@ int logic_runs(const uint8_t *data, int size, int offset,
     scratch->cache_offset = offset;
     scratch->cache_runs   = 0;
     scratch->cache_mid    = mid;
-    scratch->cache_hash   = hash;
     scratch->cache_valid  = LOGIC_CACHE_MAGIC;
 
     *mid_out = mid;
@@ -153,7 +151,6 @@ int logic_runs(const uint8_t *data, int size, int offset,
   scratch->cache_offset = offset;
   scratch->cache_runs   = runs;
   scratch->cache_mid    = mid;
-  scratch->cache_hash   = hash;
   scratch->cache_valid  = LOGIC_CACHE_MAGIC;
 
   return runs;
@@ -279,7 +276,23 @@ int logic_decode(const uint8_t *data, int size, int offset, int period_ns,
     // before it is reported at all, so this one never takes a record that
     // belongs to anything else
     { PROTO_CAN,     can_decode },
+    // Also CRC-confirmed before it is reported, and it has to run ahead of
+    // WS2812: both hold a constant bit period and put the value in the duty,
+    // at nearly the same rate. Nothing else on the list works in the range
+    // of bit times DShot uses, so first costs nobody anything.
+    { PROTO_DSHOT,   dshot_decode },
     { PROTO_NEC,     nec_decode },
+    // The other infrared family, and it has to come before the generic
+    // Manchester reader for the same reason NEC comes before everything:
+    // read as a MESSAGE it says address, command and toggle, and read as a
+    // line code it says fourteen bits. Both are true; only one is useful.
+    { PROTO_RC5,     rc5_decode },
+    // After NEC and before everything else: 24 bits of constant period is a
+    // statement nothing else here makes, and its 31T gap is a long dominant
+    // field that a break, a 1-Wire reset or a DHT start pulse would each
+    // answer to. NEC keeps its place in front because a 9 ms leader is a
+    // more specific claim than a ratio that holds at any T.
+    { PROTO_EV1527,  ev1527_decode },
     // Its break is at least ten dominant bits and 8N1 cannot send more than
     // nine, so a LIN frame is as self-identifying as a CAN frame is. After
     // NEC only because a 9 ms infrared leader followed by four zero bits has
@@ -305,8 +318,28 @@ int logic_decode(const uint8_t *data, int size, int offset, int period_ns,
     // Before UART, because a servo pulse train IS decodable as UART - a
     // 1.5 ms pulse frames bytes at 667 baud perfectly well - and after the
     // three above, whose leaders and reset pulses are more specific still
+    // Confirmed by a parity bit per character and a check octet over the
+    // telegram before it is reported, so it is safe this early - and it must
+    // be, because a train of 35 us pulses is something the generic readers
+    // will happily make bits out of.
+    { PROTO_KNX,     knx_decode },
+    // Before the generic bi-phase reader for the same reason RC5 is: read as
+    // a line code a DALI frame is nineteen bits, and read as DALI it is
+    // "ballast 5, off". Both are true and only one is worth showing.
+    { PROTO_DALI,    dali_decode },
+    // A line code rather than a protocol, and the check it makes is
+    // structural: every run half a bit or a whole one, nothing else. That
+    // rules out NEC's 1:3, a strip's four lengths and a UART's 1,2,3,4 - so
+    // it can sit ahead of the generic decoders. Guessing its own rate leaves
+    // a factor of two open, and it says so by marking the record ambiguous.
+    { PROTO_MANCH,   manchester_decode },
     { PROTO_SERVO,   servo_decode },
     { PROTO_UART,    uart_decode },
+    // Dead last but for the raw reader, and it never wins anyway: a data
+    // line without its clock reports itself ambiguous every time, so auto
+    // mode always passes over it. It is here so that asking for it by name
+    // reaches it, and for no other reason.
+    { PROTO_SPI,     spi_decode },
     { PROTO_RAW,     raw_decode },
   };
 
@@ -317,8 +350,10 @@ int logic_decode(const uint8_t *data, int size, int offset, int period_ns,
   memset(out, 0, sizeof(*out));
 
   // The record behind an unchanged (data, size, offset) is refilled by the
-  // DMA between calls, so the split is only reusable within this one call
+  // DMA between calls, so the split is only reusable within this one call -
+  // which is exactly what this marks, and what logic_runs asks for
   scratch->cache_valid = 0;
+  scratch->cascade = LOGIC_CACHE_MAGIC;
 
   for (unsigned i = 0; i < sizeof(decoders) / sizeof(decoders[0]); i++)
   {
@@ -338,9 +373,13 @@ int logic_decode(const uint8_t *data, int size, int offset, int period_ns,
         continue;
 
       *out = cur;
+      scratch->cascade = 0;
+
       return cur.count;
     }
   }
+
+  scratch->cascade = 0;
 
   return 0;
 }
