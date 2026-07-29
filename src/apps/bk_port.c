@@ -100,7 +100,22 @@
 // is a key on the keyboard; this is the rate that makes walking feel right.
 #define KEY_REPEAT_MS           60
 
-#define MAX_FILES               12
+/*
+ * The picker's list is two sources and a tail: the loose .bin files spifs can
+ * name, then the programs inside bkgames.pak, then "run nothing".
+ *
+ * MAX_FILES bounds only the first of those, because those are the ones whose
+ * names are held in RAM. The pack's index stays on the chip and is read a
+ * record at a time, so how many programs are in it costs nothing here - which
+ * is why the list is a window onto the names rather than all of them: PICK_ROWS
+ * lines between the heading and the footer, scrolled to keep the selection
+ * inside it.
+ */
+#define MAX_FILES               SPIFS_MAX_FILES
+#define PICK_ROWS               12
+#define PICK_TOP                58
+#define PICK_ROW_H              12
+#define PICK_NAME_MAX           (BK_PACK_NAME + 1)
 
 /*
  * The multiple of a real machine, in hundredths.
@@ -133,6 +148,7 @@ typedef struct
 {
     const char *files[MAX_FILES];   // pointers into spifs's own table
     int file_count;
+    int pack_count;                 // programs in bkgames.pak, 0 if none
     bool have_roms;
 
     uint32_t last_ms;
@@ -161,6 +177,7 @@ static bk_run_t *rt;
 
 static state_t g_state;
 static int g_file_sel;
+static int g_file_top;              // first name on screen, see draw_picker
 
 // Settings, all reachable from the application menu
 static int g_screen_mode;           // BK_SCREEN_*
@@ -559,36 +576,106 @@ static void draw_status(bool force)
 #endif
 
 //-----------------------------------------------------------------------------
+// How many programs are on offer, the "boot with nothing" tail not counted.
+static int pick_total(void)
+{
+    return rt->file_count + rt->pack_count;
+}
+
+//-----------------------------------------------------------------------------
+// The name of entry `index`. A loose file's name is already in RAM; a pack
+// entry's is read off the chip into `buf`, which is why this returns a pointer
+// rather than filling one in - only twelve of them are ever on screen.
+static const char *pick_name(int index, char *buf, uint32_t max)
+{
+    if (index < rt->file_count)
+        return rt->files[index];
+
+#if BK_LOAD_SPIFS
+    if (index < pick_total() &&
+        bk_load_pack_name(index - rt->file_count, buf, max))
+        return buf;
+#else
+    (void)buf;
+    (void)max;
+#endif
+
+    return (index < pick_total()) ? "(unreadable)" : "(nothing - just boot)";
+}
+
+//-----------------------------------------------------------------------------
+// The names, and only the names: everything else on the picker is fixed, and
+// repainting the whole screen for each press of DOWN is a bit-banged 320x240
+// clear that the list does not need.
+static void draw_picker_list(void)
+{
+    int last = pick_total();            // the extra entry: boot with nothing
+    int y = PICK_TOP;
+    char name[PICK_NAME_MAX];
+    char pos[24];
+
+    // Scroll only when the selection would leave the window, so a list that
+    // fits never moves and a long one moves a line at a time
+    if (g_file_sel < g_file_top)
+        g_file_top = g_file_sel;
+    else if (g_file_sel >= g_file_top + PICK_ROWS)
+        g_file_top = g_file_sel - PICK_ROWS + 1;
+
+    if (g_file_top > last - PICK_ROWS + 1)
+        g_file_top = last - PICK_ROWS + 1;
+
+    if (g_file_top < 0)
+        g_file_top = 0;
+
+    lcd_fill_rect(0, PICK_TOP - 2, LCD_WIDTH, PICK_ROWS * PICK_ROW_H + 4,
+        LCD_BLACK_COLOR);
+
+    lcd_set_font(FONT_SMALL);
+
+    for (int row = 0; row < PICK_ROWS; row++, y += PICK_ROW_H)
+    {
+        int i = g_file_top + row;
+
+        if (i > last)
+            break;
+
+        lcd_set_color(LCD_BLACK_COLOR, (i == g_file_sel) ? HUD_HI : HUD_FG);
+        lcd_puts(24, y, (i == g_file_sel) ? ">" : " ");
+        lcd_puts(40, y, pick_name(i, name, sizeof(name)));
+    }
+
+    /*
+     * Where in the list this is, for a window that shows a tenth of it. It
+     * sits on the footer line rather than in the rows, so it gets its own
+     * clear - the rows' one stops above it and a shrinking number would
+     * otherwise leave its old digits behind. FONT_SMALL is font_6x8.
+     */
+    snprintf(pos, sizeof(pos), "%d/%d", g_file_sel + 1, last + 1);
+
+    lcd_fill_rect(LCD_WIDTH - 72, 204, 72, 10, LCD_BLACK_COLOR);
+    lcd_set_color(LCD_BLACK_COLOR, HUD_FG);
+    lcd_puts(LCD_WIDTH - 8 - (int)strlen(pos) * 6, 206, pos);
+}
+
+//-----------------------------------------------------------------------------
 static void draw_picker(void)
 {
-    int y = 60;
-
     lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, LCD_BLACK_COLOR);
 
     lcd_set_font(FONT_LARGE);
     lcd_set_color(LCD_BLACK_COLOR, HUD_HI);
-    lcd_puts(84, 16, "BK-0010-01");
+    lcd_puts(84, 12, "BK-0010-01");
 
     lcd_set_font(FONT_SMALL);
     lcd_set_color(LCD_BLACK_COLOR, HUD_FG);
-    lcd_puts(20, 38, rt->have_roms ? "monitor ROM found on the SPI flash"
+    lcd_puts(20, 36, rt->have_roms ? "monitor ROM found on the SPI flash"
                                  : "no monitor ROM - using the stand-in");
 
-    for (int i = 0; i <= rt->file_count && i < MAX_FILES + 1; i++)
-    {
-        const char *name = (i < rt->file_count) ? rt->files[i] : "(nothing - just boot)";
+    lcd_puts(20, 206, "UP/DOWN choose, LEFT/RIGHT page");
+    lcd_puts(20, 218, "MODE starts. Put .bin tape images on");
+    lcd_puts(20, 230, "the chip with tools/spiflash.py add");
 
-        lcd_set_color(LCD_BLACK_COLOR, (i == g_file_sel) ? HUD_HI : HUD_FG);
-        lcd_puts(30, y, (i == g_file_sel) ? ">" : " ");
-        lcd_puts(46, y, name);
-
-        y += 12;
-    }
-
-    lcd_set_color(LCD_BLACK_COLOR, HUD_FG);
-    lcd_puts(20, 206, "UP/DOWN choose, MODE starts");
-    lcd_puts(20, 218, "put .bin tape images on the chip with");
-    lcd_puts(20, 230, "tools/spiflash.py add <file>");
+    draw_picker_list();
 }
 
 //-----------------------------------------------------------------------------
@@ -708,19 +795,26 @@ static void start_machine(void)
     bk_video_set_buffer((uint8_t *)BK_BLIT_ADDR);
 
 #if BK_LOAD_SPIFS
+    // This rescans the part, which rebuilds the table the pack was found in,
+    // so the pack is resolved again against the table as it now stands
     rt->have_roms = bk_load_roms();
+    rt->pack_count = bk_load_pack_open();
 #else
     rt->have_roms = false;
 #endif
 
     bk_io_reset();
 
-    if (g_file_sel < rt->file_count)
+    if (g_file_sel < pick_total())
     {
         bk_bin_t bin;
 
 #if BK_LOAD_SPIFS
-        if (!bk_load_bin(rt->files[g_file_sel], &bin))
+        bool ok = (g_file_sel < rt->file_count)
+            ? bk_load_bin(rt->files[g_file_sel], &bin)
+            : bk_load_pack_run(g_file_sel - rt->file_count, &bin);
+
+        if (!ok)
         {
             bk_cpu.stopped = bk_load_error();
             g_state = ST_FAULT;
@@ -786,13 +880,16 @@ void bk_port_init(void)
 #if BK_LOAD_SPIFS
     spifs_scan();
     rt->file_count = bk_load_list_bins(rt->files, MAX_FILES);
+    rt->pack_count = bk_load_pack_open();
     rt->have_roms = (NULL != spifs_find(BK_ROM_MONITOR_FILE));
 #else
     rt->file_count = 0;
+    rt->pack_count = 0;
     rt->have_roms = false;
 #endif
 
     g_file_sel = 0;
+    g_file_top = 0;
     g_state = ST_PICK;
 
     draw_picker();
@@ -913,21 +1010,39 @@ void bk_port_buttons_handler(int buttons)
     switch (g_state)
     {
     case ST_PICK:
-        if ((buttons & BTN_UP) && g_file_sel > 0)
-        {
-            g_file_sel--;
-            draw_picker();
-        }
-        else if ((buttons & BTN_DOWN) && g_file_sel < rt->file_count)
-        {
-            g_file_sel++;
-            draw_picker();
-        }
+    {
+        // A chip with a hundred programs on it is a list nobody wants to walk
+        // a line at a time, so LEFT and RIGHT take it a screen at a time
+        int step = 0;
+
+        if (buttons & BTN_UP)
+            step = -1;
+        else if (buttons & BTN_DOWN)
+            step = 1;
+        else if (buttons & BTN_LEFT)
+            step = -PICK_ROWS;
+        else if (buttons & BTN_RIGHT)
+            step = PICK_ROWS;
         else if ((buttons & BTN_MODE) && edge)
-        {
             start_machine();
+
+        if (step)
+        {
+            int was = g_file_sel;
+
+            g_file_sel += step;
+
+            if (g_file_sel < 0)
+                g_file_sel = 0;
+            else if (g_file_sel > pick_total())
+                g_file_sel = pick_total();
+
+            if (g_file_sel != was)
+                draw_picker_list();
         }
+
         return;
+    }
 
     case ST_FAULT:
         if ((buttons & BTN_STOP) && edge)
@@ -1009,10 +1124,11 @@ static void action_pick(const void *arg)
 
 #if BK_LOAD_SPIFS
     rt->file_count = bk_load_list_bins(rt->files, MAX_FILES);
+    rt->pack_count = bk_load_pack_open();
 #endif
 
-    if (g_file_sel > rt->file_count)
-        g_file_sel = rt->file_count;
+    if (g_file_sel > pick_total())
+        g_file_sel = pick_total();
 
     menu_close_popups();
     draw_picker();
@@ -1044,8 +1160,16 @@ static const char *const g_help_lines[] =
     "  bk10mon.rom   8 KB, goes to 0100000",
     "  bk10bas.rom   BASIC, goes to 0120000",
     "  anything.bin  a tape image, in the picker",
+    "  bkgames.pak   many of them in one file",
     "",
     "  python3 tools/spiflash.py add game.bin",
+    "",
+    "spifs holds sixteen files, so a collection",
+    "goes in a pack instead - its index is read",
+    "off the chip and costs no RAM at all:",
+    "",
+    "  python3 tools/bkpack.py *.bin -o b.pak",
+    "  python3 tools/spiflash.py add b.pak",
     "",
     "Without a monitor a stand-in runs instead:",
     "it sets the screen registers, points every",

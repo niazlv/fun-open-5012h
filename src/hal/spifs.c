@@ -133,7 +133,12 @@ void spifs_scan(void)
     }
 
     // A live file also fixes where the next one can start, so the scan steps
-    // over its whole extent rather than a sector at a time
+    // over its whole extent rather than a sector at a time.
+    //
+    // Past SPIFS_MAX_FILES the file is stepped over but not recorded: the
+    // table is full, and the alternative - stopping the scan - would leave
+    // g_free_base short of the real end and put the next write on top of a
+    // file that is still there.
     if (SPIFS_FLAGS_LIVE == h.flags && g_count < SPIFS_MAX_FILES)
     {
       spifs_file_t *f = &g_files[g_count++];

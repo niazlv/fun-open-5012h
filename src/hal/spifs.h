@@ -38,6 +38,20 @@
 #define SPIFS_VERSION           1
 #define SPIFS_HEADER_SIZE       64
 #define SPIFS_NAME_MAX          32
+
+/*
+ * How many files the table can hold.
+ *
+ * Sixteen, and it stays sixteen because the record is 48 bytes and every one
+ * of them is .bss in the 64 KB TCM, which has about a hundred bytes spare
+ * before the stack guard in the linker script trips. A chip holding a library
+ * rather than a handful of blobs - two hundred BK tape images, say - is not
+ * served by making this bigger: it is served by one file that holds them all,
+ * which is what doom.tex is and what bkgames.pak (tools/bkpack.py) is.
+ *
+ * Files past the limit are stepped over by the scan and keep their space.
+ * They simply cannot be found by name or listed.
+ */
 #define SPIFS_MAX_FILES         16
 
 // Live until something clears bits in it. Deleted is any other value, because

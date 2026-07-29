@@ -184,6 +184,7 @@ int main(int argc, char **argv)
     int trace = 0;
     int top = 8;
     uint8_t key = 0;
+    uint32_t start = 0;         // octal, 0 means "wherever it loaded"
     bool squash = false;
     bool mono = false, window = false;
     long size;
@@ -210,6 +211,8 @@ int main(int argc, char **argv)
             top = atoi(argv[++i]);
         else if (0 == strcmp(argv[i], "--key") && i + 1 < argc)
             key = (uint8_t)strtoul(argv[++i], NULL, 0);
+        else if (0 == strcmp(argv[i], "--start") && i + 1 < argc)
+            start = (uint32_t)strtoul(argv[++i], NULL, 8);
         else if ('-' != argv[i][0])
             tape = argv[i];
     }
@@ -219,7 +222,8 @@ int main(int argc, char **argv)
         fprintf(stderr,
             "usage: bk_host <tape.bin> [--rom mon.rom] [--ppm out.ppm]\n"
             "                          [--frames n] [--trace n]\n"
-            "                          [--squash] [--top n] [--key code]\n");
+            "                          [--squash] [--top n] [--key code]\n"
+            "                          [--start octal]\n");
         return 2;
     }
 
@@ -263,6 +267,20 @@ int main(int argc, char **argv)
     memcpy(g_ram + addr, data + 4, length);
     printf("occupies: %06o..%06o\n", addr, addr + length - 1);
 
+    /*
+     * Where to begin, which is not the same question as where it loaded.
+     *
+     * An image that starts below 001000 is one whose first bytes are the low
+     * memory a BK program sets up rather than its code - the vectors and the
+     * monitor's variables live down there - and its entry point is 001000
+     * regardless. Jumping to the load address instead lands in the middle of a
+     * vector table.
+     */
+    if (0 == start)
+        start = (addr < 01000u) ? 01000u : addr;
+
+    printf("start:    %06o\n", start);
+
     if (rom)
     {
         long rsize;
@@ -276,12 +294,12 @@ int main(int argc, char **argv)
     }
     else
     {
-        bk_load_stub_rom((uint16_t)addr);
+        bk_load_stub_rom((uint16_t)start);
         printf("rom:      the stand-in\n");
     }
 
     printf("\nfirst instructions:\n");
-    disassemble((uint16_t)addr, 8);
+    disassemble((uint16_t)start, 8);
 
     bk_load_boot();
     bk_video_init();

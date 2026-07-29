@@ -23,6 +23,13 @@
 /*- Variables ---------------------------------------------------------------*/
 static const char *g_error;
 
+#if BK_LOAD_SPIFS
+// The pack, once bk_load_pack_open has found and checked one. Two words, so
+// that a collection of any size costs the device nothing to have.
+static const spifs_file_t *g_pack;
+static int g_pack_count;
+#endif
+
 /*- Implementations ---------------------------------------------------------*/
 
 //-----------------------------------------------------------------------------
@@ -77,29 +84,24 @@ bool bk_load_roms(void)
 }
 
 //-----------------------------------------------------------------------------
-bool bk_load_bin(const char *name, bk_bin_t *out)
+// A tape image at `at` inside `f`, with `avail` bytes of file behind it.
+//
+// Both callers come through here - a loose .bin is the whole file, an entry in
+// the pack is a window into one - so the checks below are made once and made
+// the same way.
+static bool load_tape(const spifs_file_t *f, uint32_t at, uint32_t avail,
+    bk_bin_t *out)
 {
-    const spifs_file_t *f;
     uint8_t header[4];
     uint32_t addr, size;
 
-    g_error = NULL;
-
-    f = spifs_find(name);
-
-    if (NULL == f)
-    {
-        g_error = "no such file on the SPI flash";
-        return false;
-    }
-
-    if (f->size < sizeof(header))
+    if (avail < sizeof(header))
     {
         g_error = "file is shorter than a tape header";
         return false;
     }
 
-    if (!spifs_read(f, 0, header, sizeof(header)))
+    if (!spifs_read(f, at, header, sizeof(header)))
     {
         g_error = "SPI read failed";
         return false;
@@ -117,7 +119,7 @@ bool bk_load_bin(const char *name, bk_bin_t *out)
      * there is between a mistyped filename and 16 KB of somebody's photograph
      * being executed, so they are worth being strict about.
      */
-    if (size + sizeof(header) > f->size)
+    if (size + sizeof(header) > avail)
     {
         g_error = "header claims more bytes than the file has";
         return false;
@@ -135,7 +137,7 @@ bool bk_load_bin(const char *name, bk_bin_t *out)
         return false;
     }
 
-    if (!spifs_read(f, sizeof(header), bk_mem + addr, size))
+    if (!spifs_read(f, at + sizeof(header), bk_mem + addr, size))
     {
         g_error = "SPI read failed";
         return false;
@@ -147,10 +149,154 @@ bool bk_load_bin(const char *name, bk_bin_t *out)
     {
         out->addr = (uint16_t)addr;
         out->size = (uint16_t)size;
-        out->start = (uint16_t)addr;
+
+        /*
+         * Where to begin, which is not the same question as where it loaded.
+         *
+         * A tape header says where the bytes go and says nothing about where
+         * to start - on a real machine that is the address the operator types
+         * after the monitor's S, and 001000 is what it defaults to. An image
+         * that loads below 001000 is one carrying its own low memory: the
+         * vectors and the variables a program sets up down there come off the
+         * tape with it, and its code still begins at 001000. Starting at the
+         * load address instead lands in the middle of a vector table.
+         *
+         * Measured, not assumed. Of the 77 programs in the pack, 49 stopped
+         * the machine when started at their load address; starting the ones
+         * below 001000 at 001000 took that to 27 and took the number that
+         * draw a screen from 19 to 35. tests/build/bk_host --start is the
+         * same experiment on the host.
+         */
+        out->start = (addr < 01000u) ? 01000u : (uint16_t)addr;
     }
 
     return true;
+}
+
+//-----------------------------------------------------------------------------
+bool bk_load_bin(const char *name, bk_bin_t *out)
+{
+    const spifs_file_t *f;
+
+    g_error = NULL;
+
+    f = spifs_find(name);
+
+    if (NULL == f)
+    {
+        g_error = "no such file on the SPI flash";
+        return false;
+    }
+
+    return load_tape(f, 0, f->size, out);
+}
+
+//-----------------------------------------------------------------------------
+// One 32 byte index record. Kept off the stack of the caller's caller by
+// reading only the eight bytes that matter when only those are wanted.
+static bool pack_entry(int index, uint32_t *offset, uint32_t *size)
+{
+    uint8_t rec[8];
+
+    if (NULL == g_pack || index < 0 || index >= g_pack_count)
+        return false;
+
+    if (!spifs_read(g_pack, BK_PACK_HEADER + (uint32_t)index * BK_PACK_ENTRY +
+            BK_PACK_NAME, rec, sizeof(rec)))
+        return false;
+
+    *offset = (uint32_t)rec[0] | ((uint32_t)rec[1] << 8) |
+        ((uint32_t)rec[2] << 16) | ((uint32_t)rec[3] << 24);
+    *size = (uint32_t)rec[4] | ((uint32_t)rec[5] << 8) |
+        ((uint32_t)rec[6] << 16) | ((uint32_t)rec[7] << 24);
+
+    // An index that points outside its own file is a pack somebody truncated,
+    // and the window it describes is what load_tape would otherwise trust
+    if (*offset > g_pack->size || *size > g_pack->size - *offset)
+        return false;
+
+    return true;
+}
+
+//-----------------------------------------------------------------------------
+int bk_load_pack_open(void)
+{
+    uint8_t head[BK_PACK_HEADER];
+    uint32_t magic, version, count;
+
+    g_pack = NULL;
+    g_pack_count = 0;
+
+    g_pack = spifs_find(BK_PACK_FILE);
+
+    if (NULL == g_pack || g_pack->size < BK_PACK_HEADER)
+    {
+        g_pack = NULL;
+        return 0;
+    }
+
+    if (!spifs_read(g_pack, 0, head, sizeof(head)))
+    {
+        g_pack = NULL;
+        return 0;
+    }
+
+    magic = (uint32_t)head[0] | ((uint32_t)head[1] << 8) |
+        ((uint32_t)head[2] << 16) | ((uint32_t)head[3] << 24);
+    version = (uint32_t)head[4] | ((uint32_t)head[5] << 8) |
+        ((uint32_t)head[6] << 16) | ((uint32_t)head[7] << 24);
+    count = (uint32_t)head[8] | ((uint32_t)head[9] << 8) |
+        ((uint32_t)head[10] << 16) | ((uint32_t)head[11] << 24);
+
+    // The index has to fit inside the file before anything reads a record out
+    // of it, or a count of four billion walks off the end of the part
+    if (BK_PACK_MAGIC != magic || BK_PACK_VERSION != version ||
+        count > (g_pack->size - BK_PACK_HEADER) / BK_PACK_ENTRY)
+    {
+        g_pack = NULL;
+        return 0;
+    }
+
+    g_pack_count = (int)count;
+
+    return g_pack_count;
+}
+
+//-----------------------------------------------------------------------------
+bool bk_load_pack_name(int index, char *name, uint32_t max)
+{
+    char raw[BK_PACK_NAME];
+
+    if (NULL == g_pack || index < 0 || index >= g_pack_count || 0 == max)
+        return false;
+
+    if (!spifs_read(g_pack, BK_PACK_HEADER + (uint32_t)index * BK_PACK_ENTRY,
+            (uint8_t *)raw, sizeof(raw)))
+        return false;
+
+    if (max > sizeof(raw))
+        max = sizeof(raw) + 1;
+
+    memcpy(name, raw, max - 1);
+    name[max - 1] = 0;
+
+    return true;
+}
+
+//-----------------------------------------------------------------------------
+bool bk_load_pack_run(int index, bk_bin_t *out)
+{
+    uint32_t offset, size;
+
+    g_error = NULL;
+
+    if (!pack_entry(index, &offset, &size))
+    {
+        g_error = "the pack's index does not describe that program";
+        return false;
+    }
+
+    return load_tape(g_pack, offset, size, out);
 }
 
 //-----------------------------------------------------------------------------
