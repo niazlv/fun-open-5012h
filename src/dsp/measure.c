@@ -7,8 +7,10 @@
  * Robustness against real-world probing artifacts is deliberate design:
  *  - levels (top/base) come from amplitude-histogram percentiles, so
  *    overshoot, ringing and glitch spikes do not inflate the amplitude;
- *  - the frequency is the MEDIAN of all measured periods, so a handful of
- *    glitch-induced crossings cannot poison it;
+ *  - the frequency is the MEAN of the periods that AGREE with the median, so
+ *    a handful of glitch-induced crossings cannot poison it and the sample
+ *    grid cannot bias it (see period_estimate() for why the median alone
+ *    reads high by 9% at 54 MHz);
  *  - periodicity is judged by the fraction of periods near that median.
  *
  * Pure C, no hardware dependencies: this module is also compiled and tested
@@ -29,6 +31,8 @@
 #define PEAK_MIN_SAMPLES  8   // levels held for fewer samples are glitches
 #define LEVEL_BAND_DIV    8   // "at a level" = within span/8 of pk_lo or pk_hi
 #define MAX_PERIODS       128 // periods kept for the median estimate
+#define GOOD_PCT_DIV      4   // "near the median" for period_good_pct: +-1/4
+#define SUBSAMPLE         256 // sub-sample units per sample in g_periods[]
 
 /*- Variables ---------------------------------------------------------------*/
 static uint32_t g_hist[256];
@@ -107,6 +111,92 @@ static int median_period(int count)
   }
 
   return g_periods[count / 2];
+}
+
+//-----------------------------------------------------------------------------
+// The period the frequency is reported from, in x256 sub-sample units: the
+// MEAN of every interval that agrees with the median.
+//
+// The median alone is biased, badly, whenever the sample grid does not divide
+// the period evenly. A 54 MHz signal on a 125 MS/s record is 2.31 samples per
+// period, so the crossing intervals split into a 2-sample cluster (68% of
+// them) and a 3-sample one (32%); the median lands ON the fuller cluster
+// instead of between the two and reads 9% high. The mean of those same
+// intervals is exact, because the true period is what they average out to.
+// Measured against synthetic records at 125 MS/s, median vs this: a 54 MHz
+// square +9.54% vs +0.09%, a 40 MHz square +2.70% vs +0.00%, a 17 MHz square
+// +2.36% vs +0.01%.
+//
+// The median still decides WHICH intervals are real, which is what it was
+// chosen for: a glitch splits one period into two short ones, a missed
+// crossing merges two into a long one, and both land outside the tolerance
+// and are dropped. Same robustness, without the bias.
+//
+// That tolerance is a quarter of the median, but never less than ONE SAMPLE,
+// and the floor is the whole point: the two clusters an uneven sample grid
+// creates are one sample apart by construction, so a window that admits only
+// the fuller of them is just the median again, bias and all. A quarter of the
+// period is meanwhile far tighter than a sample once the record is slow, and
+// that is what throws out the 0.7-period fragment a glitch leaves behind.
+//
+// `count` is the length of the period array, which median_period() has sorted.
+static int period_estimate(int count, int med)
+{
+  int64_t sum = 0;
+  int n = 0;
+  int tol = med / GOOD_PCT_DIV;
+
+  if (tol < SUBSAMPLE)
+    tol = SUBSAMPLE;
+
+  for (int i = 0; i < count; i++)
+  {
+    int p = g_periods[i];
+
+    if (p >= med - tol && p <= med + tol)
+    {
+      sum += p;
+      n++;
+    }
+  }
+
+  return n ? (int)((sum + n / 2) / n) : med;
+}
+
+//-----------------------------------------------------------------------------
+// The widest Schmitt band the sample grid can still guarantee the signal dips
+// below, given a period of `med` (x256 sub-sample units) and a swing of `amp`.
+//
+// A sine is sampled wherever the grid falls, and the sample nearest its trough
+// can sit up to half a sample away from it. At N samples per period that is a
+// phase error of pi/N, so the deepest dip the record is CERTAIN to contain is
+// only (amp/2) * cos(pi/N) below the mid level - and a hysteresis wider than
+// that stops arming on some periods and not others. The crossings it loses are
+// invisible afterwards: the periods that survive are the right length, there
+// are simply fewer of them, and no quality figure in the Measure moves.
+//
+// This is what 54 MHz on a 125 MS/s record ran into. 2.31 samples per period
+// puts the guaranteed dip at 10.5% of the swing, the band was at 20%, and 30%
+// of the crossings were never seen: it read 58.5 MHz for a 54.000 MHz input.
+// Measured against a synthetic sweep, the same input reads +0.00% once the
+// band is inside this bound.
+//
+// cos(pi/N) in percent for N = 2.000, 2.125 ... 3.000 samples. Above three
+// samples the bound is 25% of the swing and rising, so HYSTERESIS_PCT is
+// always inside it and no cap is needed.
+static const uint8_t g_dip_pct[9] = { 0, 9, 17, 24, 30, 36, 41, 46, 50 };
+
+static int hyst_cap(int amp, int med)
+{
+  if (med >= 3 * SUBSAMPLE)
+    return amp;             // no cap: 20% of the swing is always reachable
+
+  if (med <= 2 * SUBSAMPLE)
+    return 0;               // at or under two samples nothing is guaranteed
+
+  // Three quarters of the bound, because the bound is the worst case and a
+  // real record also carries noise and quantization
+  return amp * g_dip_pct[(med * 8 / SUBSAMPLE) - 16] * 3 / 800;
 }
 
 //-----------------------------------------------------------------------------
@@ -236,15 +326,39 @@ void measure_run(const uint8_t *data, int size, int offset,
     return;
 
   // Pass 2: rising mid-level crossings with adaptive hysteresis; the
-  // Schmitt arming rejects noise around the mid level
+  // Schmitt arming rejects noise around the mid level.
+  //
+  // The mid level comes from the peaks, which is the whole point of them: a
+  // short burst has to be crossable. The WIDTH of the Schmitt band does not
+  // get to trust them, though. Eight samples out of a 98304-sample record set
+  // pk_lo/pk_hi (PEAK_MIN_SAMPLES), so eight needles from a switching supply
+  // scale the band to THEIR swing instead of the signal's - and once the band
+  // is wider than the signal, nothing crosses it and the counter locks onto
+  // the needles: a 17 MHz sine 30 counts tall, with spikes 8 times its size,
+  // read 0.15 MHz while period_good_pct still said 100%. The percentile
+  // amplitude cannot be moved by a handful of samples, so where it is the
+  // smaller of the two, it sets the width. On a genuine short burst the
+  // percentiles collapse to zero - and that is exactly when the peaks are the
+  // only honest amplitude in the record, so the peaks keep it.
+  //
+  // The mid level itself is only safe while the needles are two-sided. Eight
+  // of them on ONE side move a peak and not its partner, and the midpoint of
+  // that lopsided pair can land clean outside the signal: 8 needles up from a
+  // 40-count sine put mid at 163 for a waveform that never leaves 108..148,
+  // and nothing crossed it at all. Where the percentile band is real and the
+  // peaks' midpoint sits outside it, the band's own middle is the level the
+  // signal actually spends its time crossing.
   int mid = (m->pk_lo + m->pk_hi) / 2;
-  int hyst = (m->pk_hi - m->pk_lo) * HYSTERESIS_PCT / 100;
+  int peak_amp = m->pk_hi - m->pk_lo;
+  int pctl_amp = m->top - m->base;
+  int amp = (pctl_amp > 0 && pctl_amp < peak_amp) ? pctl_amp : peak_amp;
+  int hyst = amp * HYSTERESIS_PCT / 100;
+
+  if (pctl_amp > 0 && (mid < m->base || mid > m->top))
+    mid = (m->base + m->top) / 2;
 
   if (hyst < MIN_HYSTERESIS)
     hyst = MIN_HYSTERESIS;
-
-  int level_lo = mid - hyst;
-  int level_hi = mid + hyst;
 
   int64_t first_x256 = 0, prev_cross_x256 = 0;
   int64_t last_x256 = 0;
@@ -252,91 +366,132 @@ void measure_run(const uint8_t *data, int size, int offset,
   int crossings = 0;
   int high_samples = 0;
   int span_start = -1, span_end = -1;
-  bool armed = false;
-  int prev = data[offset];
+  int med = 0;
 
-  index = offset;
-
-  for (int i = 0; i < size; i++)
+  // The pass runs a second time when, and only when, the period it found
+  // turns out to be short enough that the Schmitt band it ran with was wider
+  // than hyst_cap() allows. The first pass is what measures the period, so
+  // the bound cannot be applied before it - and the median survives the
+  // missing crossings well enough to compute it, because a lost crossing
+  // doubles an interval rather than shortening the rest.
+  for (int attempt = 0; attempt < 2; attempt++)
   {
-    int v = data[index];
+    int level_lo = mid - hyst;
+    int level_hi = mid + hyst;
+    bool armed = false;
+    int prev = data[offset];
 
-    if (v <= level_lo)
+    nperiods = 0;
+    crossings = 0;
+    high_samples = 0;
+    span_start = -1;
+    span_end = -1;
+    index = offset;
+
+    for (int i = 0; i < size; i++)
     {
-      armed = true;
+      int v = data[index];
+
+      if (v <= level_lo)
+      {
+        armed = true;
+      }
+      else if (armed && v > level_hi && prev <= level_hi)
+      {
+        // Sub-sample interpolation of where the signal crossed `mid`
+        // between sample i-1 (prev) and sample i (v), scaled by 256 and
+        // clamped to that interval
+        int64_t cross = (int64_t)i * 256;
+
+        if (v != prev)
+        {
+          int64_t frac = (int64_t)(v - mid) * 256 / (v - prev);
+
+          if (frac < 0)
+            frac = 0;
+          else if (frac > 256)
+            frac = 256;
+
+          cross -= frac;
+        }
+
+        if (crossings == 0)
+        {
+          first_x256 = cross;
+          span_start = i;
+        }
+        else
+        {
+          if (nperiods < MAX_PERIODS)
+            g_periods[nperiods++] = (int)(cross - prev_cross_x256);
+
+          last_x256 = cross;
+          span_end = i;
+        }
+
+        prev_cross_x256 = cross;
+        crossings++;
+        armed = false;
+      }
+
+      if (crossings > 0 && v > mid)
+        high_samples++;
+
+      prev = v;
+
+      if (++index == size)
+        index = 0;
     }
-    else if (armed && v > level_hi && prev <= level_hi)
-    {
-      // Sub-sample interpolation of where the signal crossed `mid`
-      // between sample i-1 (prev) and sample i (v), scaled by 256 and
-      // clamped to that interval
-      int64_t cross = (int64_t)i * 256;
 
-      if (v != prev)
-      {
-        int64_t frac = (int64_t)(v - mid) * 256 / (v - prev);
+    if (nperiods < 1)
+      return;
 
-        if (frac < 0)
-          frac = 0;
-        else if (frac > 256)
-          frac = 256;
+    // Median period: immune to the few short/long intervals a glitch spike
+    // or a burst of ringing injects
+    med = median_period(nperiods); // destroys g_periods ordering only
 
-        cross -= frac;
-      }
+    if (med <= 0)
+      return;
 
-      if (crossings == 0)
-      {
-        first_x256 = cross;
-        span_start = i;
-      }
-      else
-      {
-        if (nperiods < MAX_PERIODS)
-          g_periods[nperiods++] = (int)(cross - prev_cross_x256);
+    int cap = hyst_cap(amp, med);
 
-        last_x256 = cross;
-        span_end = i;
-      }
+    // ...and the half-rate trap, which the bound above cannot see. At exactly
+    // 2.5 samples per period the arming misses every SECOND crossing, so the
+    // median comes back at twice the true period and every quality figure
+    // agrees with it: a 50.000 MHz input reads exactly 25.000 MHz and nothing
+    // in the record says otherwise. So where the period is short enough for
+    // that to be possible at all, the band is narrowed to what a period half
+    // this long would demand and the pass repeated - if the crossings were
+    // really there, the second pass finds them and the period halves. A
+    // signal that genuinely runs at this rate just gets counted again with a
+    // tighter band and comes back with the same answer.
+    if (cap >= hyst && med < 6 * SUBSAMPLE)
+      cap = hyst_cap(amp, med / 2);
 
-      prev_cross_x256 = cross;
-      crossings++;
-      armed = false;
-    }
+    if (attempt > 0 || cap >= hyst)
+      break;
 
-    if (crossings > 0 && v > mid)
-      high_samples++;
-
-    prev = v;
-
-    if (++index == size)
-      index = 0;
+    hyst = (cap < MIN_HYSTERESIS) ? MIN_HYSTERESIS : cap;
   }
 
   (void)first_x256;
   (void)last_x256;
 
-  if (nperiods < 1)
-    return;
-
-  // Median period: immune to the few short/long intervals a glitch spike
-  // or a burst of ringing injects
-  int med = median_period(nperiods); // destroys g_periods ordering only
   int good = 0;
-
-  if (med <= 0)
-    return;
 
   for (int i = 0; i < nperiods; i++)
   {
     int p = g_periods[i];
 
-    if (p >= med - med / 4 && p <= med + med / 4)
+    if (p >= med - med / GOOD_PCT_DIV && p <= med + med / GOOD_PCT_DIV)
       good++;
   }
 
+  int per = period_estimate(nperiods, med);
+
   m->periods = nperiods;
   m->period_good_pct = good * 100 / nperiods;
-  m->frequency = (int)((1000000000ll * 256) / ((int64_t)med * period_ns));
+  m->frequency = (int)((1000000000ll * 256) / ((int64_t)per * period_ns));
 
   // Period statistics over every period in the record - the median above
   // deliberately hides what these expose. sigma answers "how stable is this
@@ -366,7 +521,7 @@ void measure_run(const uint8_t *data, int size, int offset,
     var = sq2 / nperiods - mean_x256 * mean_x256;
     sigma_x256 = (var > 0) ? (int64_t)isqrt64((uint64_t)var) : 0;
 
-    m->period_med_ns = (int)((int64_t)med * period_ns / 256);
+    m->period_med_ns = (int)((int64_t)per * period_ns / 256);
     m->period_min_ns = (int)((int64_t)pmin * period_ns / 256);
     m->period_max_ns = (int)((int64_t)pmax * period_ns / 256);
     m->jitter_rms_ps = sat_ps(sigma_x256 * period_ns * 1000 / 256);

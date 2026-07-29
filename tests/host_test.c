@@ -2102,6 +2102,99 @@ int main(void)
     check_near("burst pctl top blind", m.top < 100, 1, 0); // documents why pk exists
     check_near("burst freq", m.frequency, 1000000, 2.0);
 
+    // --- the counter where the sample grid is coarse -------------------
+    // A 125 MS/s record (8 ns) of an FPGA square through a ~100 MHz analog
+    // frontend, harmonics folding as they do on the bench. The crossing
+    // intervals here split into two clusters one sample apart, and the
+    // MEDIAN of them lands on the fuller one instead of between: 54 MHz used
+    // to read 59.15, 40 MHz 41.08, 17 MHz 17.40. The mean of the intervals
+    // that agree with the median has no such bias.
+    {
+      static const struct { double f; double tol; const char *name; } hf[] =
+      {
+        { 17e6, 0.5, "17 MHz square @ 8ns" },
+        { 40e6, 0.5, "40 MHz square @ 8ns" },
+        { 54e6, 1.0, "54 MHz square @ 8ns (2.31 s/p)" },
+      };
+
+      for (unsigned k = 0; k < sizeof(hf) / sizeof(hf[0]); k++)
+      {
+        for (int i = 0; i < SIZE; i++)
+        {
+          double t = i * 8e-9, s = 0.0;
+
+          for (int h = 1; h <= 9; h += 2)
+          {
+            double fh = hf[k].f * h;
+            double g = 1.0 / sqrt(1.0 + (fh / 100e6) * (fh / 100e6));
+
+            s += g * sin(2 * M_PI * fh * t + 0.3) / h;
+          }
+
+          double v = ZERO_POINT + (4.0 / M_PI) * s * 100.0;
+
+          buf[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : (int)lround(v));
+        }
+
+        measure_run(buf, SIZE, 0, 8, ZERO_POINT, &m);
+        check_near(hf[k].name, m.frequency, hf[k].f, hf[k].tol);
+      }
+    }
+
+    // --- a small signal wearing big needles -----------------------------
+    // Eight samples out of the whole record set pk_lo/pk_hi, on purpose, and
+    // a Schmitt band scaled to THOSE came out wider than the signal's own
+    // swing: nothing crossed it and this read 0.15 MHz, with
+    // period_good_pct still saying 100%.
+    printf("17 MHz, 30 counts tall, under needles 8x its size:\n");
+    for (int i = 0; i < SIZE; i++)
+      buf[i] = (uint8_t)lround(ZERO_POINT + 15.0 * sin(2 * M_PI * 17e6 * i * 8e-9));
+
+    for (int i = 400; i < SIZE; i += 400)
+      buf[i] = ((i / 400) & 1) ? 228 : 28;
+
+    measure_run(buf, SIZE, 0, 8, ZERO_POINT, &m);
+    check_near("frequency survives the needles", m.frequency, 17e6, 1.0);
+
+    // ...and the harder half of the same problem: needles on ONE side move a
+    // peak without moving its partner, and the midpoint of that lopsided
+    // pair can land clean outside the signal, which is a level nothing
+    // crosses at all
+    printf("...and with the needles on one side only:\n");
+    for (int i = 0; i < SIZE; i++)
+      buf[i] = (uint8_t)lround(ZERO_POINT + 20.0 * sin(2 * M_PI * 17e6 * i * 8e-9));
+
+    for (int g = 0; g < 8; g++)
+      buf[1000 + g * 2000] = 218;
+
+    measure_run(buf, SIZE, 0, 8, ZERO_POINT, &m);
+    check_near("mid level stays on the signal", m.frequency, 17e6, 1.0);
+
+    // --- the half-rate trap ---------------------------------------------
+    // The worst failure this counter had, because it was silent and the
+    // frequency it lands on is the most common clock on earth. At exactly
+    // 2.5 samples per period the Schmitt arming misses every SECOND
+    // crossing, deterministically: 50.000 MHz read exactly 25.000 MHz with
+    // periods=128, good=100% and a period of a round 5 samples. Nothing in
+    // the record contradicted it. The second pass at a narrower band is what
+    // finds the crossings that were there all along.
+    printf("50.000 MHz at 125 MS/s - the half-rate trap:\n");
+    for (int i = 0; i < SIZE; i++)
+      buf[i] = (uint8_t)lround(ZERO_POINT + 100.0 * sin(2 * M_PI * 50e6 * i * 8e-9 + 0.3));
+
+    measure_run(buf, SIZE, 0, 8, ZERO_POINT, &m);
+    check_near("50.000 MHz, not half of it", m.frequency, 50e6, 1.0);
+
+    // The bench signal that started this: a 54 MHz sine is what reaches the
+    // ADC once the frontend has taken the harmonics off, and 2.31 samples
+    // per period is under three. It read 58.5 MHz.
+    printf("54.000 MHz sine - 2.31 samples per period:\n");
+    for (int i = 0; i < SIZE; i++)
+      buf[i] = (uint8_t)lround(ZERO_POINT + 100.0 * sin(2 * M_PI * 54e6 * i * 8e-9 + 0.3));
+
+    measure_run(buf, SIZE, 0, 8, ZERO_POINT, &m);
+    check_near("54 MHz sine, not 58.5", m.frequency, 54e6, 1.0);
+
     // Mains hum picked up by hand on a floating probe: a 50 Hz fundamental
     // buried in harmonics, HF junk and noise. This is the record the
     // auto-setup surveys (HS_5_ms => 24576 samples at 4.096 us = 100 ms),

@@ -32,7 +32,12 @@ typedef struct
   int  periods;    // number of full periods seen
   int  slope_pos;  // samples where the signal was rising (beyond noise)
   int  slope_neg;  // samples where the signal was falling (beyond noise)
-  int  period_med_ns;   // median period in ns (what `frequency` is 1/x of)
+  int  period_med_ns;   // period in ns that `frequency` is 1/x of: the mean
+                        // of the periods within +-1/2 of the median. The
+                        // median alone reads high when the sample grid does
+                        // not divide the period evenly (+9% at 2.31
+                        // samples/period); its job here is to say which
+                        // periods are real, not what they measure.
   int  period_min_ns;   // shortest and longest period seen - the one runt or
   int  period_max_ns;   // stretched cycle the median deliberately hides
   int  jitter_rms_ps;   // stddev of all periods, ps (sub-sample crossing
@@ -57,6 +62,12 @@ typedef struct
 // sub-sample interpolation of the crossing instants, so it works regardless
 // of where the trigger level sits and averages over every full period in
 // the record.
+//
+// It is a TIME-domain counter, and it stops being one below about 3 samples
+// per period: at 2.5 exactly the Schmitt arming misses every second crossing
+// and a 50.000 MHz input on a 125 MS/s record reads exactly 25.000 MHz, with
+// nothing in the Measure to say so. Above that rate the spectrum is the only
+// honest source - see fft_peak_frequency().
 void measure_run(const uint8_t *data, int size, int offset,
     int period_ns, int zero_point, Measure *m);
 
