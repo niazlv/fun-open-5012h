@@ -166,6 +166,11 @@ static volatile uint8_t * const g_storage_buffer =
 static volatile BufferInfo g_capture_buffer_info;
 static volatile BufferInfo g_storage_buffer_info;
 static volatile uint32_t g_buffer_generation = 0;
+// Where capture_fold_samples() has read the ring up to. Not a record and not
+// a snapshot: roll mode reads the ring as a stream, so its read point has to
+// survive between calls and has to be put back to the start of the ring
+// whenever dma_start() moves the writer back there.
+static volatile int g_stream_ptr;
 
 /*- Prototypes --------------------------------------------------------------*/
 static inline int dma_get_count(void);
@@ -542,6 +547,7 @@ static inline void dma_start(void)
 
   g_active_buf_ptr = 0;
   g_next_buf_ptr   = g_dma_buffer_size * 2;
+  g_stream_ptr     = 0;
   g_trigger_ptr    = 0;
   g_count          = 0;
   g_remaining      = 0;
@@ -850,6 +856,14 @@ void capture_set_horizontal_parameters(int sr_divider, int trigger_offset)
   int divider, dma_divider;
 
   dma_stop();
+
+  // Never program a prescaler that does not fit the register (see the note on
+  // MAX_SR_DIVIDER). Clamped here rather than trusted to the callers, because
+  // everything downstream - the sample period, the auto-mode sweep length,
+  // the record's advertised rate - is derived from this number, and the one
+  // failure mode of getting it wrong is silent.
+  if (sr_divider > MAX_SR_DIVIDER)
+    sr_divider = MAX_SR_DIVIDER;
 
   if (sr_divider < 1)
   {
@@ -1426,6 +1440,136 @@ int capture_read_fast_samples(uint8_t *dst, int max_count, int *period_ns)
     if (++start >= CAPTURE_BUFFER_SIZE)
       start -= CAPTURE_BUFFER_SIZE;
   }
+
+  return count;
+}
+
+//---------------------------------------------------------------------
+// Roll mode's view of the acquisition: the ring as a stream.
+//
+// Everything else in here reads a RECORD - a finished sweep, snapshotted so
+// it cannot move while it is being read. Roll cannot wait for one: a sweep is
+// 98304 samples and at the rate roll runs at that is the best part of a
+// second, which is the very stutter roll exists to remove. So it reads what
+// the DMA has written since the last call and folds it into a peak pair, with
+// no copy and no record: every sample that lands between two calls is looked
+// at, so a spike narrower than a display column still moves the envelope.
+//
+// The two places samples are lost are worth knowing about, because both are
+// visible on screen as a column that is quieter than it should be:
+//   - a sweep ending: dma_finish() rewinds the writer to the base of the ring
+//     and the samples taken while the storage buffer is being filled are
+//     never written anywhere. That is ~1 ms per sweep.
+//   - the caller falling more than a whole ring behind, which the clamp below
+//     turns into "the newest ring's worth" rather than into garbage.
+int capture_fold_samples(int *vmin, int *vmax)
+{
+  int end, start, count, step, lo = 255, hi = 0;
+  uint32_t primask;
+
+  if (g_stopped)
+    return 0;
+
+  // Everything that decides WHICH samples to read, and the advance of the read
+  // point, in one uninterruptible piece.
+  //
+  // The advance especially. dma_start() puts g_stream_ptr back to the base of
+  // the ring, and an FTF landing between reading the write position and
+  // storing it back would have that reset overwritten with a pointer into the
+  // sweep that just ended - after which the next call reads from there to the
+  // new sweep's head and folds however much of the OLD sweep lies between.
+  // On screen that is one column holding hundreds of milliseconds of signal,
+  // a full-height spike through an otherwise clean trace.
+  primask = __get_PRIMASK();
+  __disable_irq();
+
+  // The write position, from the DMA's own registers: MBS selects the memory
+  // buffer being filled and CH2CNT says what is left of it. NOT the
+  // g_next_buf_ptr arithmetic the other readers use - that only holds inside
+  // the FTF handler and is a whole block ahead out here, which for a peak
+  // fold is not a seam but a block of the PREVIOUS sweep read as if it were
+  // the newest data. It reads as full-scale noise on every column.
+  //
+  // Masking interrupts does not make those two registers agree with each
+  // other: the CHANNEL flips MBS and reloads CH2CNT on its own, so a block
+  // finishing between the MBS read and the count read pairs the old buffer's
+  // base with the new buffer's full count and puts the answer one whole block
+  // in the past. The count only ever falls inside a block, so reading it
+  // either side of the address is enough to see that happen - and one block
+  // is 8 ms, so the retry cannot run twice.
+  {
+    int before, after;
+
+    do
+    {
+      before = dma_get_count();
+      end    = (int)((DMA1->CH2CTL_b.MBS ? DMA1->CH2M1ADDR : DMA1->CH2M0ADDR)
+          - (uint32_t)g_capture_buffer);
+      after  = dma_get_count();
+    } while (after > before);
+
+    end += g_dma_buffer_size - after;
+  }
+
+  start = g_stream_ptr;
+  // Only sr_divider 0 interleaves the two converters, and roll never runs
+  // that fast - but an odd byte read as if it were a straight one is 8 bits
+  // of bit-reversed nonsense, so take the ADC B phase alone rather than
+  // trust the timebase to stay away
+  step  = g_dual_channel ? 2 : 1;
+
+  if (end >= CAPTURE_BUFFER_SIZE)
+    end -= CAPTURE_BUFFER_SIZE;
+
+  count = end - start;
+
+  if (count < 0)
+    count += CAPTURE_BUFFER_SIZE;
+
+  // Lapped: keep clear of the block the DMA is writing into right now and
+  // take the rest, which is the freshest whole ring available
+  if (count > CAPTURE_BUFFER_SIZE - 2 * g_dma_buffer_size)
+  {
+    count = CAPTURE_BUFFER_SIZE - 2 * g_dma_buffer_size;
+    start = end - count;
+
+    if (start < 0)
+      start += CAPTURE_BUFFER_SIZE;
+  }
+
+  g_stream_ptr = end;
+  __set_PRIMASK(primask);
+
+  if (count == 0)
+    return 0;
+
+  // The samples themselves can be read with interrupts on: they are behind
+  // the writer by construction, and a sweep that ends mid-loop only starts
+  // overwriting them a whole ring later
+  if (step == 2)
+    start &= ~1;
+
+  for (int i = 0; i < count; i += step)
+  {
+    int v = g_capture_buffer[start];
+
+    if (v < lo)
+      lo = v;
+
+    if (v > hi)
+      hi = v;
+
+    start += step;
+
+    if (start >= CAPTURE_BUFFER_SIZE)
+      start -= CAPTURE_BUFFER_SIZE;
+  }
+
+  if (lo > hi)
+    return 0; // step 2 over a single odd byte: nothing was actually read
+
+  *vmin = lo;
+  *vmax = hi;
 
   return count;
 }

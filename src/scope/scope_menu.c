@@ -150,6 +150,8 @@ static const char *const g_scope_help_lines[] =
   "  dT, 1/dT, dV",
   "SHIFT+SAVE  - Trend view: 1 Hz log of",
   "  f/Vrms/duty; EDGE metric, MODE clears",
+  "SHIFT+L/R   - Timebase; 1 s/div and up",
+  "  is the roll strip - see the Roll page",
   "STOP        - Freeze: pan/zoom/measure/",
   "  decode/spectrum on the frozen record",
   "TRIG / EDGE - Trigger mode / edge",
@@ -193,6 +195,99 @@ static const info_page_t g_page_spectrum_help =
   .title = "Spectrum (FFT)",
   .lines = g_spectrum_help_lines,
   .count = ARRAY_SIZE(g_spectrum_help_lines),
+};
+
+// Roll turns itself on, so the page has to answer "why does the trace behave
+// differently now" before it answers anything else - and then the one thing
+// that genuinely surprises people: the measurements are not the strip's
+static const char *const g_roll_help_lines[] =
+{
+  INFO_HEAD "What it is",
+  "At 1 s/div and slower the trace is a",
+  "strip chart, not a sweep: the newest",
+  "reading is the right-hand column and",
+  "everything else is one column older.",
+  "It engages by itself - the state slot",
+  "reads ROLL - and Display > Roll from",
+  "moves the point where it takes over.",
+  "",
+  "A sweep cannot go here. A record is",
+  "98304 samples and the timer prescaler",
+  "that clocks them is 16 bits, so the",
+  "longest one the hardware can take is",
+  "~51 s - less than ONE screen at",
+  "5 s/div. Waiting for a record would",
+  "also mean a frozen screen for a whole",
+  "screenful of time at a stretch, which",
+  "is what rolling is for.",
+  "",
+  INFO_HEAD "Keys",
+  "SHIFT+L/R - timebase, out of roll too",
+  "SHIFT+U/D - volts/div",
+  "UP/DOWN   - vertical position",
+  "STOP      - freeze the strip",
+  "",
+  "None of those drops what is drawn.",
+  "The rate roll samples at does not",
+  "move with the timebase, so a column",
+  "means the same thing on all of them",
+  "and the strip is rescaled along time",
+  "instead: slower, and columns merge;",
+  "faster, and one column becomes",
+  "several. Going faster cannot un-blur",
+  "what was recorded coarsely - those",
+  "several all carry the one envelope -",
+  "but it is the envelope as recorded,",
+  "and the history stays. Volts do the",
+  "same thing vertically: a row knows",
+  "enough to be put somewhere else.",
+  "Only clipped columns are gone for",
+  "good, top and bottom of the grid",
+  "being where a column was cut.",
+  "",
+  "Panning is off: the right-hand column",
+  "is now and there is nothing either",
+  "side of the screen to move into. So",
+  "are the cursors, the 50% level and",
+  "the glitch finder - all of them work",
+  "on a record. AUTO leaves roll and",
+  "hunts for a signal as usual.",
+  "",
+  INFO_HEAD "The trigger",
+  "Takes no part. The strip is read from",
+  "the capture ring as it fills, and the",
+  "acquisition is held in AUTO while",
+  "rolling whatever the mode says, so",
+  "the ring keeps turning and the",
+  "measurements keep landing. The stored",
+  "mode comes back on the way out.",
+  "",
+  INFO_HEAD "What the numbers measure",
+  "Not the strip. The panel and the",
+  "status line read the RECORD, which",
+  "here is the last ~0.8 s of signal -",
+  "so on a screen minutes wide, Vpp is",
+  "the swing of the last moment, not of",
+  "everything drawn. For anything above",
+  "a few Hz the two agree; below that,",
+  "believe the plot.",
+  "",
+  INFO_HEAD "What the plot can miss",
+  "Each column is the peak envelope of",
+  "every sample taken during it, at",
+  "122 kS/s - a 20 us runt still shows.",
+  "Two gaps: ~1 ms each time a sweep of",
+  "the ring ends, and whatever a stall",
+  "longer than 805 ms would cost. A lost",
+  "column reads as a quiet one, never as",
+  "a wrong one.",
+};
+
+static const info_page_t g_page_roll_help =
+{
+  .title = "Roll (slow timebases)",
+  .lines = g_roll_help_lines,
+  .count = ARRAY_SIZE(g_roll_help_lines),
 };
 
 // The decoder reads the whole record, and the record is what the TIMEBASE
@@ -1016,6 +1111,16 @@ static const char *const g_average_labels[] =
   "Off", "4 frames", "8 frames", "16 frames", "32 frames", "64 frames",
 };
 
+// Where the trace stops being a swept record and becomes a strip chart. 1 s
+// is index 0 and the default: past 500 ms/div no record can span the screen,
+// so those timebases roll whatever this says, and this only decides how far
+// DOWN roll reaches into timebases a sweep can still show. The scope re-reads
+// it when the menu closes.
+static const char *const g_roll_from_labels[] =
+{
+  "1 s/div", "500 ms/div", "200 ms/div", "100 ms/div",
+};
+
 static const menu_item_t g_display_items[] =
 {
   { .kind = MI_TOGGLE, .label = "Persistence",
@@ -1025,6 +1130,10 @@ static const menu_item_t g_display_items[] =
     .desc = "Mean of N triggered frames",
     .u.choice = { &config.average_mode, g_average_labels,
         ARRAY_SIZE(g_average_labels), display_processing_changed } },
+  { .kind = MI_CHOICE, .label = "Roll from",
+    .desc = "Strip chart instead of a sweep",
+    .u.choice = { &config.roll_from, g_roll_from_labels,
+        ARRAY_SIZE(g_roll_from_labels), NULL } },
 };
 
 // The four parameters the calibration screen edits, and the order the
@@ -1231,6 +1340,8 @@ static const menu_item_t g_scope_help_items[] =
     .u.action = { menu_action_info, &g_page_scope_help } },
   { .kind = MI_ACTION, .label = "Spectrum (FFT)",
     .u.action = { menu_action_info, &g_page_spectrum_help } },
+  { .kind = MI_ACTION, .label = "Roll (slow timebases)",
+    .u.action = { menu_action_info, &g_page_roll_help } },
   { .kind = MI_ACTION, .label = "Decoder",
     .u.action = { menu_action_info, &g_page_decoder_help } },
   { .kind = MI_ACTION, .label = "Calibration",

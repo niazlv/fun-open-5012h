@@ -54,6 +54,15 @@
 #define TRIGGER_MARGIN_SAMPLES 1024
 #define DATA_BUFFER_SIZE       300
 
+// Slowest the acquisition can be clocked. TIMER0/7 take a 16-bit prescaler
+// and capture_set_horizontal_parameters loads it with (1 << sr_divider) - 1,
+// so 16 is where the register runs out: 524 us per sample, a 51 s record.
+// Ask for more and the write wraps - the hardware then samples four or eight
+// times faster than the rate every readout, decoder and spectrum reports,
+// with nothing on screen to say so. The screen is allowed to want more time
+// than that (the roll view spans minutes); the RECORD is not.
+#define MAX_SR_DIVIDER         16
+
 /*- Types -------------------------------------------------------------------*/
 typedef struct
 {
@@ -139,6 +148,12 @@ int capture_read_samples(uint8_t *dst, int max_count, int *period_ns, bool consu
 // storage buffer), usable while acquisition runs. May tear mid-write — meant
 // for spectral estimation, where a seam only raises the noise floor.
 int capture_read_fast_samples(uint8_t *dst, int max_count, int *period_ns);
+// Peak pair over every ring sample written since the previous call, in raw
+// ADC counts; nothing is copied and no record is waited for. Returns the
+// number of samples folded, 0 when the ring has not moved (or is stopped),
+// in which case vmin/vmax are untouched. This is how the roll view reads the
+// input — see the comment on the definition for where samples are lost.
+int capture_fold_samples(int *vmin, int *vmax);
 bool capture_get_record(const uint8_t **data, int *size, int *offset,
     int *period_ns, int *trigger_timepos);
 

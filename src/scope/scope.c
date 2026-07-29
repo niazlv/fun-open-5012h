@@ -98,6 +98,20 @@
 #define TREND_INTERVAL_MS      1000  // logger tick; the ring compresses 2:1
                                      // when full, so the span only grows
 #define TREND_MARGIN_PX        12    // headroom above/below the plotted curve
+
+// Roll view. The sample rate is pinned rather than derived from the timebase:
+// a roll screen spans minutes, the record that would have to span it does not
+// exist, and the only thing the rate still decides is how narrow a spike the
+// peak fold can catch and how far behind the main loop may fall before the
+// ring laps it. Divider 10 is 8.192 us per sample, so the ring holds 805 ms
+// of history - longer than any main-loop stall - and a 20 us runt still lands
+// in the envelope.
+#define ROLL_SR_DIVIDER        10
+#define ROLL_STATE_COLOR       LCD_COLOR(255, 180, 50)
+// Pseudo capture state: rolling is neither WAIT nor TRIG, and saying so in
+// the state slot is the only place the mode announces itself
+#define CAPTURE_STATE_ROLL     3
+
 #define GRID_BG_COLOR          LCD_COLOR(0, 0, 0)
 #define GRID_FG_COLOR          LCD_COLOR(200, 200, 200)
 #define MV_FRAME_COLOR         LCD_COLOR(230, 230, 230)
@@ -273,13 +287,18 @@ static const char *hs_str[HS_COUNT] =
   "  1\x01ms", "  2\x01ms", "  5\x01ms", // ms
   " 10\x01ms", " 20\x01ms", " 50\x01ms",
   "100\x01ms", "200\x01ms", "500\x01ms",
+  "  1\x01s ", "  2\x01s ", "  5\x01s ", // s - roll
+  " 10\x01s ", " 20\x01s ", " 50\x01s ",
 };
 
-static const int hs_div_value[HS_COUNT] =
+// 64-bit because of the roll end: 5 s/div is 5e9 ns and int stops at 2.1e9
+static const int64_t hs_div_value[HS_COUNT] =
 {
   50, 100, 200, 500, // ns
   1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 500000, // us
   1000000, 2000000, 5000000, 10000000, 20000000, 50000000, 100000000, 200000000, 500000000, // ms
+  1000000000ll, 2000000000ll, 5000000000ll, // s
+  10000000000ll, 20000000000ll, 50000000000ll,
 };
 
 static const int hs_px_value[HS_COUNT] = // in ns
@@ -287,6 +306,8 @@ static const int hs_px_value[HS_COUNT] = // in ns
   2, 4, 8, 20, // ns
   40, 80, 200, 400, 800, 2000, 4000, 8000, 20000, // us
   40000, 80000, 200000, 400000, 800000, 2000000, 4000000, 8000000, 20000000, // ms
+  40000000, 80000000, 200000000, // s
+  400000000, 800000000, 2000000000,
 };
 
 static const char *vs_str[VS_COUNT] =
@@ -361,8 +382,27 @@ static bool g_trend_mode = false;
 static int  g_trend_metric = 0;   // 0 = frequency, 1 = Vrms, 2 = duty
 static int  g_trend_timer = TIMER_DISABLE;
 
+// Roll view: no button turns it on, the timebase does. Past the point where a
+// triggered sweep would leave the screen unchanged for seconds at a time, the
+// trace becomes a strip chart - the input's peak envelope over one column's
+// worth of time, appended at the right, everything else one column older.
+//
+// The history IS g_display_buffer, shifted: it is already 300 columns of
+// min/max/flags in display rows, TCM has ~1 KB left over the linker's stack
+// reserve, and a second copy of it would take most of that. What that costs
+// is spelled out in roll_rescale(), which is why the vertical keys remap the
+// stored rows instead of clearing them.
+static bool g_roll_active = false;
+static int  g_roll_col_us = 0;    // time one display column covers
+static int  g_roll_acc_us = 0;    // ...and how much of it is in the open one
+static uint32_t g_roll_stamp = 0; // timer_us() at the previous fold
+static int  g_roll_min = 255;     // open column's envelope, raw ADC counts
+static int  g_roll_max = 0;
+
 static int cursor_t_col(int64_t t_ns);
 static int cursor_v_row(int mv);
+static int64_t roll_screen_ns(void);
+static void roll_sync(void);
 
 typedef struct
 {
@@ -1000,8 +1040,9 @@ static void build_trace_column(int c, uint16_t *column)
   else
     update_from_display_buffer(column, &g_display_buffer);
 
-  // The trigger-position overlay is meaningless on the spectrum and trend views
-  if (!g_fft_mode && !g_trend_mode)
+  // The trigger-position overlay is meaningless on the spectrum, the trend
+  // and the roll strip - none of them is drawn around a trigger
+  if (!g_fft_mode && !g_trend_mode && !g_roll_active)
   {
     if (config.horizontal_position_px < -(GRID_WIDTH/2-1))
     {
@@ -1021,7 +1062,7 @@ static void build_trace_column(int c, uint16_t *column)
   // Measurement cursors ride the sweep like every other overlay: the pair of
   // time hairlines and the pair of voltage lines, the active one solid, its
   // partner dashed
-  if (g_cursor_sel && !g_fft_mode && !g_trend_mode)
+  if (g_cursor_sel && !g_fft_mode && !g_trend_mode && !g_roll_active)
   {
     for (int k = 0; k < 2; k++)
     {
@@ -1268,7 +1309,11 @@ static void draw_horizontal_position(void)
   if (g_toast_active || scope_calibration_mode || measure_owns_status_line())
     return;
 
-  str = format_time(config.horizontal_position, true);
+  // The pan offset is always zero while rolling. What the same field is
+  // worth there is how much time the screen holds - the one number a strip
+  // chart has to be read against.
+  str = format_time(g_roll_active ? roll_screen_ns() : config.horizontal_position,
+      !g_roll_active);
   lcd_set_color(BG_COLOR, HPOS_COLOR);
   lcd_puts(236, STATUS_LINE_Y, str);
 }
@@ -2853,10 +2898,21 @@ static void draw_capture_state(void)
   int color = BG_COLOR;
   char *str = "";
 
+  // Rolling has no trigger to wait for or catch, so WAIT/TRIG here would be
+  // reporting on an acquisition the screen is not showing. This slot is the
+  // only place the mode names itself.
+  if (g_roll_active && CAPTURE_STATE_STOP != state)
+    state = CAPTURE_STATE_ROLL;
+
   if (g_state == state)
     return;
 
-  if (CAPTURE_STATE_STOP == state)
+  if (CAPTURE_STATE_ROLL == state)
+  {
+    color = ROLL_STATE_COLOR;
+    str = "ROLL";
+  }
+  else if (CAPTURE_STATE_STOP == state)
   {
     color = CAPTURE_STOP_COLOR;
     str = "STOP";
@@ -3010,6 +3066,33 @@ static void update_sample_rate(void)
   // here: whatever the envelope and the averages accumulated no longer maps
   // onto these columns
   scope_display_settings_changed();
+
+  // Rolling: the screen is not a record and the rate cannot be derived from
+  // it. Asking for one would not just be pointless, it would be wrong - the
+  // loop below stretches the sample period until a record spans the screen,
+  // and a minute-wide screen walks the divider straight past the 16 bits the
+  // sampling timer's prescaler has. Pin the rate instead (see ROLL_SR_DIVIDER)
+  // and let the whole strip read as the window it is.
+  if (g_roll_active)
+  {
+    int sr = (config.sample_rate_limit > ROLL_SR_DIVIDER) ?
+        config.sample_rate_limit : ROLL_SR_DIVIDER;
+    int rate = (int)(BASE_SAMPLE_RATE / (1 << sr));
+
+    capture_set_horizontal_parameters(sr, CAPTURE_BUFFER_SIZE/2);
+
+    g_mv_trigger_px = 0;
+    g_mv_window_px = -MINIVIEW_WIDTH/2;
+    g_mv_width_px = MINIVIEW_WIDTH;
+    draw_miniview(g_mv_trigger_px, g_mv_window_px, g_mv_width_px);
+
+    // The lower readout is the ring's own rate, undecimated: the fold reads
+    // the ring itself, not the storage record every other view goes through
+    draw_sample_rates((int)(BASE_SAMPLE_RATE / (1 << config.sample_rate_limit)),
+        rate);
+    return;
+  }
+
   int64_t window_time = (int64_t)hs_div_value[config.horizontal_scale] * GRID_DIVS_H;
   int64_t period = BASE_SAMPLE_PERIOD;
   int64_t trigger_margin, trigger_offset;
@@ -3039,6 +3122,13 @@ static void update_sample_rate(void)
       required_time = window_time;
 
     if (required_time < buffer_time)
+      break;
+
+    // ...and the prescaler runs out before the slow timebases do. Past here
+    // the record simply spans less than the screen asks for, which is a fact
+    // about the instrument; stretching the period past the register would be
+    // a rate nothing on screen reports (see MAX_SR_DIVIDER).
+    if (sr_divider >= MAX_SR_DIVIDER)
       break;
 
     sr_divider++;
@@ -3493,6 +3583,7 @@ static void trend_toggle(void)
   g_fft_mode = false;
   g_shadow_valid = false;
   g_sweep_force = true;
+  roll_sync(); // the trend plots its own log, not the input
 
   if (g_trend_mode)
     trend_view_update();
@@ -3530,6 +3621,385 @@ static bool trend_buttons(int buttons, bool shift, bool repeat)
     return true;
 
   return false; // SAVE, STOP and the SHIFT view switches fall through
+}
+
+//-----------------------------------------------------------------------------
+// Roll view
+//
+// A triggered sweep shows a record, and a record only exists once it is
+// whole: at 500 ms/div that is six seconds of a frozen screen before six
+// seconds of new signal replace all of it at once. Past that the useful
+// picture is not a waveform at all - it is the input plotted against wall
+// clock, appended a column at a time, which is what the stock firmware turns
+// into above 500 ms/div and what this does.
+//
+// Nothing here waits for the acquisition. The ring is folded into a peak pair
+// every pass of the main loop (capture_fold_samples), the pair accumulates
+// into the column being written, and when that column has had its share of
+// time the whole screen shifts left by one. The trigger takes no part - the
+// acquisition is held in AUTO for the duration so the ring keeps turning and
+// the measurements keep landing, whatever the trigger is set to.
+//-----------------------------------------------------------------------------
+
+// The timebase the user's roll threshold starts at. Index 0 is the default
+// and means "only where a sweep cannot work at all", which is what the stock
+// scope does; the rest pull roll down into timebases a sweep can still show,
+// where it trades the trigger for a screen that keeps moving.
+static int roll_threshold_hs(void)
+{
+  static const uint8_t from[] =
+      { HS_ROLL_FIRST, HS_500_ms, HS_200_ms, HS_100_ms };
+
+  int sel = config.roll_from;
+
+  if (sel < 0 || sel >= (int)ARRAY_SIZE(from))
+    sel = 0;
+
+  return from[sel];
+}
+
+//-----------------------------------------------------------------------------
+// Roll is a property of the timebase, not a mode with a key. The other views
+// own the whole trace area and say what it means themselves, so none of them
+// rolls: the spectrum has no time axis, the trend plots its own log, and a
+// decoder needs the record roll refuses to wait for.
+static bool roll_wanted(void)
+{
+  if (g_fft_mode || g_trend_mode || g_decode_mode || scope_calibration_mode ||
+      g_autocal_active || g_autoset_active)
+    return false;
+
+  return config.horizontal_scale >= roll_threshold_hs();
+}
+
+//-----------------------------------------------------------------------------
+// One display column's worth of time. Column, not division: 25 px per
+// division is the whole resolution of the plot, and a column is what the
+// envelope is accumulated into.
+static int roll_column_us(void)
+{
+  int64_t us = hs_div_value[config.horizontal_scale] / (GRID_DIV_PX * 1000);
+
+  return (us < 1) ? 1 : (int)us;
+}
+
+//-----------------------------------------------------------------------------
+// Raw ADC count to display row, by the same route the swept trace takes:
+// counts to millivolts through the range's calibration, millivolts to pixels
+// through the volts/div, then the user's vertical position.
+static int roll_row(int raw)
+{
+  int mv = ((raw - ZERO_POINT) * config.vertical_mult + config.vertical_mult/2) /
+      CALIB_MULTIPLIER;
+
+  return clip_for_display((mv - config.vertical_position_mv) /
+      vs_px_value[config.vertical_scale] + config.vertical_position);
+}
+
+//-----------------------------------------------------------------------------
+// Start the open column over and put the whole strip back on screen. Every
+// path that rewrites the plotted columns ends here.
+static void roll_reopen(void)
+{
+  g_roll_min   = 255;
+  g_roll_max   = 0;
+  g_roll_acc_us = 0;
+  g_roll_stamp = timer_us();
+  g_shadow_valid = false;
+  redraw_trace();
+}
+
+//-----------------------------------------------------------------------------
+// Forget the plotted history. Only where there is nothing to carry over:
+// entering the view, and coming back to it from one that owned the columns.
+static void roll_clear(void)
+{
+  for (int c = 0; c < GRID_WIDTH; c++)
+  {
+    g_display_buffer.min[c]   = GRID_HEIGHT/2-1;
+    g_display_buffer.max[c]   = GRID_HEIGHT/2-1;
+    g_display_buffer.flags[c] = SAMPLE_FLAG_NONE;
+  }
+
+  roll_reopen();
+}
+
+//-----------------------------------------------------------------------------
+// A timebase step INSIDE the view: rescale the strip along time instead of
+// dropping it.
+//
+// The sample rate does not move with the roll timebase - it is pinned, see
+// ROLL_SR_DIVIDER - so a column means the same thing at every roll timebase:
+// the peak envelope of a stretch of wall clock. Only the length of the
+// stretch changes. Slower, and a new column is the union of the old ones its
+// span covers; faster, and one old column feeds the several new ones that
+// fall inside it.
+//
+// That second direction cannot un-blur anything, and does not pretend to: a
+// column recorded over 400 ms knows only its own two extremes, and the four
+// 100 ms columns it becomes all carry them. It is the envelope at the
+// resolution it was RECORDED at - which is a true statement about the signal,
+// where throwing ten minutes of history away over one keypress is not.
+//
+// In place, because there is no TCM for a second copy of the buffer. The two
+// directions need opposite orders and the arithmetic is what guarantees it:
+// compressing, a new column never reads anything to the right of itself, so
+// the sweep goes right to left; expanding, never anything to the left, so it
+// goes the other way. Either way a column is written only after everything
+// that reads it has been.
+static void roll_retime(int old_us, int new_us)
+{
+  int step = (new_us > old_us) ? -1 : 1;
+  int j = (step < 0) ? GRID_WIDTH-1 : 0;
+
+  for (int n = 0; n < GRID_WIDTH; n++, j += step)
+  {
+    // Age of this column's edges, in us behind the newest edge of the strip.
+    // Column c of either scale covers [(W-1-c)*us, (W-c)*us).
+    int lo = (GRID_WIDTH-1 - j) * new_us;
+    int hi = lo + new_us - 1;
+    int first = GRID_WIDTH-1 - hi / old_us; // oldest old column it touches
+    int last  = GRID_WIDTH-1 - lo / old_us; // ...and the newest
+    int min = GRID_HEIGHT, max = -1, flags = SAMPLE_FLAG_NONE;
+
+    if (first < 0)
+      first = 0;
+
+    if (last > GRID_WIDTH-1)
+      last = GRID_WIDTH-1;
+
+    for (int i = first; i <= last; i++)
+    {
+      if (!(g_display_buffer.flags[i] & SAMPLE_FLAG_VALID))
+        continue;
+
+      if (g_display_buffer.min[i] < min)
+        min = g_display_buffer.min[i];
+
+      if (g_display_buffer.max[i] > max)
+        max = g_display_buffer.max[i];
+
+      flags |= g_display_buffer.flags[i];
+    }
+
+    // Nothing was ever recorded this far back: the strip now spans more time
+    // than it has been running for, and those columns are honestly empty
+    if (max < 0)
+    {
+      g_display_buffer.min[j]   = GRID_HEIGHT/2-1;
+      g_display_buffer.max[j]   = GRID_HEIGHT/2-1;
+      g_display_buffer.flags[j] = SAMPLE_FLAG_NONE;
+    }
+    else
+    {
+      g_display_buffer.min[j]   = min;
+      g_display_buffer.max[j]   = max;
+      g_display_buffer.flags[j] = flags;
+    }
+  }
+
+  roll_reopen();
+}
+
+//-----------------------------------------------------------------------------
+// A vertical change moves every stored column, and clearing an hour of
+// history because the range was nudged is not an answer. The rows carry
+// enough to move them: a row is the input's millivolts divided by the
+// volts/div and offset by the vertical position, so the old settings give the
+// millivolts back and the new ones put them somewhere else.
+//
+// What that cannot recover is a column that was already against the top or
+// the bottom of the grid - clip_for_display() threw the rest of it away when
+// the column was written, exactly as it does for the live trace. Zooming out
+// therefore un-clips nothing; it only stops NEW columns from clipping.
+static void roll_rescale(int old_scale, int old_vpos)
+{
+  int scale = vs_px_value[config.vertical_scale];
+
+  if (!g_roll_active)
+    return;
+
+  for (int c = 0; c < GRID_WIDTH; c++)
+  {
+    if (!(g_display_buffer.flags[c] & SAMPLE_FLAG_VALID))
+      continue;
+
+    // clip_for_display() is row = GRID_HEIGHT/2-1 - value, so this runs it
+    // backwards into a value, into millivolts, and forwards again
+    int lo = (GRID_HEIGHT/2-1 - g_display_buffer.min[c] - old_vpos) * old_scale;
+    int hi = (GRID_HEIGHT/2-1 - g_display_buffer.max[c] - old_vpos) * old_scale;
+
+    g_display_buffer.min[c] = clip_for_display(lo / scale + config.vertical_position);
+    g_display_buffer.max[c] = clip_for_display(hi / scale + config.vertical_position);
+  }
+
+  g_shadow_valid = false;
+  redraw_trace();
+}
+
+//-----------------------------------------------------------------------------
+// Close the open column: everything one place to the left, the accumulated
+// envelope into the column that just came free at the right.
+static void roll_commit(void)
+{
+  int flags = SAMPLE_FLAG_NONE;
+
+  memmove(&g_display_buffer.min[0], &g_display_buffer.min[1], GRID_WIDTH-1);
+  memmove(&g_display_buffer.max[0], &g_display_buffer.max[1], GRID_WIDTH-1);
+  memmove(&g_display_buffer.flags[0], &g_display_buffer.flags[1], GRID_WIDTH-1);
+
+  if (g_roll_min <= g_roll_max)
+  {
+    // min/max are counts here and rows on the way out, and the two run
+    // opposite ways: a bigger count is a HIGHER pixel, i.e. a smaller row
+    g_display_buffer.min[GRID_WIDTH-1] = roll_row(g_roll_max);
+    g_display_buffer.max[GRID_WIDTH-1] = roll_row(g_roll_min);
+
+    flags = SAMPLE_FLAG_VALID;
+
+    if (g_roll_min == 0)
+      flags |= SAMPLE_FLAG_CLIP_L;
+
+    if (g_roll_max == 255)
+      flags |= SAMPLE_FLAG_CLIP_H;
+  }
+
+  g_display_buffer.flags[GRID_WIDTH-1] = flags;
+
+  g_roll_min = 255;
+  g_roll_max = 0;
+}
+
+//-----------------------------------------------------------------------------
+// Called every pass of the main loop while the view is up
+static void roll_task(void)
+{
+  uint32_t now = timer_us();
+  int vmin, vmax, elapsed, columns = 0;
+
+  if (g_roll_col_us <= 0)
+    return; // never entered the view properly; nothing to divide time into
+
+  if (capture_get_state() == CAPTURE_STATE_STOP)
+  {
+    // Frozen: the plot is a picture of the last minutes and the time spent
+    // stopped is not part of it. Restart the clock so resuming appends the
+    // next column rather than a screenful of blank ones.
+    g_roll_stamp = now;
+    return;
+  }
+
+  if (capture_fold_samples(&vmin, &vmax) > 0)
+  {
+    if (vmin < g_roll_min)
+      g_roll_min = vmin;
+
+    if (vmax > g_roll_max)
+      g_roll_max = vmax;
+  }
+
+  elapsed = (int)(now - g_roll_stamp); // wrap-safe: 1 MHz into 32 bits
+  g_roll_stamp = now;
+
+  // More than a screen's worth of time since the last look. The scope does
+  // not run while a menu is open, so this is mostly "the menu was up for a
+  // while" - and a negative reading is the same thing after 35 minutes of it,
+  // which is where a 1 MHz counter overruns what an int can hold. Either way
+  // every column on screen is older than the screen, and shifting 300 empty
+  // ones through one at a time only takes longer to say so.
+  if (elapsed < 0 || elapsed > GRID_WIDTH * g_roll_col_us)
+  {
+    roll_clear();
+    return;
+  }
+
+  g_roll_acc_us += elapsed;
+
+  while (g_roll_acc_us >= g_roll_col_us)
+  {
+    g_roll_acc_us -= g_roll_col_us;
+    roll_commit();
+    columns++;
+  }
+
+  if (columns > 0)
+  {
+    g_shadow_valid = false;
+    // The sweep paints one column per pass and everything moved, so this is
+    // a full repaint - ~11 ms of LCD writes spread over the next 300 passes,
+    // which is why the roll threshold stops where it does
+    redraw_trace();
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Enter or leave the view. Only the timebase decides this, so it is called
+// from wherever the timebase or a view flag can have changed rather than from
+// a key.
+static void roll_set_active(bool active)
+{
+  if (active == g_roll_active)
+  {
+    // Same view, different timebase: a column covers a new amount of time,
+    // and what is already plotted gets rescaled onto it
+    if (active && g_roll_col_us != roll_column_us())
+    {
+      int old_us = g_roll_col_us;
+
+      g_roll_col_us = roll_column_us();
+      roll_retime(old_us, g_roll_col_us);
+    }
+
+    return;
+  }
+
+  g_roll_active = active;
+  g_state = -1; // the state slot says ROLL or does not
+
+  if (active)
+  {
+    // Panning has nothing to pan: the newest column is the present, and
+    // there is no record either side of the screen to walk into
+    config.horizontal_position = 0;
+    config.horizontal_position_px = 0;
+
+    g_roll_col_us = roll_column_us();
+    roll_clear();
+  }
+
+  // AUTO while rolling whatever the trigger says, and the user's mode back
+  // on the way out. A NORMAL sweep that never triggers would leave the
+  // measurements frozen on whatever record was last published, and SINGLE
+  // stops the ring outright - which would look exactly like a hung scope.
+  //
+  // Not capture_start(): a stop is the user's, and a timebase key is not a
+  // request to undo one. Rolling into a stopped acquisition shows the frozen
+  // strip and STOP in the state slot, and RUN starts it moving.
+  capture_set_trigger_mode(active ? TRIGGER_MODE_AUTO : config.trigger_mode);
+}
+
+//-----------------------------------------------------------------------------
+// Re-decide the view after something OTHER than the timebase changed what it
+// should be - a view toggle, the threshold setting. The timebase key does
+// this itself, in the middle of its own rescaling; everyone else calls here.
+static void roll_sync(void)
+{
+  bool want = roll_wanted();
+
+  if (want == g_roll_active)
+    return;
+
+  roll_set_active(want);
+  update_sample_rate(); // the acquisition is timed differently either way
+}
+
+//-----------------------------------------------------------------------------
+// How much time the screen holds, for the readout that shows the pan offset
+// on a swept trace - there is no pan here, and the span is what a strip chart
+// is read against
+static int64_t roll_screen_ns(void)
+{
+  return hs_div_value[config.horizontal_scale] * GRID_DIVS_H;
 }
 
 //-----------------------------------------------------------------------------
@@ -3599,6 +4069,15 @@ static void update_display(void)
   if (g_trend_mode)
   {
     trend_view_update();
+    return;
+  }
+
+  // ...and it is the roll history while THAT view is up, which the columns
+  // of a record would wipe out. Nothing to rebuild here either: roll_task()
+  // owns those columns and appends to them on its own clock.
+  if (g_roll_active)
+  {
+    redraw_trace();
     return;
   }
 
@@ -3931,8 +4410,13 @@ static void change_horizontal_scale(int delta)
     return;
 
   config.horizontal_scale += delta;
-  config.horizontal_position_px = config.horizontal_position / hs_px_value[config.horizontal_scale];
   config.horizontal_period = hs_px_value[config.horizontal_scale];
+
+  // Roll is a property of the timebase and this is the only key that changes
+  // it. Ahead of the pan being rescaled, because entering roll zeroes it.
+  roll_set_active(roll_wanted());
+
+  config.horizontal_position_px = config.horizontal_position / hs_px_value[config.horizontal_scale];
 
   draw_horizontal_scale();
   draw_horizontal_position();
@@ -3944,6 +4428,12 @@ static void change_horizontal_scale(int delta)
 static void change_horizontal_position_ex(int delta, bool repeat)
 {
   int div = hs_px_value[config.horizontal_scale];
+
+  // Rolling: the right-hand column is now and there is nothing either side of
+  // the screen to walk into - the record a pan moves through is the very
+  // thing roll does without
+  if (g_roll_active)
+    return;
 
   if ((delta < 0 && config.horizontal_position <= MIN_HORIZONTAL_POSITION) ||
       (delta > 0 && config.horizontal_position >= MAX_HORIZONTAL_POSITION))
@@ -3994,6 +4484,8 @@ static void change_vertical_scale(int delta)
   if (scale == config.vertical_scale)
     return;
 
+  int old_scale = vs_px_value[config.vertical_scale];
+
   config.vertical_scale = scale;
   config.vertical_mult = config.calib_vs_mult[config.vertical_scale];
   config.vertical_position_mv = config.vertical_position * vs_px_value[config.vertical_scale];
@@ -4001,6 +4493,7 @@ static void change_vertical_scale(int delta)
   config.trigger_level_mv = config.trigger_level * vs_px_value[config.vertical_scale];
 
   scope_display_settings_changed(); // px-to-mV mapping changed under them
+  roll_rescale(old_scale, config.vertical_position); // ...including the plot's
   capture_set_vertical_parameters();
   capture_set_trigger_level(config.trigger_level_mv);
   draw_vertical_scale();
@@ -4015,10 +4508,13 @@ static void change_vertical_position_ex(int delta, bool repeat)
       (delta > 0 && config.vertical_position >= MAX_VERTICAL_POSITION))
     return;
 
+  int old_vpos = config.vertical_position;
+
   config.vertical_position += delta;
   config.vertical_position_mv = config.vertical_position * vs_px_value[config.vertical_scale];
 
   scope_display_settings_changed(); // every column moved on screen
+  roll_rescale(vs_px_value[config.vertical_scale], old_vpos); // the plot too
 
   // Same held-key coalescing as horizontal pan: the DAC/DMA restart runs
   // every 4th repeat tick, the settle timer finalizes after release
@@ -4294,13 +4790,15 @@ static int decode_fit_scale(int baud)
   // start + 8 data + stop, twice over for the pre-trigger half of the record
   int64_t want_ns = (int64_t)LOGIC_MAX_BYTES * 10 * 2 * 1000000000ll / baud;
 
-  for (int hs = 0; hs < HS_COUNT; hs++)
+  // Sweep timebases only: the fit exists to put a whole message in a RECORD,
+  // and past HS_SWEEP_LAST there is no record to put it in
+  for (int hs = 0; hs <= HS_SWEEP_LAST; hs++)
   {
-    if ((int64_t)hs_div_value[hs] * GRID_DIVS_H >= want_ns)
+    if (hs_div_value[hs] * GRID_DIVS_H >= want_ns)
       return hs;
   }
 
-  return HS_LAST;
+  return HS_SWEEP_LAST;
 }
 
 //-----------------------------------------------------------------------------
@@ -5342,6 +5840,9 @@ static void decode_mode_enter(void)
   g_decode_hunt = false;
   g_decode_sel = 0;
   g_decode_force = true; // show something without waiting for the throttle
+  // Before anything re-times the acquisition: the window and the trigger set
+  // up below are a record's, and roll pins the rate to something else
+  roll_sync();
   trigger_set_50_percent();
 
   if (decoder_baud_value() > 0 && config.decoder_fit_mode == 0 &&
@@ -5424,13 +5925,15 @@ static void autoset_set_horizontal(int hs)
 }
 
 //-----------------------------------------------------------------------------
-// Timebase that puts periods_x10/10 whole periods across the screen
+// Timebase that puts periods_x10/10 whole periods across the screen. Sweep
+// timebases only - the hunt found a signal by measuring records, and landing
+// it in a view that draws none would throw that away.
 static void autoset_set_timebase(int freq, int periods_x10)
 {
   int64_t need = (100000000ll * periods_x10) / freq / GRID_DIVS_H;
   int hs = 0;
 
-  while (hs < HS_LAST && hs_div_value[hs] < need)
+  while (hs < HS_SWEEP_LAST && hs_div_value[hs] < need)
     hs++;
 
   autoset_set_horizontal(hs);
@@ -5595,6 +6098,9 @@ static void autoset_end(void)
 {
   g_autoset_active = false;
   g_autoset_timer = TIMER_DISABLE;
+
+  // An abort restored a timebase that may have been a roll one
+  roll_sync();
 
   // The hunt rewrote the scale, the position, the timebase and the trigger
   // while a toast was up, and a toast suppresses every status-line element.
@@ -5826,6 +6332,11 @@ static void autoset_start(void)
 {
   g_autoset_active = true;
   g_autoset_timer = AUTOSET_TIMEOUT;
+
+  // The hunt steers on records, so it cannot run inside a view that has none.
+  // It ends on a swept timebase whatever it finds, and "no signal found" puts
+  // the roll timebase - and the roll view with it - back.
+  roll_sync();
 
   g_autoset_phase = AS_SURVEY;
   g_autoset_saved_hs = config.horizontal_scale;
@@ -6570,7 +7081,7 @@ void scope_buttons_handler(int buttons)
   }
 
   if (g_cursor_sel && !g_fft_mode && !g_decode_mode && !g_trend_mode &&
-      !scope_calibration_mode)
+      !g_roll_active && !scope_calibration_mode)
   {
     if (cursor_buttons(buttons, shift, repeat))
       return;
@@ -6578,10 +7089,13 @@ void scope_buttons_handler(int buttons)
 
   if ((buttons & BTN_UP) && (buttons & BTN_DOWN))
   {
+    int old_vpos = config.vertical_position;
+
     config.vertical_position = 0;
     config.vertical_position_mv = 0;
 
     capture_set_vertical_parameters();
+    roll_rescale(vs_px_value[config.vertical_scale], old_vpos);
     draw_vertical_position(true);
     refresh_view();
   }
@@ -6602,6 +7116,9 @@ void scope_buttons_handler(int buttons)
 
   else if ((buttons & BTN_LEFT) && (buttons & BTN_RIGHT))
   {
+    if (g_roll_active)
+      return; // already zero, and nothing to re-time
+
     config.horizontal_position = 0;
     config.horizontal_position_px = 0;
 
@@ -6634,8 +7151,14 @@ void scope_buttons_handler(int buttons)
     else
       config.trigger_mode++;
 
-    capture_set_trigger_mode(config.trigger_mode);
-    capture_start();
+    // Set here, applied on the way out of roll: the strip is drawn from the
+    // ring and holding the acquisition in AUTO is what keeps the ring turning
+    if (!g_roll_active)
+    {
+      capture_set_trigger_mode(config.trigger_mode);
+      capture_start();
+    }
+
     draw_trigger_mode();
   }
   else if (buttons & BTN_EDGE)
@@ -6656,6 +7179,7 @@ void scope_buttons_handler(int buttons)
         g_decode_hunt = false;
         g_shadow_valid = false;
         g_sweep_force = true;
+        roll_sync();
         update_display();
         redraw_miniview();   // restore the decorative wave over the byte map
         decode_band_build(); // and clear the byte marks off the trace
@@ -6746,6 +7270,7 @@ void scope_buttons_handler(int buttons)
       g_trend_mode = false;
       g_shadow_valid = false;
       g_sweep_force = true;
+      roll_sync(); // a spectrum has no time axis to roll along
       draw_status_line();
 
       if (g_fft_mode)
@@ -6805,6 +7330,15 @@ void scope_buttons_handler(int buttons)
     if (repeat || scope_calibration_mode)
       return;
 
+    // Both work on a record: the glitch finder scans one, and a 50% level is
+    // a trigger setting for a sweep that is not running here
+    if (g_roll_active)
+    {
+      toast_show();
+      lcd_puts(GRID_LEFT, STATUS_LINE_Y, "Not while rolling - zoom in first");
+      return;
+    }
+
     if (shift)
     {
       trend_toggle();
@@ -6857,6 +7391,12 @@ void scope_init(bool calibration_mode)
   g_vpos_marker.valid = false;
   g_trig_marker.valid = false;
 
+  // The stored timebase decides the view, and update_sample_rate() at the
+  // bottom of this has to already know which one it is timing the ADC for.
+  // Not roll_sync(): nothing is on screen yet for it to compare against.
+  g_roll_active = false;
+  roll_set_active(roll_wanted());
+
   // Settle the panel before anything paints. It decides who owns the status
   // line, and it is a static that outlives the application: entering the scope
   // a second time painted that line for the panel state of the previous
@@ -6883,7 +7423,8 @@ void scope_init(bool calibration_mode)
   else
   {
     capture_set_trigger_edge(config.trigger_edge);
-    capture_set_trigger_mode(config.trigger_mode);
+    // AUTO while rolling whatever the stored mode says - see roll_set_active
+    capture_set_trigger_mode(g_roll_active ? TRIGGER_MODE_AUTO : config.trigger_mode);
     capture_set_trigger_level(config.trigger_level_mv);
   }
 
@@ -6922,6 +7463,11 @@ void scope_redraw_all(void)
 
   lcd_set_font(FONT_LARGE);
   lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, BG_COLOR);
+
+  // The menu that was up may have moved the roll threshold under the current
+  // timebase, and update_sample_rate() below times the ADC for one view or
+  // the other
+  roll_set_active(roll_wanted());
 
   draw_grid_frame();
   draw_vertical_position(false);
@@ -6976,7 +7522,7 @@ void scope_task(void)
         autoset_step();
       else if (g_fft_mode)
         fft_tick();
-      else if (g_trend_mode)
+      else if (g_trend_mode || g_roll_active)
         capture_consume_frame(); // keep acquisition flowing under the plot
       else
       {
@@ -6987,6 +7533,11 @@ void scope_task(void)
       }
     }
   }
+
+  // The strip advances on wall clock, not on records: every pass, so a
+  // column is closed within a main-loop pass of the time it is due
+  if (g_roll_active)
+    roll_task();
 
   // A cursor moved: repaint the sweep once the current one is done. The
   // overlay is composited into the columns, so the shadow cache is stale.
@@ -7147,7 +7698,7 @@ void scope_task(void)
     static bool was_ready = true;
     bool ready = trace_ready();
     bool want = capture_stopped_on_snapshot() && !g_fft_mode &&
-        !g_trend_mode && !scope_calibration_mode;
+        !g_trend_mode && !g_roll_active && !scope_calibration_mode;
 
     if (want != g_snap_tag)
     {

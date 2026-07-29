@@ -650,6 +650,8 @@ void config_reset(void)
   config.spi_order              = 0; // ...and score both bit orders
   config.man_rate               = 0; // Manchester rate off the record
   config.man_polarity           = 0; // ...rising mid-bit edge is a one
+  config.swd_clock_hz           = 0; // work the SWD bit time out of the record
+  config.roll_from              = 0; // roll only above 500 ms/div
 
   // General settings defaults
   config.screen_brightness      = 80;  // 80% default brightness

@@ -375,7 +375,10 @@ bool cpu_step(void)
     return true;
   }
 
-  emu_log("core stopped: %s at pc 0x%08x", uc_strerror(err), pc);
+  emu_log("core stopped: %s at pc 0x%08x lr 0x%08x sp 0x%08x r0 %08x r1 %08x r2 %08x r3 %08x",
+      uc_strerror(err), pc, reg_read(UC_ARM_REG_LR), reg_read(UC_ARM_REG_SP),
+      reg_read(UC_ARM_REG_R0), reg_read(UC_ARM_REG_R1),
+      reg_read(UC_ARM_REG_R2), reg_read(UC_ARM_REG_R3));
   g_wedged = true;
 
   return false;

@@ -61,8 +61,28 @@ enum // Horizontal Scale
   HS_200_ms,
   HS_500_ms,
 
-  HS_LAST = HS_500_ms,
-  HS_COUNT,
+  // Roll territory. A triggered sweep cannot show these: the record is
+  // 98304 samples and the timer prescaler that clocks them is 16 bits, so
+  // the longest record the hardware can take is ~51 s - less than one screen
+  // at 5 s/div. The scope draws these as a strip chart of the live input
+  // instead, one column at a time, and never waits for a whole record.
+  HS_1_s,
+  HS_2_s,
+  HS_5_s,
+  HS_10_s,
+  HS_20_s,
+  HS_50_s,
+
+  // Values, not counter positions: an assignment in the middle of an enum
+  // moves every entry after it
+  HS_LAST       = HS_50_s,
+  HS_COUNT      = HS_50_s + 1,
+  // Last timebase a triggered sweep can show. Auto-setup and the decoder's
+  // fit-the-window step pick from these only - both want a record, and roll
+  // has none to give them.
+  HS_SWEEP_LAST = HS_500_ms,
+  // First timebase that always rolls, whatever the roll threshold says
+  HS_ROLL_FIRST = HS_1_s,
 };
 
 enum // Vertical Scale

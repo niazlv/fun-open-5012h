@@ -217,6 +217,12 @@ typedef struct
   // padding, like everything above it.
   int      swd_clock_hz;
 
+  // Where the roll view takes over from the swept trace, as an index into
+  // scope.c's own table: 0 = 1 s/div, i.e. only where a sweep cannot work at
+  // all. Zero-is-default again, so a config saved before this field existed
+  // gets the stock behaviour. Carved out of padding.
+  int      roll_from;
+
   // Snake's best score. A high score that dies with the power is not a high
   // score, and the game has nowhere else to keep it. Carved out of padding
   // like every field above it, so sizeof(Config) and every stored calibration
@@ -224,7 +230,7 @@ typedef struct
   // yet" - the same zero-is-default rule the rest of this struct follows.
   int      snake_high_score;
 
-  uint32_t padding[6];  // Reduced padding to accommodate new fields
+  uint32_t padding[5];  // Reduced padding to accommodate new fields
 
   int      calib_channel_delta;
   int      calib_dac_zero;
