@@ -1039,6 +1039,11 @@ void capture_set_horizontal_parameters(int sr_divider, int trigger_offset)
   if (g_auto_mode_count < CAPTURE_BUFFER_SIZE)
     g_auto_mode_count = CAPTURE_BUFFER_SIZE;
 
+  // Everything published from here on belongs to the OLD timing until a sweep
+  // completes under the new one - which at the slow end of the timebase is
+  // most of a minute away. See capture_record_fill().
+  g_retime_gen = g_buffer_generation;
+
   update_trigger_handler();
 
   if (!g_stopped)
@@ -1064,11 +1069,6 @@ void capture_set_trigger_edge(int edge)
   dma_stop();
 
   g_trigger_edge = edge;
-
-  // Everything published from here on belongs to the OLD timing until a sweep
-  // completes under the new one - which at the slow end of the timebase is
-  // most of a minute away. See capture_record_fill().
-  g_retime_gen = g_buffer_generation;
 
   update_trigger_handler();
 
