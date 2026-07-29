@@ -17,6 +17,11 @@
 
 /*- Definitions -------------------------------------------------------------*/
 #define SHIFT_DOUBLE_CLICK_MS   500
+
+// Holding SHIFT on its own this long latches it, and it stays on until it is
+// tapped again. Well clear of the 250 ms it takes auto-repeat to start, so a
+// key held down deliberately still gets its repeats before anything latches.
+#define SHIFT_HOLD_LOCK_MS      700
 #define REMAP_KEY_COUNT         11
 #define KEY_MAPPING_SLOTS       ((int)(sizeof(config.key_mapping) / \
                                        sizeof(config.key_mapping[0])))
@@ -28,15 +33,20 @@
 #define SHIFT_FLAG_X            280
 #define SHIFT_FLAG_Y            4
 #define SHIFT_FLAG_W            8
-#define SHIFT_FLAG_H            8
+#define SHIFT_FLAG_H            10
+#define SHIFT_FLAG_BAR_ROW      8
 #define SHIFT_FLAG_COLOR        LCD_COLOR(255, 200, 0)
 #define SHIFT_FLAG_REFRESH_MS   100
 
 /*- Constants ---------------------------------------------------------------*/
-// Shift arrow, one bit per pixel, MSB leftmost
+// Shift arrow, one bit per pixel, MSB leftmost. The last two rows are the lock
+// bar, drawn only while shift is latched: the bare arrow is one key's worth of
+// shift, the underlined arrow is shift until it is switched off, and the two
+// have to be told apart at a glance because they end very differently.
 static const uint8_t g_shift_glyph[SHIFT_FLAG_H] =
 {
   0x18, 0x3c, 0x7e, 0xff, 0x3c, 0x3c, 0x3c, 0x00,
+  0xff, 0xff,
 };
 
 /*- Variables ---------------------------------------------------------------*/
@@ -44,7 +54,11 @@ static struct
 {
   bool active;      // armed, waiting for the key it applies to
   bool held;        // that key is down; keep shifting it until it is released
+  bool locked;      // latched by a long hold; every key is shifted until a tap
   bool down;        // SHIFT itself is down, so a repeat event is not a new tap
+  bool lock_hold;   // the latch came from the hold that is still in progress
+  bool no_lock;     // this hold cleared a latch and must not put one back
+  uint32_t press_at;
   uint32_t last_tap;
   uint32_t taps;
 } g_shift;
@@ -250,8 +264,10 @@ static uint32_t key_remapping_translate(uint32_t buttons)
 }
 
 //-----------------------------------------------------------------------------
-// Double-click on SHIFT arms sticky shift; the next regular key press gets
-// BTN_SHIFT OR-ed in and disarms it. Another double-click cancels.
+// Two ways to get shift without holding it, and they end differently:
+//
+//   double click  arms it for one key, then it is gone      (shift_mode_enabled)
+//   long hold     latches it until SHIFT is tapped again    (shift_hold_lock)
 //
 // What arrives here is the whole debounced key state, not one key event, so an
 // ordinary SHIFT+key chord also has the SHIFT bit set, and so does the event
@@ -261,39 +277,80 @@ static uint32_t key_remapping_translate(uint32_t buttons)
 // Only a solo tap of SHIFT, with a release before it, counts.
 static void shift_mode_track(int buttons)
 {
-  if (!config.shift_mode_enabled)
+  uint32_t now = timer_ms();
+
+  if (!config.shift_mode_enabled && !config.shift_hold_lock)
   {
-    g_shift.active = false;
-    g_shift.held = false;
+    shift_mode_reset();
     g_shift.down = false;
     g_shift.taps = 0;
     return;
   }
-
-  if (buttons & BTN_REPEAT)
-    return; // auto-repeat of a held key, not a new press
 
   if (!(buttons & BTN_SHIFT))
   {
     g_shift.down = false;
+    g_shift.lock_hold = false;
+    g_shift.no_lock = false;
     return;
   }
 
-  // SHIFT held together with something else is a plain chord, and it voids
-  // whatever double click was in progress
+  // SHIFT held together with something else is a plain chord. It voids
+  // whatever double click was in progress, and takes back a latch this same
+  // hold had just produced: dwelling on SHIFT before pressing the other key is
+  // how a chord is normally typed, and it must not leave shift stuck on.
   if (buttons & ~(BTN_SHIFT | BTN_REPEAT))
   {
     g_shift.down = true;
     g_shift.taps = 0;
+    g_shift.no_lock = true; // and it may not latch again before it is released
+
+    if (g_shift.lock_hold)
+    {
+      g_shift.locked = false;
+      g_shift.lock_hold = false;
+    }
+
     return;
   }
 
+  // SHIFT on its own, still down - the press was seen already, this is either
+  // an auto-repeat or the event that reported another key going up. Time it:
+  // past the threshold the hold latches.
   if (g_shift.down)
-    return; // same press, seen again because another key went up
+  {
+    if (config.shift_hold_lock && !g_shift.locked && !g_shift.no_lock &&
+        now - g_shift.press_at >= SHIFT_HOLD_LOCK_MS)
+    {
+      g_shift.locked = true;
+      g_shift.lock_hold = true;
+      g_shift.active = false;
+      g_shift.held = false;
+      g_shift.taps = 0;
+    }
 
+    return;
+  }
+
+  // A new press of SHIFT, alone
   g_shift.down = true;
+  g_shift.press_at = now;
+  g_shift.lock_hold = false;
+  g_shift.no_lock = false;
 
-  uint32_t now = timer_ms();
+  // A latch is released by tapping SHIFT, and that tap is not also the first
+  // half of a double click. no_lock keeps the same press from latching again
+  // the moment it crosses the threshold.
+  if (g_shift.locked)
+  {
+    g_shift.locked = false;
+    g_shift.no_lock = true;
+    g_shift.taps = 0;
+    return;
+  }
+
+  if (!config.shift_mode_enabled)
+    return;
 
   if (g_shift.taps && now - g_shift.last_tap < SHIFT_DOUBLE_CLICK_MS)
   {
@@ -321,6 +378,16 @@ int input_translate(int buttons)
   buttons = key_remapping_translate(buttons);
 
   int keys = buttons & ~(BTN_SHIFT | BTN_REPEAT);
+
+  // A latch is shift on the keyboard, not shift on the next key: everything
+  // gets it, repeats included, until it is switched off again
+  if (g_shift.locked)
+  {
+    if (keys)
+      buttons |= BTN_SHIFT;
+
+    return buttons;
+  }
 
   // Arming applies to one key, but for as long as that key stays down: the
   // repeats have to carry SHIFT too, or holding the key would act shifted once
@@ -350,10 +417,18 @@ bool shift_mode_is_active(void)
 }
 
 //-----------------------------------------------------------------------------
+bool shift_mode_is_locked(void)
+{
+  return g_shift.locked;
+}
+
+//-----------------------------------------------------------------------------
 void shift_mode_reset(void)
 {
   g_shift.active = false;
   g_shift.held = false;
+  g_shift.locked = false;
+  g_shift.lock_hold = false;
 }
 
 //-----------------------------------------------------------------------------
@@ -362,17 +437,16 @@ void shift_mode_reset(void)
 // it needs and expects to find them that way next time, and this runs between
 // their frames. The badge used to set the small font and a red background here
 // and never put them back, which is what made the fonts fall apart everywhere.
-static void shift_flag_blit(int fg)
+static void shift_flag_blit(int fg, bool bar)
 {
   uint16_t buf[SHIFT_FLAG_W * SHIFT_FLAG_H];
 
   for (int y = 0; y < SHIFT_FLAG_H; y++)
   {
+    int row = (!bar && y >= SHIFT_FLAG_BAR_ROW) ? 0 : g_shift_glyph[y];
+
     for (int x = 0; x < SHIFT_FLAG_W; x++)
-    {
-      buf[y * SHIFT_FLAG_W + x] =
-          (g_shift_glyph[y] & (0x80 >> x)) ? fg : LCD_BLACK_COLOR;
-    }
+      buf[y * SHIFT_FLAG_W + x] = (row & (0x80 >> x)) ? fg : LCD_BLACK_COLOR;
   }
 
   lcd_draw_buf(SHIFT_FLAG_X, SHIFT_FLAG_Y, SHIFT_FLAG_W, SHIFT_FLAG_H, buf);
@@ -381,28 +455,35 @@ static void shift_flag_blit(int fg)
 //-----------------------------------------------------------------------------
 void shift_mode_task(void)
 {
-  static bool was_active = false;
+  static bool was_shown = false;
+  static bool was_locked = false;
   static uint32_t last_draw = 0;
 
-  if (g_shift.active)
+  bool shown = g_shift.active || g_shift.locked;
+
+  if (shown)
   {
     uint32_t now = timer_ms();
 
     // Refresh at 10 Hz so the flag survives screen repaints without
-    // bit-banging the LCD on every main loop pass
-    if (!was_active || now - last_draw >= SHIFT_FLAG_REFRESH_MS)
+    // bit-banging the LCD on every main loop pass. A change of state does not
+    // wait for the tick: the bar going up is the whole feedback that the hold
+    // has taken, and it has to land while the key is still down.
+    if (!was_shown || g_shift.locked != was_locked ||
+        now - last_draw >= SHIFT_FLAG_REFRESH_MS)
     {
-      shift_flag_blit(SHIFT_FLAG_COLOR);
+      shift_flag_blit(SHIFT_FLAG_COLOR, g_shift.locked);
       last_draw = now;
     }
   }
-  else if (was_active)
+  else if (was_shown)
   {
     // Erase to black, the same background the battery block next door paints
     // its own interior on. The slot belongs to the status corner and no screen
     // draws in it, so there is nothing underneath to restore.
-    shift_flag_blit(LCD_BLACK_COLOR);
+    shift_flag_blit(LCD_BLACK_COLOR, false);
   }
 
-  was_active = g_shift.active;
+  was_shown = shown;
+  was_locked = g_shift.locked;
 }

@@ -6656,6 +6656,7 @@ int main(void)
   printf("sticky shift:\n");
   {
     config.shift_mode_enabled = true;
+    config.shift_hold_lock = false; // the double click on its own
     config.key_remapping_enabled = false;
     g_input_now = 0;
     input_init();
@@ -6736,6 +6737,121 @@ int main(void)
     g_input_now += 60;   input_translate(0);
     check_near("nothing arms while the feature is off",
         shift_mode_is_active(), 0, 0);
+  }
+
+  // ========================== shift hold lock ===========================
+  //
+  // The other way in: hold SHIFT on its own and it latches, and then stays on
+  // for every key until SHIFT is tapped again. The hold is timed off the
+  // auto-repeat events, so the cases below feed them the way buttons.c does.
+  printf("shift hold lock:\n");
+  {
+    config.shift_mode_enabled = true;
+    config.shift_hold_lock = true;
+    config.key_remapping_enabled = false;
+    g_input_now = 0;
+    input_init();
+
+    // A short hold is just a tap
+    g_input_now += 10;   input_translate(BTN_SHIFT);
+    g_input_now += 250;  input_translate(BTN_SHIFT | BTN_REPEAT);
+    g_input_now += 100;  input_translate(0);
+    check_near("a short hold does not latch", shift_mode_is_locked(), 0, 0);
+
+    // Past the threshold it does, while the key is still down
+    g_input_now += 1000; input_translate(BTN_SHIFT);
+    g_input_now += 250;  input_translate(BTN_SHIFT | BTN_REPEAT);
+    check_near("not yet at 250 ms", shift_mode_is_locked(), 0, 0);
+    g_input_now += 500;  input_translate(BTN_SHIFT | BTN_REPEAT);
+    check_near("latched at 750 ms", shift_mode_is_locked(), 1, 0);
+    g_input_now += 100;  input_translate(0);
+    check_near("and it survives the release", shift_mode_is_locked(), 1, 0);
+
+    // Latched means every key, and every repeat of it
+    g_input_now += 100;
+    check_near("first key shifted",
+        (input_translate(BTN_UP) & BTN_SHIFT) != 0, 1, 0);
+    g_input_now += 100;
+    check_near("its repeat too",
+        (input_translate(BTN_UP | BTN_REPEAT) & BTN_SHIFT) != 0, 1, 0);
+    g_input_now += 100;  input_translate(0);
+    g_input_now += 100;
+    check_near("and the key after it",
+        (input_translate(BTN_LEFT) & BTN_SHIFT) != 0, 1, 0);
+    g_input_now += 100;  input_translate(0);
+    check_near("still latched", shift_mode_is_locked(), 1, 0);
+
+    // A tap switches it off
+    g_input_now += 100;  input_translate(BTN_SHIFT);
+    check_near("a tap releases the latch", shift_mode_is_locked(), 0, 0);
+
+    // ...and holding that same press on must not put it straight back
+    g_input_now += 800;  input_translate(BTN_SHIFT | BTN_REPEAT);
+    check_near("the releasing hold does not re-latch",
+        shift_mode_is_locked(), 0, 0);
+    g_input_now += 100;  input_translate(0);
+
+    g_input_now += 1000;
+    check_near("the next key is unshifted",
+        !(input_translate(BTN_UP) & BTN_SHIFT), 1, 0);
+    g_input_now += 50;   input_translate(0);
+
+    // Dwelling on SHIFT before the other key of a chord is how a chord gets
+    // typed; the latch it crossed on the way has to be taken back
+    g_input_now += 1000; input_translate(BTN_SHIFT);
+    g_input_now += 800;  input_translate(BTN_SHIFT | BTN_REPEAT);
+    check_near("the slow chord latched on the way",
+        shift_mode_is_locked(), 1, 0);
+    g_input_now += 100;
+    check_near("the chord itself is shifted",
+        (input_translate(BTN_SHIFT | BTN_LEFT) & BTN_SHIFT) != 0, 1, 0);
+    check_near("and it takes the latch back", shift_mode_is_locked(), 0, 0);
+    g_input_now += 100;  input_translate(BTN_SHIFT);
+    g_input_now += 100;  input_translate(0);
+    g_input_now += 1000;
+    check_near("so nothing is left shifted",
+        !(input_translate(BTN_UP) & BTN_SHIFT), 1, 0);
+    g_input_now += 50;   input_translate(0);
+
+    // The double click still means one key, not a latch
+    g_input_now += 1000; input_translate(BTN_SHIFT);
+    g_input_now += 60;   input_translate(0);
+    g_input_now += 60;   input_translate(BTN_SHIFT);
+    g_input_now += 60;   input_translate(0);
+    check_near("double click arms", shift_mode_is_active(), 1, 0);
+    check_near("but does not latch", shift_mode_is_locked(), 0, 0);
+    g_input_now += 100;  input_translate(BTN_LEFT);
+    g_input_now += 100;  input_translate(0);
+    g_input_now += 100;
+    check_near("and it is spent after that key",
+        !(input_translate(BTN_UP) & BTN_SHIFT), 1, 0);
+    g_input_now += 50;   input_translate(0);
+
+    // Each half switches off on its own
+    config.shift_hold_lock = false;
+    g_input_now += 1000; input_translate(BTN_SHIFT);
+    g_input_now += 800;  input_translate(BTN_SHIFT | BTN_REPEAT);
+    g_input_now += 100;  input_translate(0);
+    check_near("no latch with the hold off", shift_mode_is_locked(), 0, 0);
+
+    config.shift_hold_lock = true;
+    config.shift_mode_enabled = false;
+    g_input_now += 1000; input_translate(BTN_SHIFT);
+    g_input_now += 60;   input_translate(0);
+    g_input_now += 60;   input_translate(BTN_SHIFT);
+    g_input_now += 60;   input_translate(0);
+    check_near("no double click with the sticky off",
+        shift_mode_is_active(), 0, 0);
+    g_input_now += 1000; input_translate(BTN_SHIFT);
+    g_input_now += 800;  input_translate(BTN_SHIFT | BTN_REPEAT);
+    check_near("the hold still latches", shift_mode_is_locked(), 1, 0);
+    g_input_now += 100;  input_translate(0);
+
+    // Both off: whatever was latched goes with them
+    config.shift_hold_lock = false;
+    g_input_now += 100;  input_translate(BTN_SHIFT);
+    check_near("both off clears the latch", shift_mode_is_locked(), 0, 0);
+    g_input_now += 100;  input_translate(0);
   }
 
   // ============================= key remap ==============================

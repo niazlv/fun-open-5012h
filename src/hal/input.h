@@ -43,7 +43,8 @@ void     key_remap_reset(void);
 bool     key_remap_is_default(void);
 
 void shift_mode_task(void);
-bool shift_mode_is_active(void);
+bool shift_mode_is_active(void); // armed by a double click, for one key
+bool shift_mode_is_locked(void); // latched by a long hold, until tapped off
 void shift_mode_reset(void);
 
 #endif // _INPUT_H_
