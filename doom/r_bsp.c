@@ -196,15 +196,38 @@ static void R_ClipPassWallSegment(int first, int last)
 }
 
 //-----------------------------------------------------------------------------
+// The original reads this out of viewangletox, a 4096-entry table. That table
+// is 8 KB and it is the inverse of xtoviewangle, which is 321 entries and has
+// to be in the pack anyway - so the pack ships only the small one and the
+// answer is searched for instead. Nine iterations, twice per visible seg, and
+// the packer proves the two tables agree entry for entry before it writes one
+// (check_va2x_derivable in tools/wadpack.py).
+//
+// The search works on xtoviewangle[x] being the first fine angle that reaches
+// column x, which makes its angle index non-increasing in x: the leftmost
+// column whose index is at or below `i` is the column angle `a` lands on. An
+// angle off the left edge answers no column, and the loop ends at SCREENWIDTH,
+// which is where the original's clamp put it too.
 static inline int angle_to_x(angle_t a)
 {
     unsigned i = (a + ANG90) >> ANGLETOFINESHIFT;
+    int lo = 0, hi = SCREENWIDTH;
 
-    // The clipped angle can land exactly one past the end of the table
+    // The clipped angle can land exactly one past the end of the fine angles
     if (i > 4095)
         i = 4095;
 
-    return dt_viewangletox[i];
+    while (lo < hi)
+    {
+        int mid = (lo + hi) >> 1;
+
+        if (((dt_xtoviewangle[mid] + ANG90) >> ANGLETOFINESHIFT) <= i)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+
+    return lo;
 }
 
 //-----------------------------------------------------------------------------

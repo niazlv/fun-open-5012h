@@ -298,7 +298,8 @@ extern const uint8_t *dt_colormap;      // 32 * 256
 extern const int32_t *dt_sinq;          // quarter sine wave, 2048
 extern const int32_t *dt_tanh;          // positive half of finetangent, 2048
 extern const uint32_t *dt_tantoangle;   // 2049
-extern const int16_t *dt_viewangletox;  // 4096
+// No viewangletox: r_bsp.c searches xtoviewangle for it rather than spend
+// 8 KB of the image on its inverse
 extern const uint32_t *dt_xtoviewangle; // SCREENWIDTH + 1
 extern const int32_t *dt_yslope;        // SCREENHEIGHT
 extern const int32_t *dt_distscale;     // SCREENWIDTH
@@ -344,6 +345,12 @@ void w_stream_init(w_stream_read_t read, void *ctx, uint8_t *cache,
 // the column cache lives and where the flats may be held.
 bool doom_assets_stream(const void *dir, w_stream_read_t read, void *ctx,
     uint8_t *cache, uint8_t *flats, uint32_t flats_size);
+
+// Where a section of that same pack sits, for a caller that reads it itself
+// rather than through the column cache. False if this pack has no such
+// section, which a whole pack legitimately does not.
+bool doom_stream_find(const void *dir, const char *name, uint32_t *offset,
+    uint32_t *size);
 const uint8_t *w_column(uint32_t offset);
 uint32_t w_stream_fetches(void);
 void w_stream_reset_stats(void);

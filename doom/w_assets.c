@@ -57,7 +57,6 @@ const uint8_t *dt_colormap;
 const int32_t *dt_sinq;
 const int32_t *dt_tanh;
 const uint32_t *dt_tantoangle;
-const int16_t *dt_viewangletox;
 const uint32_t *dt_xtoviewangle;
 const int32_t *dt_yslope;
 const int32_t *dt_distscale;
@@ -197,7 +196,6 @@ bool doom_assets_init(const void *blob, uint8_t *cache)
     dt_sinq         = require("SINQ");
     dt_tanh         = require("TANH");
     dt_tantoangle   = require("TANTOANGLE");
-    dt_viewangletox = require("VIEWANGLETOX");
     dt_xtoviewangle = require("XTOVIEWANGLE");
     dt_yslope       = require("YSLOPE");
     dt_distscale    = require("DISTSCALE");
@@ -207,7 +205,7 @@ bool doom_assets_init(const void *blob, uint8_t *cache)
     g_info = require("LEVELINFO");
 
     if (!dt_palette || !dt_colormap || !dt_sinq || !dt_tanh || !dt_tantoangle ||
-        !dt_viewangletox || !dt_xtoviewangle || !dt_yslope || !dt_distscale ||
+        !dt_xtoviewangle || !dt_yslope || !dt_distscale ||
         !dt_scalelight || !dt_zlight || !g_info)
         return false;
 
@@ -341,6 +339,40 @@ bool doom_assets_stream(const void *dir, w_stream_read_t read, void *ctx,
     w_stream_init(read, ctx, cache, tex->offset, tex->size);
 
     return true;
+}
+
+//-----------------------------------------------------------------------------
+// A section of the streamed pack, by name, as an offset rather than a pointer -
+// nothing on the chip has an address. The caller already holds the header and
+// directory it passed to doom_assets_stream(); this walks that same buffer, so
+// there is no second bus read and no state kept here.
+//
+// Returns false for a section this pack does not carry, which is not an error:
+// a whole pack keeps the HUD lumps in the image, and the caller falls back to
+// reading them straight out of it.
+bool doom_stream_find(const void *dir, const char *name, uint32_t *offset,
+    uint32_t *size)
+{
+    const blob_header_t *hdr = (const blob_header_t *)dir;
+    const blob_entry_t *ents;
+
+    if (NULL == dir || BLOB_MAGIC != hdr->magic || 1 != hdr->version)
+        return false;
+
+    ents = (const blob_entry_t *)((const uint8_t *)dir + hdr->dir_offset);
+
+    for (unsigned i = 0; i < hdr->count; i++)
+    {
+        if (0 == strncmp(ents[i].name, name, NAME_LEN))
+        {
+            *offset = ents[i].offset;
+            *size = ents[i].size;
+
+            return true;
+        }
+    }
+
+    return false;
 }
 
 //-----------------------------------------------------------------------------

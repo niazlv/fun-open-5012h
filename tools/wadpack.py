@@ -313,6 +313,41 @@ def gen_projection(width, height, fov_deg):
     return focal_length, center_y, viewangletox, xtoviewangle, yslope, distscale
 
 
+def check_va2x_derivable(viewangletox, xtoviewangle, width):
+    """viewangletox is not packed: it is 8 KB, and r_bsp.c gets the same answer
+    out of xtoviewangle, which is 321 entries and already in the pack.
+
+    That works because viewangletox is non-increasing in the fine angle and
+    xtoviewangle[x] is the first angle reaching column x, so the smallest x
+    whose angle index is at or below i is exactly viewangletox[i]. The one gap
+    is the clamp above: angles off the left edge were width + 1 before it, and
+    no column answers for them, so a search that runs off the end returns
+    width - which is what the clamp wrote.
+
+    Whether that identity holds depends on the projection, so it is checked
+    against the table rather than trusted. A break would clip walls one column
+    out, which is the kind of thing that looks like a texture bug for a week."""
+    def angle_index(x):
+        return ((xtoviewangle[x] + ANG90) & 0xFFFFFFFF) >> 19
+
+    for i, want in enumerate(viewangletox):
+        lo, hi = 0, width
+
+        while lo < hi:
+            mid = (lo + hi) // 2
+
+            if angle_index(mid) <= i:
+                hi = mid
+            else:
+                lo = mid + 1
+
+        if lo != want:
+            raise SystemExit(
+                "viewangletox[%d] is %d, but searching xtoviewangle gives %d. "
+                "r_bsp.c derives the table instead of reading it, so the pack "
+                "cannot be used." % (i, want, lo))
+
+
 LIGHTLEVELS = 16
 LIGHTSEGSHIFT = 4
 MAXLIGHTSCALE = 48
@@ -580,7 +615,8 @@ def main():
     focal, centery, va2x, x2va, yslope, distscale = gen_projection(
         args.width, args.height, args.fov)
 
-    blob.add("VIEWANGLETOX", struct.pack("<%dh" % len(va2x), *va2x))
+    # VIEWANGLETOX is deliberately absent - see check_va2x_derivable
+    check_va2x_derivable(va2x, x2va, args.width)
     blob.add("XTOVIEWANGLE", struct.pack("<%dI" % len(x2va), *x2va))
     blob.add("YSLOPE", struct.pack("<%di" % len(yslope), *yslope))
     blob.add("DISTSCALE", struct.pack("<%di" % len(distscale), *distscale))
@@ -798,9 +834,11 @@ def main():
 
     if args.split:
         # TEXDATA is fetched a column at a time and FLATS is loaded whole at
-        # map load; everything else is read at random on every pixel and every
-        # step of the BSP walk, so it has to stay addressable.
-        core, tex = blob.split({"TEXDATA", "FLATS"})
+        # map load; the status bar and its digits are drawn a few times a
+        # second at most. Everything else is read at random on every pixel and
+        # every step of the BSP walk, so it has to stay addressable.
+        core, tex = blob.split({"TEXDATA", "FLATS",
+                                "STBAR", "STNUMDIR", "STNUMS"})
         data = core.build()
         tex_data = tex.build()
         tex_path = os.path.splitext(args.output)[0] + "_tex.bin"

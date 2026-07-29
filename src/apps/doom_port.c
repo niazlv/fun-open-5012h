@@ -67,6 +67,7 @@ _Static_assert(sizeof(doom_mem_t) <= DOOM_RAM_SIZE,
 
 /*- Variables ---------------------------------------------------------------*/
 extern const uint8_t doom_assets[];
+extern const uint32_t doom_assets_size;
 
 // Why the streamed half did not bind, for the screen that says so
 static const char *g_stream_error;
@@ -90,7 +91,16 @@ static int g_health = 100;
 static int g_armor;
 static int g_ammo = 50;
 
+// The half of the pack that is on the chip: the file, and its header and
+// directory. Bound by bind_streamed_pack() and kept, because the status bar
+// reads from it long after that has returned.
+static const spifs_file_t *g_texfile;
+static uint8_t g_texdir[256];
+
 /*- Status bar --------------------------------------------------------------*/
+#define ST_GLYPHS           11      // the ten digits and the percent sign
+#define ST_GLYPH_MAX        288     // 14x16 pixels plus its 28-byte mask
+
 typedef struct
 {
     uint8_t w, h;
@@ -98,12 +108,28 @@ typedef struct
     uint16_t pad;
 } st_glyph_t;
 
-static const uint8_t *g_stbar;
-static const st_glyph_t *g_stnumdir;
-static const uint8_t *g_stnums;
+// The bar and the digits are 13 KB, an eighth of what the pack costs the image,
+// for something drawn a few times a second - so a split pack keeps them on the
+// SPI part with the textures. A whole pack still has them in the image, and
+// both are read through hud_lump_t rather than through two versions of every
+// draw: `mem` is set for one, `off` into the streamed pack for the other.
+typedef struct
+{
+    const uint8_t *mem;
+    uint32_t off;
+    uint32_t size;
+} hud_lump_t;
+
+static hud_lump_t g_stbar;
+static hud_lump_t g_stnums;
+static st_glyph_t g_stnumdir[ST_GLYPHS];
+static bool g_hud;
 
 // One number field at a time, composited here and pushed in a single transfer
 static uint8_t g_stbuf[3 * 16 * 16];
+
+// One glyph at a time, on its way out of the lump: pixels then mask
+static uint8_t g_glyphbuf[ST_GLYPH_MAX];
 
 /*- Implementations ---------------------------------------------------------*/
 
@@ -143,13 +169,41 @@ static void build_ticcmd(ticcmd_t *cmd, int buttons)
 }
 
 //-----------------------------------------------------------------------------
+// Out of a HUD lump and into `dst`, from wherever that lump turned out to live.
+// The bounds check is here rather than at each call site because on the SPI
+// path a bad offset is a read of some other file rather than a fault, which
+// would draw plausible garbage instead of saying anything.
+static bool hud_read(const hud_lump_t *lump, uint32_t off, void *dst,
+    uint32_t size)
+{
+    if (off > lump->size || size > lump->size - off)
+        return false;
+
+    if (lump->mem)
+    {
+        memcpy(dst, lump->mem + off, size);
+        return true;
+    }
+
+    return NULL != g_texfile &&
+        spifs_read(g_texfile, lump->off + off, (uint8_t *)dst, size);
+}
+
+//-----------------------------------------------------------------------------
 // A digit, over whatever the bar already had there. The mask is what makes the
 // glyph's own background transparent.
 static void st_glyph(int gx, int index, int fieldw, int fieldh)
 {
     const st_glyph_t *g = &g_stnumdir[index];
-    const uint8_t *pixels = g_stnums + g->offset;
-    const uint8_t *mask = pixels + g->w * g->h;
+    unsigned npix = (unsigned)g->w * g->h;
+    const uint8_t *pixels = g_glyphbuf;
+    const uint8_t *mask = g_glyphbuf + npix;
+
+    if (npix + ((npix + 7) >> 3) > sizeof(g_glyphbuf))
+        return;
+
+    if (!hud_read(&g_stnums, g->offset, g_glyphbuf, npix + ((npix + 7) >> 3)))
+        return;
 
     for (int y = 0; y < g->h && y < fieldh; y++)
     {
@@ -177,11 +231,18 @@ static void st_number(int xright, int digits, int value)
     int x0 = xright - fieldw;
     int x = fieldw;
 
-    if (NULL == g_stbar || 0 == w)
+    if (!g_hud || 0 == w || fieldw * h > (int)sizeof(g_stbuf))
         return;
 
+    // The field's own slice of the bar, which is what the glyphs sit on. A row
+    // at a time, because the bar is stored whole and only this window of it is
+    // wanted - 16 short reads, and only when one of the numbers has changed.
     for (int r = 0; r < h; r++)
-        memcpy(g_stbuf + r * fieldw, g_stbar + (ST_NUMY + r) * SCREENWIDTH + x0, fieldw);
+    {
+        if (!hud_read(&g_stbar, (ST_NUMY + r) * SCREENWIDTH + x0,
+                g_stbuf + r * fieldw, fieldw))
+            return;
+    }
 
     if (0 == value)
     {
@@ -202,20 +263,36 @@ static void st_number(int xright, int digits, int value)
 }
 
 //-----------------------------------------------------------------------------
+// Four rows at a time rather than the whole 10 KB bar in one transfer: on a
+// split pack it is not in the address space to hand to the display, and this
+// runs once per redraw, so eight transfers instead of one costs nothing worth
+// the stack a full-height buffer would take.
+#define ST_CHUNK            4
+
 static void draw_statusbar(void)
 {
-    if (g_stbar)
-    {
-        lcd_draw_indexed(0, ST_Y, SCREENWIDTH, ST_H, g_stbar, dt_palette);
+    uint8_t rows[ST_CHUNK * SCREENWIDTH];
 
-        st_number(ST_AMMOX, 3, g_ammo);
-        st_number(ST_HEALTHX, 3, g_health);
-        st_number(ST_ARMORX, 3, g_armor);
-    }
-    else
+    if (!g_hud)
     {
         lcd_fill_rect(0, ST_Y, LCD_WIDTH, ST_H, HUD_BG);
+        return;
     }
+
+    for (int y = 0; y < ST_H; y += ST_CHUNK)
+    {
+        if (!hud_read(&g_stbar, y * SCREENWIDTH, rows, sizeof(rows)))
+        {
+            lcd_fill_rect(0, ST_Y + y, LCD_WIDTH, ST_H - y, HUD_BG);
+            return;
+        }
+
+        lcd_draw_indexed(0, ST_Y + y, SCREENWIDTH, ST_CHUNK, rows, dt_palette);
+    }
+
+    st_number(ST_AMMOX, 3, g_ammo);
+    st_number(ST_HEALTHX, 3, g_health);
+    st_number(ST_ARMORX, 3, g_armor);
 }
 
 //-----------------------------------------------------------------------------
@@ -269,7 +346,10 @@ static void draw_stats(bool force)
 // the pack and the firmware then runs perfectly without it.
 static void draw_no_assets(void)
 {
-    const char *why = doom_assets_error();
+    // The streamed half is asked for first and its complaint is the specific
+    // one - "no doom.tex on the SPI flash" rather than the "level data" the
+    // pack reader falls back to when it was never given a reason at all.
+    const char *why = g_stream_error ? g_stream_error : doom_assets_error();
     const uint32_t *words = (const uint32_t *)doom_assets;
     char buf[52];
 
@@ -288,16 +368,23 @@ static void draw_no_assets(void)
         (unsigned long)(uintptr_t)doom_assets, (unsigned long)words[0],
         (unsigned long)words[1], (unsigned long)words[2]);
     lcd_puts(12, 74, buf);
-    lcd_puts(12, 86, "expected  44504b31 00000001 00000019");
+    // The third word is the section count, which changes with the pack
+    lcd_puts(12, 86, "expected  44504b31 00000001 <count>");
 
     if (why && 'f' == why[0])
     {
-        // "flash not written"
+        // "flash not written". The two sizes are read off the image rather
+        // than written down: they moved the day the pack was split, and a
+        // number on a diagnostic screen that is quietly wrong is worse than
+        // no number at all.
         lcd_set_color(LCD_BLACK_COLOR, HUD_HI);
         lcd_puts(12, 110, "Flash reads as erased where the pack");
-        lcd_puts(12, 122, "should be. The image is 362 KB and all");
-        lcd_puts(12, 134, "the code is in its first 162 KB, so a");
-        lcd_puts(12, 146, "short write leaves this exact state.");
+        snprintf(buf, sizeof(buf),
+            "should be. The code is the first %lu KB,",
+            (unsigned long)(((uintptr_t)doom_assets - 0x08000000u) >> 10));
+        lcd_puts(12, 122, buf);
+        lcd_puts(12, 134, "so a short write leaves this exact");
+        lcd_puts(12, 146, "state.");
         lcd_set_color(LCD_BLACK_COLOR, HUD_FG);
         lcd_puts(12, 166, "Reflash the whole open-5012h.bin and");
         lcd_puts(12, 178, "let the programmer verify it.");
@@ -305,12 +392,15 @@ static void draw_no_assets(void)
     else
     {
         lcd_set_color(LCD_BLACK_COLOR, HUD_FG);
-        lcd_puts(12, 110, "The pack is 208 KB of a 384 KB image, so");
-        lcd_puts(12, 122, "builds leave it out unless asked:");
+        snprintf(buf, sizeof(buf),
+            "The pack is %lu KB of the image, and is",
+            (unsigned long)(doom_assets_size >> 10));
+        lcd_puts(12, 110, buf);
+        lcd_puts(12, 122, "left out of a build without one:");
         lcd_set_color(LCD_BLACK_COLOR, HUD_HI);
         lcd_puts(12, 142, "python3 tools/wadpack.py doom1.wad \\");
-        lcd_puts(12, 154, "        -o doom/doom_assets.bin");
-        lcd_puts(12, 166, "cd make && make DOOM=1");
+        lcd_puts(12, 154, "        --split -o doom/doom_assets.bin");
+        lcd_puts(12, 166, "cd make && make");
         lcd_set_color(LCD_BLACK_COLOR, HUD_FG);
         lcd_puts(12, 186, "Any DOOM IWAD works, Freedoom included.");
     }
@@ -352,7 +442,6 @@ static bool spifs_reader(void *ctx, uint32_t offset, uint8_t *dst,
 
 static bool bind_streamed_pack(void)
 {
-    static uint8_t dir[256];
     const spifs_file_t *file;
     uint8_t *cache = (uint8_t *)tcm_borrow_base();
 
@@ -372,14 +461,14 @@ static bool bind_streamed_pack(void)
     }
 
     // The header and directory only, which is all doom_assets_stream needs to
-    // find the two lumps in it
-    if (!spifs_read(file, 0, dir, sizeof(dir)))
+    // find the lumps in it - and all bind_hud() needs later
+    if (!spifs_read(file, 0, g_texdir, sizeof(g_texdir)))
     {
         g_stream_error = "SPI read failed";
         return false;
     }
 
-    if (!doom_assets_stream(dir, spifs_reader, (void *)file, cache,
+    if (!doom_assets_stream(g_texdir, spifs_reader, (void *)file, cache,
             cache + W_STREAM_CACHE_SIZE,
             tcm_borrow_size() - W_STREAM_CACHE_SIZE))
     {
@@ -387,7 +476,60 @@ static bool bind_streamed_pack(void)
         return false;
     }
 
+    g_texfile = file;
+
     return true;
+}
+
+//-----------------------------------------------------------------------------
+// One HUD lump, wherever this pack put it: in the image for a whole pack, on
+// the chip for a split one. Everything that draws the bar goes through
+// hud_read() afterwards and never learns which it was.
+static bool bind_lump(const char *name, hud_lump_t *lump)
+{
+    int size = 0;
+    const void *mem = doom_asset_find(name, &size);
+    uint32_t off, len;
+
+    if (mem)
+    {
+        lump->mem = (const uint8_t *)mem;
+        lump->off = 0;
+        lump->size = size;
+
+        return true;
+    }
+
+    if (!doom_stream_find(g_texdir, name, &off, &len))
+        return false;
+
+    lump->mem = NULL;
+    lump->off = off;
+    lump->size = len;
+
+    return true;
+}
+
+//-----------------------------------------------------------------------------
+// A pack built from a WAD without STBAR has no bar at all, and the screen it
+// draws instead is a plain filled strip - so this failing is not fatal, and
+// the sizes are checked here rather than trusted at each draw.
+static void bind_hud(void)
+{
+    hud_lump_t dir;
+
+    g_hud = false;
+
+    if (!bind_lump("STBAR", &g_stbar) || !bind_lump("STNUMS", &g_stnums) ||
+        !bind_lump("STNUMDIR", &dir))
+        return;
+
+    // The directory is 66 bytes and every glyph draw wants it, so it is the
+    // one HUD lump held rather than read
+    if (dir.size > sizeof(g_stnumdir) || !hud_read(&dir, 0, g_stnumdir, dir.size))
+        return;
+
+    g_hud = g_stbar.size >= SCREENWIDTH * ST_H && 0 != g_stnumdir[0].w;
 }
 
 //-----------------------------------------------------------------------------
@@ -410,9 +552,7 @@ void doom_port_init(void)
         return;
     }
 
-    g_stbar = doom_asset_find("STBAR", NULL);
-    g_stnumdir = doom_asset_find("STNUMDIR", NULL);
-    g_stnums = doom_asset_find("STNUMS", NULL);
+    bind_hud();
 
     R_Init();
     R_InitSegs();
