@@ -888,11 +888,83 @@ void capture_set_horizontal_parameters(int sr_divider, int trigger_offset)
   TIMER0->CTL0 = 0;
   TIMER7->CTL0 = 0;
 
+  // Where in the ADC's period the DMA samples the data bus.
+  //
+  // CAR is 1, so the counter only ever reads 0 or 1 and CH0CV picks which of
+  // the two compare matches raises the request - the two are half a period
+  // apart. CH0CV = 1 matches when the counter becomes 1, which is the SAME
+  // timer instant as ADC B's rising encode edge (CH1 runs inverted, see
+  // ADC_B_CLOCK_MODE), so the bus is read exactly as the converter drives its
+  // new value onto it. The only setup margin is the gap between the two CEN
+  // writes below, a few nanoseconds, and single-channel mode - every timebase
+  // from 100 us/div up - reads ADC B's byte and nothing else.
+  //
+  // CH0CV = 0 matches on the wrap instead, half a period from that
+  // transition, which is as much margin as this counter can express. Same one
+  // match per period either way, so the sample rate is untouched.
+  //
+  // Which of the two is right depends on the PERIOD, because the delay from
+  // the request to the DMA actually reading GPIOD is a fixed number of
+  // nanoseconds while the period is not: half a period is 8 ns at sr 1 and
+  // 16 ns at sr 2, so one setting cannot suit both. Measured on hardware, at
+  // 50 mV/div where the sensitivity shows it worst:
+  //
+  //   sr 0, 8 ns   dual channel   CH0CV 1 clean   (not moved, see below)
+  //   sr 1, 16 ns  100 us/div     CH0CV 1 clean,  CH0CV 0 -> 600-670 mV
+  //   sr 2, 32 ns  200 us/div     CH0CV 1 needles, CH0CV 0 -> 9 mV
+  //   sr 3, 64 ns  500 us/div     either, 4 mV - the converter's own floor
+  //
+  // So the short periods want the match at count 1 and the long ones the
+  // wrap. Two positions is all CAR = 1 can express; if a period ever turns up
+  // that neither suits, the way out is a finer counter on TIMER7 (smaller
+  // PSC, larger CAR, same request rate) and a compare value placed in ns.
+  //
+  // Both positions being half a period apart is also why picking the right
+  // one gets so close to the best there is: the bus transition sits on one of
+  // them, so the other is the farthest point from it the counter can name.
+  //
+  // Before this, with the strobe left on the transition, the failure went by
+  // rate rather than by timebase - 15.625 MS/s clean, needles at 31.25 and
+  // above, worst where a long decimated record made them all visible at once.
+  // What is left now is the converter's own floor, 1-2 counts of a 256 count
+  // range at every attenuator setting, and rare single samples pinned to a
+  // rail.
+  //
+  // Dual channel is never moved. Interleaved acquisition reads BOTH bytes in
+  // one 16-bit snapshot and the pairing of the two converters depends on
+  // where in the period that snapshot falls - it is what the 125 MS/s scan of
+  // a 50-60 MHz input rides on, and one channel alone cannot reach it.
+  TIMER7->CH0CV = (sr_divider <= 1) ? 1 : 0;
+
   TIMER0->PSC = (divider > 63) ? 63 : divider;
   TIMER7->PSC = divider;
 
   TIMER0->CNT = 0;
   TIMER7->CNT = 0;
+
+  // PSC is a shadow register: it reaches the prescaler only on an update
+  // event, and writing CNT is not one. Without this, each timer picks the new
+  // divider up on its OWN first overflow and clears its prescaler counter
+  // there - instants that differ by the gap between the two CEN writes below.
+  // TIMER0 clocks the ADC and TIMER7 strobes the DMA read of GPIOD, and ADC
+  // B's encode edge is nominally the SAME timer instant as that strobe (see
+  // ADC_B_CLOCK_MODE), so the whole setup margin is that gap. A few timer
+  // ticks of slip - 4 ns each - lands the read on the ADC's data-bus
+  // transition and the ring fills with metastable bytes: needles all over the
+  // record, and a trigger that fires on every one of them.
+  //
+  // Which is why it only ever showed at 200 us/div. adc_init() leaves PSC at
+  // 1 and sr_divider 0 and 1 write 1 again - no value change, no re-latch, so
+  // the alignment adc_init() established survives. 200 us/div is sr_divider
+  // 2, the first timebase that actually changes the divider (and the only one
+  // at PSC=3). UPG latches PSC and clears both CNT and the prescaler counter
+  // right here, with the timers stopped, so every timebase starts from the
+  // same known phase - what timer_init() already does for TIMER1.
+  //
+  // Safe to raise while the capture DMA is stopped (dma_stop() above) and
+  // with UPDEN clear: an update event moves no data on either timer.
+  TIMER0->SWEVG = TIMER0_SWEVG_UPG_Msk;
+  TIMER7->SWEVG = TIMER7_SWEVG_UPG_Msk;
 
   TIMER0->CTL0 = TIMER0_CTL0_CEN_Msk;
   TIMER7->CTL0 = TIMER7_CTL0_CEN_Msk;
