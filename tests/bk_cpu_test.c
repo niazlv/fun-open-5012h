@@ -34,6 +34,7 @@
 #include "bk_io.h"
 #include "bk_video.h"
 #include "bk_load.h"
+#include "bk_disasm.h"
 
 /*- The panel, as far as bk_video.c can tell --------------------------------*/
 /*
@@ -698,6 +699,82 @@ static void t_stub_rom(void)
     check_oct("nothing trapped", bk_cpu.last_trap, 0);
 }
 
+/*- Reading it back ---------------------------------------------------------*/
+static void check_text(const char *name, const char *got, const char *want)
+{
+    if (0 == strcmp(got, want))
+    {
+        printf("  PASS %-46s %s\n", name, got);
+    }
+    else
+    {
+        printf("  FAIL %-46s got \"%s\"  want \"%s\"\n", name, got, want);
+        g_failures++;
+    }
+}
+
+//-----------------------------------------------------------------------------
+// One instruction assembled, then read back.
+//
+// The listing is what the fault screen shows and what the debug overlay is,
+// so a disassembler that is confidently wrong is worse than none: it does not
+// look broken, it looks like a different program. The first version of this
+// one read every extension word two bytes late, which turned MOV #1000,SP into
+// MOV #104260,SP and an EMT that was not in the program at all - and nothing
+// noticed, because nothing checked.
+static void t_disasm(void)
+{
+    static const struct
+    {
+        const char *text;
+        int len;
+        uint16_t words[3];
+    } cases[] =
+    {
+        { "MOV  #001000, SP",     4, { 0012706u, 0001000u } },
+        { "MOV  R2, (R0)+",       2, { 0010220u } },
+        { "MOVB #000377, R0",     4, { 0112700u, 0000377u } },
+        { "MOV  @#177664, R0",    4, { 0013700u, 0177664u } },
+        { "MOV  R5, @#177662",    4, { 0010537u, 0177662u } },
+        { "ADD  #000330, R5",     4, { 0062705u, 0000330u } },
+        { "MOV  000010(R1), R0",  4, { 0016100u, 0000010u } },
+        { "CLR  (R0)+",           2, { 0005020u } },
+        { "SOB  R1, 001000",      2, { 0077101u } },
+        { "BEQ  001006",          2, { 0001402u } },
+        { "JSR  PC, @#002000",    4, { 0004737u, 0002000u } },
+        { "RTS  PC",              2, { 0000207u } },
+        { "EMT  007",             2, { 0104007u } },
+        { "MTPS #000000",         4, { 0106427u, 0000000u } },
+        { "HALT",                 2, { 0000000u } },
+        { "NOP",                  2, { 0000240u } },
+        { "SEC",                  2, { 0000261u } },
+        { "XOR  R1, R2",          2, { 0074102u } },
+        { "MOV  001004, R0",      4, { 0016700u, 0000000u } },
+    };
+
+    printf("reading it back:\n");
+
+    reset_machine();
+
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+    {
+        char text[48];
+        int len;
+
+        org(01000);
+
+        for (int k = 0; k < cases[i].len / 2; k++)
+            w(cases[i].words[k]);
+
+        len = bk_disasm(01000, text, sizeof(text));
+
+        check_text(cases[i].text, text, cases[i].text);
+
+        if (len != cases[i].len)
+            check("  ...and its length", len, cases[i].len);
+    }
+}
+
 /*- A program that does something -------------------------------------------*/
 static void t_program(void)
 {
@@ -763,6 +840,9 @@ int main(void)
     printf("\n");
 
     t_program();
+    printf("\n");
+
+    t_disasm();
 
     printf("\n%s (%d failures)\n", g_failures ? "FAILED" : "ALL PASSED",
         g_failures);

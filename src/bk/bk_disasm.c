@@ -63,6 +63,18 @@ static char *put(char *p, const char *end, const char *s)
 }
 
 //-----------------------------------------------------------------------------
+// Spaces up to a column, so the operands line up whatever the mnemonic is.
+// Four-letter names are common enough here - MOVB, SWAB, HALT, MTPS, BLOS -
+// that a fixed two spaces after the name puts half the listing out of step.
+static char *pad_to(char *p, const char *end, const char *buf, int col)
+{
+    while (p < end && (p - buf) < col)
+        *p++ = ' ';
+
+    return p;
+}
+
+//-----------------------------------------------------------------------------
 static char *put_octal(char *p, const char *end, uint32_t value, int digits)
 {
     char tmp[8];
@@ -93,11 +105,22 @@ static char *put_operand(char *p, const char *end, unsigned spec, uint16_t pc,
 {
     unsigned reg = spec & 7;
     unsigned mode = (spec >> 3) & 7;
+
+    /*
+     * *len counts the whole instruction so far, opcode word included, so the
+     * next extension word is at (instruction start + len) - and pc is the
+     * word after the opcode, which is the start plus two.
+     *
+     * Getting this off by one word is not a wrong-looking listing, it is a
+     * confident and completely different one: MOV #1000,SP read two bytes late
+     * disassembles as MOV #104260,SP followed by an EMT that is not there.
+     */
+    uint16_t base = (uint16_t)(pc - 2);
     uint16_t extra = 0;
 
     if (mode >= 6)
     {
-        extra = bk_read16((uint16_t)(pc + *len));
+        extra = bk_read16((uint16_t)(base + *len));
         *len += 2;
     }
 
@@ -115,7 +138,7 @@ static char *put_operand(char *p, const char *end, unsigned spec, uint16_t pc,
         if (7 == reg)
         {
             // #n: the word after the instruction is the value, not a place
-            extra = bk_read16((uint16_t)(pc + *len));
+            extra = bk_read16((uint16_t)(base + *len));
             *len += 2;
             p = put(p, end, "#");
             return put_octal(p, end, extra, 6);
@@ -127,7 +150,7 @@ static char *put_operand(char *p, const char *end, unsigned spec, uint16_t pc,
     case 3:
         if (7 == reg)
         {
-            extra = bk_read16((uint16_t)(pc + *len));
+            extra = bk_read16((uint16_t)(base + *len));
             *len += 2;
             p = put(p, end, "@#");
             return put_octal(p, end, extra, 6);
@@ -154,7 +177,9 @@ static char *put_operand(char *p, const char *end, unsigned spec, uint16_t pc,
             if (7 == mode)
                 p = put(p, end, "@");
 
-            return put_octal(p, end, (uint16_t)(pc + *len + extra), 6);
+            // The counter has passed the index word by the time the operand is
+            // worked out, which is exactly where *len now points
+            return put_octal(p, end, (uint16_t)(base + *len + extra), 6);
         }
 
         if (7 == mode)
@@ -168,11 +193,11 @@ static char *put_operand(char *p, const char *end, unsigned spec, uint16_t pc,
 }
 
 //-----------------------------------------------------------------------------
-static char *put_branch(char *p, const char *end, const char *name, uint16_t op,
-    uint16_t pc)
+static char *put_branch(char *p, const char *end, const char *buf,
+    const char *name, uint16_t op, uint16_t pc)
 {
     p = put(p, end, name);
-    p = put(p, end, "  ");
+    p = pad_to(p, end, buf, 5);
 
     return put_octal(p, end, (uint16_t)(pc + 2 * (int16_t)(int8_t)(op & 0377u)),
         6);
@@ -230,7 +255,7 @@ int bk_disasm(uint16_t addr, char *buf, int size)
         if (top >= 010 && 6 != kind)
             p = put(p, end, "B");
 
-        p = put(p, end, "  ");
+        p = pad_to(p, end, buf, 5);
         p = put_operand(p, end, (op >> 6) & 077u, pc, &len);
         p = put(p, end, ", ");
         p = put_operand(p, end, op & 077u, pc, &len);
@@ -243,7 +268,7 @@ int bk_disasm(uint16_t addr, char *buf, int size)
     if ((op >= 0000400u && op < 0004000u) ||
         (op >= 0100000u && op < 0104000u))
     {
-        p = put_branch(p, end, branch_name(op), op, pc);
+        p = put_branch(p, end, buf, branch_name(op), op, pc);
         *p = 0;
         return 2;
     }
@@ -277,7 +302,7 @@ int bk_disasm(uint16_t addr, char *buf, int size)
             p = put(p, end, n[kind - 12]);
         }
 
-        p = put(p, end, "  ");
+        p = pad_to(p, end, buf, 5);
 
         if (!byteop && 12 == kind)
             p = put_octal(p, end, op & 077u, 2);      // MARK takes a count
@@ -296,14 +321,16 @@ int bk_disasm(uint16_t addr, char *buf, int size)
 
         if (4 == sub)
         {
-            p = put(p, end, "XOR  ");
+            p = put(p, end, "XOR");
+            p = pad_to(p, end, buf, 5);
             p = put(p, end, g_regs[reg]);
             p = put(p, end, ", ");
             p = put_operand(p, end, op & 077u, pc, &len);
         }
         else if (7 == sub)
         {
-            p = put(p, end, "SOB  ");
+            p = put(p, end, "SOB");
+            p = pad_to(p, end, buf, 5);
             p = put(p, end, g_regs[reg]);
             p = put(p, end, ", ");
             p = put_octal(p, end, (uint16_t)(pc - 2 * (op & 077u)), 6);
@@ -316,7 +343,7 @@ int bk_disasm(uint16_t addr, char *buf, int size)
             };
 
             p = put(p, end, n[sub]);
-            p = put(p, end, "  ");
+            p = pad_to(p, end, buf, 5);
             p = put(p, end, g_regs[reg]);
             p = put(p, end, ", ");
             p = put_operand(p, end, op & 077u, pc, &len);
@@ -328,7 +355,8 @@ int bk_disasm(uint16_t addr, char *buf, int size)
 
     if (op >= 0004000u && op < 0005000u)        // JSR
     {
-        p = put(p, end, "JSR  ");
+        p = put(p, end, "JSR");
+        p = pad_to(p, end, buf, 5);
         p = put(p, end, g_regs[(op >> 6) & 7]);
         p = put(p, end, ", ");
         p = put_operand(p, end, op & 077u, pc, &len);
@@ -338,7 +366,8 @@ int bk_disasm(uint16_t addr, char *buf, int size)
 
     if (op >= 0000100u && op < 0000200u)        // JMP
     {
-        p = put(p, end, "JMP  ");
+        p = put(p, end, "JMP");
+        p = pad_to(p, end, buf, 5);
         p = put_operand(p, end, op & 077u, pc, &len);
         *p = 0;
         return len;
@@ -346,7 +375,8 @@ int bk_disasm(uint16_t addr, char *buf, int size)
 
     if (op >= 0000200u && op < 0000210u)        // RTS
     {
-        p = put(p, end, "RTS  ");
+        p = put(p, end, "RTS");
+        p = pad_to(p, end, buf, 5);
         p = put(p, end, g_regs[op & 7]);
         *p = 0;
         return 2;
@@ -354,7 +384,8 @@ int bk_disasm(uint16_t addr, char *buf, int size)
 
     if (op >= 0000300u && op < 0000400u)        // SWAB
     {
-        p = put(p, end, "SWAB ");
+        p = put(p, end, "SWAB");
+        p = pad_to(p, end, buf, 5);
         p = put_operand(p, end, op & 077u, pc, &len);
         *p = 0;
         return len;
@@ -362,7 +393,8 @@ int bk_disasm(uint16_t addr, char *buf, int size)
 
     if (op >= 0104000u && op < 0105000u)        // EMT and TRAP
     {
-        p = put(p, end, (op < 0104400u) ? "EMT  " : "TRAP ");
+        p = put(p, end, (op < 0104400u) ? "EMT" : "TRAP");
+        p = pad_to(p, end, buf, 5);
         p = put_octal(p, end, op & 0377u, 3);
         *p = 0;
         return 2;
@@ -407,7 +439,8 @@ int bk_disasm(uint16_t addr, char *buf, int size)
         return 2;
     }
 
-    p = put(p, end, ".WORD ");
+    p = put(p, end, ".WORD");
+    p = pad_to(p, end, buf, 6);
     p = put_octal(p, end, op, 6);
     *p = 0;
 
