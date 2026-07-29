@@ -551,12 +551,24 @@ static bool info_is_head(const char *line)
 }
 
 //-----------------------------------------------------------------------------
+// One line of a page, however the page supplies them. A generated page owns
+// the storage it hands back and only promises it until the next call, so the
+// result must be used before asking for another - every caller here does.
+static const char *info_line(const info_page_t *page, int index)
+{
+  if (page->line_fn)
+    return page->line_fn(index);
+
+  return page->lines ? page->lines[index] : "";
+}
+
+//-----------------------------------------------------------------------------
 // The heading that line belongs under, -1 if it is above the first one
 static int info_head_at(const info_inst_t *in, int line)
 {
   for (int i = line; i >= 0; i--)
   {
-    if (info_is_head(in->page->lines[i]))
+    if (info_is_head(info_line(in->page, i)))
       return i;
   }
 
@@ -608,7 +620,7 @@ static void info_draw_position(const info_inst_t *in)
 {
   const char *title = in->page->title ? in->page->title : "";
   int head = in->heads ? info_head_at(in, in->top) : -1;
-  const char *name = (head >= 0) ? in->page->lines[head] + 1 : "";
+  const char *name = (head >= 0) ? info_line(in->page, head) + 1 : "";
   int erase_x = INFO_X + (int)strlen(title) * FW_LARGE + 8;
   char buf[8];
 
@@ -636,7 +648,7 @@ static void info_draw_body(const info_inst_t *in)
   lcd_set_color(INFO_BG, INFO_FG);
 
   for (int i = 0; i < in->vis && in->top + i < in->count; i++)
-    info_draw_line(in->page->lines[in->top + i], in->y0 + i * in->line_h);
+    info_draw_line(info_line(in->page, in->top + i), in->y0 + i * in->line_h);
 
   if (in->count > in->vis)
   {
@@ -673,9 +685,6 @@ static void info_draw(void *ctx, bool full)
   }
 
   info_draw_body(in);
-
-  if (p->body)
-    p->body();
 }
 
 //-----------------------------------------------------------------------------
@@ -705,7 +714,7 @@ static void info_jump_section(info_inst_t *in, int dir)
 
   for (i = in->top + dir; i > 0 && i < in->count; i += dir)
   {
-    if (info_is_head(in->page->lines[i]))
+    if (info_is_head(info_line(in->page, i)))
       break;
   }
 
@@ -777,7 +786,8 @@ void menu_open_info(const info_page_t *page)
   info_inst_t *in = &g_info;
 
   in->page = page;
-  in->count = (page->lines && page->count > 0) ? page->count : 0;
+  in->count = ((page->lines || page->line_fn) && page->count > 0) ?
+      page->count : 0;
   in->top = 0;
   in->heads = 0;
   in->y0 = INFO_Y;
@@ -805,7 +815,7 @@ void menu_open_info(const info_page_t *page)
 
     for (int i = 0; i < in->count; i++)
     {
-      if (info_is_head(page->lines[i]))
+      if (info_is_head(info_line(page, i)))
         in->heads++;
     }
   }

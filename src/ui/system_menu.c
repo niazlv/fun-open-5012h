@@ -107,150 +107,302 @@ static uint32_t calculate_firmware_hash(void)
 }
 
 //-----------------------------------------------------------------------------
-// Info page bodies: the frame, font and colors are already set up by the
-// info page, these only add the computed lines
+// Info page content.
+//
+// Every page here renders ONE line at a time, on request, rather than painting
+// itself at coordinates it picked. That is not a style choice: a page that
+// draws itself has to know where the bottom of the panel is, and it silently
+// loses whatever it puts below it. This file had three of them, and the
+// System Information page was already one line off the edge - the next field
+// anybody added to it would simply not have appeared.
+//
+// Handing lines back instead gives the widget what it needs to lay the page
+// out: it picks the roomy grid when the content fits, the tight one when it
+// does not, and adds scrolling and a scrollbar past that. A page can now grow
+// without anyone having to check arithmetic against INFO_BODY_BOTTOM.
+//
+// The shared buffer only has to survive until the next call, which is the
+// contract info_page_t::line_fn states.
 //-----------------------------------------------------------------------------
-static void body_device_info(void)
+static char g_info_line[80];
+
+//-----------------------------------------------------------------------------
+// Line numbering, with the conditional rows in place. An #ifdef'd entry
+// removes itself from the count as well as from the switch, so the two cannot
+// disagree about how long the page is.
+enum
 {
-  char buf[80];
-  char mcu_buf[32];
+  DI_MCU, DI_DEVID, DI_MEM, DI_CPU, DI_UID,
+#ifdef FIRMWARE_NAME
+  DI_FIRMWARE,
+#endif
+  DI_BUILT,
+#ifdef GIT_HASH
+  DI_GIT,
+#endif
+  DI_HASH,
+  DI_COUNT,
+};
 
-  uint32_t device_id = *(uint32_t *)DBG_ID_REG;
-  uint16_t dev_id = device_id & 0xFFF;
-  uint16_t rev_id = (device_id >> 16) & 0xFFFF;
+static const char *device_info_line(int index)
+{
+  char *buf = g_info_line;
+  int size = sizeof(g_info_line);
 
-  const char *mcu_name;
-
-  switch (dev_id)
+  switch (index)
   {
-    case 0x413: mcu_name = "GD32F407VE"; break;
-    case 0x414: mcu_name = "GD32F405/407"; break;
-    default:
-      snprintf(mcu_buf, sizeof(mcu_buf), "Unknown GD32 (0x%03X)", dev_id);
-      mcu_name = mcu_buf;
+    case DI_MCU:
+    {
+      uint32_t device_id = *(uint32_t *)DBG_ID_REG;
+      uint16_t dev_id = device_id & 0xFFF;
+
+      switch (dev_id)
+      {
+        case 0x413:
+          snprintf(buf, size, "MCU: GD32F407VE (ARM Cortex-M4)");
+          break;
+
+        case 0x414:
+          snprintf(buf, size, "MCU: GD32F405/407 (ARM Cortex-M4)");
+          break;
+
+        default:
+          snprintf(buf, size, "MCU: Unknown GD32 (0x%03X) (ARM Cortex-M4)",
+              dev_id);
+          break;
+      }
+
       break;
-  }
+    }
 
-  snprintf(buf, sizeof(buf), "MCU: %s (ARM Cortex-M4)", mcu_name);
-  lcd_puts(INFO_X, 45, buf);
+    case DI_DEVID:
+    {
+      uint32_t device_id = *(uint32_t *)DBG_ID_REG;
 
-  sprintf(buf, "DevID: 0x%03X, Rev: 0x%04X", dev_id, rev_id);
-  lcd_puts(INFO_X, 60, buf);
+      snprintf(buf, size, "DevID: 0x%03X, Rev: 0x%04X",
+          (unsigned)(device_id & 0xFFF), (unsigned)((device_id >> 16) & 0xFFFF));
+      break;
+    }
 
-  uint16_t flash_size = *(uint16_t *)FLASH_SIZE_REG;
+    case DI_MEM:
+    {
+      uint16_t flash_size = *(uint16_t *)FLASH_SIZE_REG;
 
-  if (0xFFFF == flash_size || 0 == flash_size)
-    flash_size = 512;
+      if (0xFFFF == flash_size || 0 == flash_size)
+        flash_size = 512;
 
-  sprintf(buf, "Flash: %u KB, SRAM: %u KB + TCM: %u KB",
-      flash_size, SRAM_SIZE_KB, TCM_SIZE_KB);
-  lcd_puts(INFO_X, 75, buf);
+      snprintf(buf, size, "Flash: %u KB, SRAM: %u KB + TCM: %u KB",
+          flash_size, SRAM_SIZE_KB, TCM_SIZE_KB);
+      break;
+    }
 
-  sprintf(buf, "CPU Freq: %lu MHz", F_CPU / 1000000UL);
-  lcd_puts(INFO_X, 90, buf);
+    case DI_CPU:
+      snprintf(buf, size, "CPU Freq: %lu MHz", F_CPU / 1000000UL);
+      break;
 
-  uint32_t uid0 = *(uint32_t *)(UID_REG_BASE + 0);
-  uint32_t uid1 = *(uint32_t *)(UID_REG_BASE + 4);
-  uint32_t uid2 = *(uint32_t *)(UID_REG_BASE + 8);
-  sprintf(buf, "UID: %08lX-%08lX-%08lX", uid0, uid1, uid2);
-  lcd_puts(INFO_X, 105, buf);
+    case DI_UID:
+      snprintf(buf, size, "UID: %08lX-%08lX-%08lX",
+          *(uint32_t *)(UID_REG_BASE + 0),
+          *(uint32_t *)(UID_REG_BASE + 4),
+          *(uint32_t *)(UID_REG_BASE + 8));
+      break;
 
 #ifdef FIRMWARE_NAME
-  sprintf(buf, "%s v%s", FIRMWARE_NAME, FIRMWARE_VERSION);
-  lcd_puts(INFO_X, 120, buf);
+    case DI_FIRMWARE:
+      snprintf(buf, size, "%s v%s", FIRMWARE_NAME, FIRMWARE_VERSION);
+      break;
 #endif
 
+    case DI_BUILT:
 #ifdef BUILD_DATE
-  sprintf(buf, "Built: %s %s", BUILD_DATE, BUILD_TIME);
+      snprintf(buf, size, "Built: %s %s", BUILD_DATE, BUILD_TIME);
 #else
-  sprintf(buf, "Built: %s %s", __DATE__, __TIME__);
+      snprintf(buf, size, "Built: %s %s", __DATE__, __TIME__);
 #endif
-  lcd_puts(INFO_X, 135, buf);
+      break;
 
 #ifdef GIT_HASH
-  sprintf(buf, "Git: %s", GIT_HASH);
-  lcd_puts(INFO_X, 150, buf);
+    case DI_GIT:
+      snprintf(buf, size, "Git: %s", GIT_HASH);
+      break;
 #endif
 
-  sprintf(buf, "FW Hash(CRC32): %08lX", calculate_firmware_hash());
-  lcd_puts(INFO_X, 165, buf);
+    case DI_HASH:
+      snprintf(buf, size, "FW Hash(CRC32): %08lX", calculate_firmware_hash());
+      break;
+
+    default:
+      return "";
+  }
+
+  return buf;
 }
 
 //-----------------------------------------------------------------------------
-static void body_system_info(void)
+enum
 {
-  char buf[80];
+  SI_FLASH, SI_TCM, SI_DATA, SI_CPU, SI_UPTIME,
+#ifdef GIT_HASH
+  SI_GIT,
+#endif
+#ifdef GIT_USER
+  SI_BUILT_BY,
+#endif
+  SI_LOOP, SI_PANEL, SI_STORE, SI_CALIB,
+  SI_COUNT,
+};
 
-  uint32_t flash_used = (uint32_t)&_etext - FLASH_MEM_BASE;
-  uint32_t data_size = (uint32_t)&_edata - (uint32_t)&_data;
-  uint32_t bss_size = (uint32_t)&_ebss - (uint32_t)&_bss;
-  uint32_t ram_used = (uint32_t)&_end - TCM_MEM_BASE;
+static const char *system_info_line(int index)
+{
+  char *buf = g_info_line;
+  int size = sizeof(g_info_line);
 
   uint16_t flash_total = *(uint16_t *)FLASH_SIZE_REG;
 
   if (0xFFFF == flash_total || 0 == flash_total)
     flash_total = 512;
 
-  // Percentages in integer tenths: newlib's %f pulls in the malloc-backed
-  // _dtoa path, and the heap shares scarce TCM with the stack
-  uint32_t flash_pct10 = flash_used * 1000ul / (flash_total * 1024ul);
-  uint32_t ram_pct10 = ram_used * 1000ul / (TCM_SIZE_KB * 1024ul);
+  switch (index)
+  {
+    case SI_FLASH:
+    {
+      uint32_t flash_used = (uint32_t)&_etext - FLASH_MEM_BASE;
 
-  sprintf(buf, "Flash: %lu KB / %u KB (%lu.%lu%%)",
-      flash_used / 1024, flash_total, flash_pct10 / 10, flash_pct10 % 10);
-  lcd_puts(INFO_X, 45, buf);
+      // Percentages in integer tenths: newlib's %f pulls in the malloc-backed
+      // _dtoa path, and the heap shares scarce TCM with the stack
+      uint32_t pct10 = flash_used * 1000ul / (flash_total * 1024ul);
 
-  sprintf(buf, "TCM RAM: %lu KB / %u KB (%lu.%lu%%)",
-      ram_used / 1024, TCM_SIZE_KB, ram_pct10 / 10, ram_pct10 % 10);
-  lcd_puts(INFO_X, 60, buf);
+      snprintf(buf, size, "Flash: %lu KB / %u KB (%lu.%lu%%)",
+          flash_used / 1024, flash_total, pct10 / 10, pct10 % 10);
+      break;
+    }
 
-  sprintf(buf, "Data: %lu B, BSS: %lu B", data_size, bss_size);
-  lcd_puts(INFO_X, 75, buf);
+    case SI_TCM:
+    {
+      uint32_t ram_used = (uint32_t)&_end - TCM_MEM_BASE;
+      uint32_t pct10 = ram_used * 1000ul / (TCM_SIZE_KB * 1024ul);
 
-  sprintf(buf, "CPU Freq: %lu MHz", F_CPU / 1000000UL);
-  lcd_puts(INFO_X, 90, buf);
+      snprintf(buf, size, "TCM RAM: %lu KB / %u KB (%lu.%lu%%)",
+          ram_used / 1024, TCM_SIZE_KB, pct10 / 10, pct10 % 10);
+      break;
+    }
 
-  uint32_t uptime_ms = timer_ms();
-  uint32_t uptime_sec = uptime_ms / 1000;
-  uint32_t hours = uptime_sec / 3600;
-  uint32_t minutes = (uptime_sec % 3600) / 60;
-  uint32_t seconds = uptime_sec % 60;
+    case SI_DATA:
+      snprintf(buf, size, "Data: %lu B, BSS: %lu B",
+          (uint32_t)&_edata - (uint32_t)&_data,
+          (uint32_t)&_ebss - (uint32_t)&_bss);
+      break;
 
-  if (hours > 0)
-    sprintf(buf, "Uptime: %luh %lum %lus", hours, minutes, seconds);
-  else if (minutes > 0)
-    sprintf(buf, "Uptime: %lum %lus", minutes, seconds);
-  else
-    sprintf(buf, "Uptime: %lu.%03lus", seconds, uptime_ms % 1000);
-  lcd_puts(INFO_X, 105, buf);
+    case SI_CPU:
+      snprintf(buf, size, "CPU Freq: %lu MHz", F_CPU / 1000000UL);
+      break;
+
+    case SI_UPTIME:
+    {
+      uint32_t uptime_ms = timer_ms();
+      uint32_t uptime_sec = uptime_ms / 1000;
+      uint32_t hours = uptime_sec / 3600;
+      uint32_t minutes = (uptime_sec % 3600) / 60;
+      uint32_t seconds = uptime_sec % 60;
+
+      if (hours > 0)
+        snprintf(buf, size, "Uptime: %luh %lum %lus", hours, minutes, seconds);
+      else if (minutes > 0)
+        snprintf(buf, size, "Uptime: %lum %lus", minutes, seconds);
+      else
+        snprintf(buf, size, "Uptime: %lu.%03lus", seconds, uptime_ms % 1000);
+
+      break;
+    }
 
 #ifdef GIT_HASH
-  sprintf(buf, "Git: %s (%s)", GIT_HASH, GIT_BRANCH);
-  lcd_puts(INFO_X, 120, buf);
+    case SI_GIT:
+      snprintf(buf, size, "Git: %s (%s)", GIT_HASH, GIT_BRANCH);
+      break;
 #endif
 
 #ifdef GIT_USER
-  sprintf(buf, "Built by: %s", GIT_USER);
-  lcd_puts(INFO_X, 135, buf);
+    case SI_BUILT_BY:
+      snprintf(buf, size, "Built by: %s", GIT_USER);
+      break;
 #endif
 
-  // Worst main-loop stall since this dialog was last opened: the practical
-  // "is it responsive" metric (a button press can wait at most this long)
-  sprintf(buf, "Loop max: %d ms   Scope FPS: %d",
-      timer_get_max_delta(), scope_get_fps());
-  lcd_puts(INFO_X, 150, buf);
+    // Worst main-loop stall since this dialog was last opened: the practical
+    // "is it responsive" metric (a button press can wait at most this long)
+    case SI_LOOP:
+      snprintf(buf, size, "Loop max: %d ms   Scope FPS: %d",
+          timer_get_max_delta(), scope_get_fps());
+      break;
 
-  // Measurements panel state, for diagnosing a blank one: d=enabled,
-  // m=panel/rotate, act=composited into the sweep, t=update timer,
-  // bld/pnt=texts built and bands repainted, len=length of the current text
-  scope_get_panel_state(buf, sizeof(buf));
-  lcd_puts(INFO_X, 165, buf);
+    // Measurements panel state, for diagnosing a blank one: d=enabled,
+    // m=panel/rotate, act=composited into the sweep, t=update timer,
+    // bld/pnt=texts built and bands repainted, len=length of the current text
+    case SI_PANEL:
+      scope_get_panel_state(buf, size);
+      break;
 
-  // Settings store health. "saved" with a rising entry number is a store that
-  // is persisting; "NO STORED CONFIG" on a device that has been used before
-  // means the last session's settings were lost on the way to flash.
-  config_get_state(buf, sizeof(buf));
-  lcd_puts(INFO_X, 180, buf);
+    // Settings store health. "saved" with a rising entry number is a store
+    // that is persisting; "NO STORED CONFIG" on a device that has been used
+    // before means the last session's settings were lost on the way to flash.
+    case SI_STORE:
+      config_get_state(buf, size);
+      break;
+
+    // Where the calibration came from. "DEFAULTS" here means the numbers
+    // belong to another unit and every voltage on screen is approximate - the
+    // one failure in this dialog that a working-looking scope can be hiding.
+    case SI_CALIB:
+      config_get_calib_state(buf, size);
+      break;
+
+    default:
+      return "";
+  }
+
+  return buf;
+}
+
+//-----------------------------------------------------------------------------
+// The calibration itself, in full. This page exists to be copied onto paper:
+// flash is only a cache for these numbers, and the one thing that survives the
+// storage sector wearing out, being erased by a layout change, or the silicon
+// failing outright is somebody having written them down.
+#define CAL_HEADER  2
+
+static const char *calibration_line(int index)
+{
+  switch (index)
+  {
+    case 0:
+      return "Measured on THIS unit. Copy them somewhere.";
+
+    case 1:
+      config_get_calib_state(g_info_line, sizeof(g_info_line));
+      return g_info_line;
+
+    default:
+      break;
+  }
+
+  if (!config_get_calib_line(index - CAL_HEADER, g_info_line,
+        sizeof(g_info_line)))
+    return "";
+
+  return g_info_line;
+}
+
+//-----------------------------------------------------------------------------
+// Asked rather than hard-coded, so that a range added to VS_COUNT lengthens
+// the page instead of falling off the end of it
+static int calibration_lines(void)
+{
+  char buf[64];
+  int n = 0;
+
+  while (config_get_calib_line(n, buf, sizeof(buf)))
+    n++;
+
+  return n + CAL_HEADER;
 }
 
 //-----------------------------------------------------------------------------
@@ -264,7 +416,8 @@ static const char *const g_key_bindings_lines[] =
   "MODE        - Select / confirm",
   "MENU        - System menu over any application",
   "SHIFT+MENU  - Leave the application",
-  "SHIFT x2    - Sticky shift (if enabled)",
+  "SHIFT x2    - Sticky shift, for the next key",
+  "SHIFT hold  - Shift latched on; tap SHIFT off",
   "",
   "The rows above the first separator belong to",
   "the running application. Its keys, and every",
@@ -308,14 +461,105 @@ static const info_page_t g_page_key_bindings =
 static const info_page_t g_page_device_info =
 {
   .title = "Device Information",
-  .body = body_device_info,
+  .count = DI_COUNT,
+  .line_fn = device_info_line,
 };
 
 static const info_page_t g_page_system_info =
 {
   .title = "System Information",
-  .body = body_system_info,
+  .count = SI_COUNT,
+  .line_fn = system_info_line,
 };
+
+// count is filled in when it opens, see action_calibration: the number of
+// ranges is config.c's to decide, not this file's
+static info_page_t g_page_calibration =
+{
+  .title = "Calibration",
+  .line_fn = calibration_line,
+};
+
+static void action_calibration(const void *arg)
+{
+  (void)arg;
+
+  g_page_calibration.count = calibration_lines();
+
+  menu_action_info(&g_page_calibration);
+}
+
+//-----------------------------------------------------------------------------
+// The config as the running scope holds it, field by field.
+//
+// This is the RAM side of the pair: the flash viewer's Config view decodes
+// what is on the flash, and this decodes what is in use. They are supposed to
+// agree, and every interesting bug in this store is a case where they do not -
+// a change that never reached a slot, or a slot that loaded as something else.
+//
+// Rendered a line at a time through the page's line_fn rather than built into
+// an array: eighty lines of text is 3 KB, and TCM keeps 16 KB back for stack
+// and heap - a buffer that size does not link. One line of scratch does.
+//-----------------------------------------------------------------------------
+// Where the config came from, ahead of what it holds: a config that quietly
+// fell back to defaults reads perfectly ordinary field by field
+#define CFG_DUMP_HEADER   3
+
+static char g_cfg_line[52];
+
+static const char *config_ram_line(int index)
+{
+  switch (index)
+  {
+    case 0:
+      config_get_state(g_cfg_line, sizeof(g_cfg_line));
+      return g_cfg_line;
+
+    case 1:
+      config_get_calib_state(g_cfg_line, sizeof(g_cfg_line));
+      return g_cfg_line;
+
+    case 2:
+      return "";
+
+    default:
+      break;
+  }
+
+  if (!config_describe(&config, index - CFG_DUMP_HEADER,
+        g_cfg_line, sizeof(g_cfg_line)))
+    return "";
+
+  return g_cfg_line;
+}
+
+//-----------------------------------------------------------------------------
+// The page needs its length up front, and config_describe is what knows it
+static int config_ram_lines(void)
+{
+  char buf[52];
+  int n = 0;
+
+  while (config_describe(&config, n, buf, sizeof(buf)))
+    n++;
+
+  return n + CFG_DUMP_HEADER;
+}
+
+static info_page_t g_page_config_ram =
+{
+  .title = "Config (RAM)",
+  .line_fn = config_ram_line,
+};
+
+static void action_config_ram(const void *arg)
+{
+  (void)arg;
+
+  g_page_config_ram.count = config_ram_lines();
+
+  menu_action_info(&g_page_config_ram);
+}
 
 //-----------------------------------------------------------------------------
 // Menu actions
@@ -347,10 +591,12 @@ static void apply_backlight(int value)
 }
 
 //-----------------------------------------------------------------------------
+// Either switch, either way: whatever shift was pending was pending under the
+// old setting, and leaving it armed or latched across the change would outlive
+// the thing that put it there
 static void shift_mode_changed(void)
 {
-  if (!config.shift_mode_enabled)
-    shift_mode_reset();
+  shift_mode_reset();
 }
 
 //-----------------------------------------------------------------------------
@@ -368,8 +614,10 @@ static const menu_item_t g_general_items[] =
 {
   { .kind = MI_NUMBER, .label = "Brightness",
     .u.number = { &config.lcd_bl_level, 10, 100, 5, 10, "%", apply_backlight } },
-  { .kind = MI_TOGGLE, .label = "Shift Mode",
+  { .kind = MI_TOGGLE, .label = "Shift x2 Sticky",
     .u.toggle = { &config.shift_mode_enabled, shift_mode_changed } },
+  { .kind = MI_TOGGLE, .label = "Shift Hold Lock",
+    .u.toggle = { &config.shift_hold_lock, shift_mode_changed } },
   { .kind = MI_TOGGLE, .label = "Key Remap",
     .u.toggle = { &config.key_remapping_enabled, NULL } },
   { .kind = MI_ACTION, .label = "Remap Keys...",
@@ -382,6 +630,10 @@ static const menu_item_t g_advanced_items[] =
     .u.action = { menu_action_info, &g_page_device_info } },
   { .kind = MI_ACTION, .label = "System Info",
     .u.action = { menu_action_info, &g_page_system_info } },
+  { .kind = MI_ACTION, .label = "Calibration",
+    .u.action = { action_calibration, NULL } },
+  { .kind = MI_ACTION, .label = "Config (RAM)",
+    .u.action = { action_config_ram, NULL } },
   { .kind = MI_SEPARATOR },
   { .kind = MI_ACTION, .label = "Reboot System",
     .u.action = { action_reboot, NULL } },

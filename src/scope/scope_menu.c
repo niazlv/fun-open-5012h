@@ -1142,11 +1142,21 @@ static const char *const g_roll_from_labels[] =
   "1 s/div", "500 ms/div", "200 ms/div", "100 ms/div",
 };
 
+// In the order config.persist_mode stores them, which is not the order they
+// would be listed in from scratch: the field is the four bytes the old
+// on/off bool occupied, and a stored "on" reads back as 1 - so 1 has to stay
+// the behaviour that bool selected. See the note on the field.
+static const char *const g_persist_labels[] =
+{
+  "Off", "Infinite", "Decay (CRT)",
+};
+
 static const menu_item_t g_display_items[] =
 {
-  { .kind = MI_TOGGLE, .label = "Persistence",
-    .desc = "Envelope accumulates over frames",
-    .u.toggle = { &config.display_persist, display_processing_changed } },
+  { .kind = MI_CHOICE, .label = "Persistence",
+    .desc = "Envelope: kept, or fading like a CRT",
+    .u.choice = { &config.persist_mode, g_persist_labels,
+        ARRAY_SIZE(g_persist_labels), display_processing_changed } },
   { .kind = MI_CHOICE, .label = "Averaging",
     .desc = "Mean of N triggered frames",
     .u.choice = { &config.average_mode, g_average_labels,
@@ -1318,6 +1328,22 @@ static void action_calib_values(const void *arg)
   menu_open_dialog(&g_calib_values); // MENU or LEFT backs out
 }
 
+//-----------------------------------------------------------------------------
+// The only way to throw the calibration away on purpose. It used to happen by
+// accident instead: the boot-time reset combo ran config_reset(), which
+// overwrote the calibration block along with the preferences, and a second
+// later the store made that permanent. config_reset() keeps the block now, so
+// the deliberate version has to live somewhere - and this menu, behind the
+// probe warning and next to auto-calibrate, is where somebody looking for it
+// would look.
+static void action_calib_defaults(const void *arg)
+{
+  (void)arg;
+  config_reset_calibration();
+  scope_calib_apply(true);
+  menu_close_popups();
+}
+
 static const menu_item_t g_calib_items[] =
 {
   { .kind = MI_ACTION, .label = "Auto-calibrate",
@@ -1326,6 +1352,9 @@ static const menu_item_t g_calib_items[] =
   { .kind = MI_ACTION, .label = "Enter values",
     .desc = "Type Z, D, S and O per range",
     .u.action = { action_calib_values, NULL } },
+  { .kind = MI_ACTION, .label = "Reset calibration",
+    .desc = "Back to factory numbers - not this unit's",
+    .u.action = { action_calib_defaults, NULL } },
   { .kind = MI_SEPARATOR },
   { .kind = MI_TOGGLE, .label = "Calibration mode",
     .u.toggle = { &scope_calibration_mode, scope_calibration_changed } },

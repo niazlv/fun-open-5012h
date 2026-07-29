@@ -96,6 +96,13 @@ void debug_coredump_clear_all(void);
 uint32_t debug_coredump_boot_id(void);
 bool debug_coredump_ring_retained(void);
 
+// True once debug_coredump_init() has run. Before that the ring is whatever
+// the SRAM happened to hold, and a dump written into it is either wiped by
+// store_reset() on a cold start or filed under the previous boot's id - so a
+// caller that can run that early (config_init() does, main.c brings the store
+// up first) has to ask rather than assume.
+bool debug_coredump_ready(void);
+
 // Application entry points, see launcher.c
 void coredump_app_init(void);
 void coredump_app_task(void);

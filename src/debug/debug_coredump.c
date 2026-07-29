@@ -34,6 +34,7 @@ _Static_assert(sizeof(coredump_store_t) <= COREDUMP_RAM_SIZE,
 #define g_coredump_write_index (g_store->write_index)
 
 static bool g_ring_retained = false; // ring came from a previous boot
+static bool g_initialised = false;   // the ring is live and safe to write
 static int g_viewer_current_entry = 0;
 static int g_viewer_current_page = 0;
 static bool g_viewer_dirty = false;
@@ -135,6 +136,8 @@ void debug_coredump_init(void)
         g_ring_retained = false;
         store_reset(1);
     }
+
+    g_initialised = true;
 }
 
 //-----------------------------------------------------------------------------
@@ -147,6 +150,12 @@ uint32_t debug_coredump_boot_id(void)
 bool debug_coredump_ring_retained(void)
 {
     return g_ring_retained;
+}
+
+//-----------------------------------------------------------------------------
+bool debug_coredump_ready(void)
+{
+    return g_initialised;
 }
 
 //-----------------------------------------------------------------------------

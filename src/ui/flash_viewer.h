@@ -26,8 +26,22 @@ typedef enum {
     FLASH_VIEW_ASCII,
     FLASH_VIEW_STRUCTURE,
     FLASH_VIEW_THUMB,
+    FLASH_VIEW_CONFIG,      // the settings store, decoded rather than dumped
     FLASH_VIEW_COUNT
 } flash_view_mode_t;
+
+// Address spaces the viewer will read. Deliberately a whitelist and not a free
+// pointer: an unmapped address bus-faults, and a peripheral register can have
+// side effects just from being read - popping a FIFO, clearing a status bit -
+// so "read any address" would turn the viewer into a way to break the running
+// scope. These four are plain memory arrays and safe to walk.
+typedef enum {
+    MEM_REGION_FLASH = 0,
+    MEM_REGION_SRAM,
+    MEM_REGION_TCM,
+    MEM_REGION_SYSTEM,      // bootloader ROM, and the id/size registers past it
+    MEM_REGION_COUNT
+} mem_region_t;
 
 typedef struct {
     const char* name;

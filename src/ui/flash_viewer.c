@@ -20,6 +20,7 @@
 #include "utils.h"
 #include "ui.h"
 #include "menu_widget.h"
+#include "config.h"
 #include "flash_viewer.h"
 
 /*- Definitions -------------------------------------------------------------*/
@@ -53,6 +54,35 @@ static bool g_dirty = true;
 static flash_section_t g_flash_sections[FLASH_MAX_SECTIONS];
 static int g_section_count = 0;
 
+/*
+ * The address spaces the viewer walks. Sizes are the real ones for this part:
+ * 128 KB of main SRAM at 0x20000000, 64 KB of tightly coupled memory at
+ * 0x10000000 (where the stack and heap live, see the linker script), and the
+ * 32 KB system region - bootloader ROM, then the OTP block, and at the top of
+ * it the unique id and flash size registers this file already reads.
+ *
+ * Flash's length is fixed up at init from the size register: it is the one
+ * that varies by part, and reading past the end of the array bus-faults.
+ */
+static struct {
+    const char *name;
+    uint32_t base;
+    uint32_t size;
+} g_regions[MEM_REGION_COUNT] = {
+    [MEM_REGION_FLASH]  = { "Flash",  FLASH_START_ADDR, FLASH_SIZE },
+    [MEM_REGION_SRAM]   = { "SRAM",   0x20000000u, 128 * 1024 },
+    [MEM_REGION_TCM]    = { "TCM",    0x10000000u,  64 * 1024 },
+    [MEM_REGION_SYSTEM] = { "System", 0x1FFF0000u,  32 * 1024 },
+};
+
+static int g_region = MEM_REGION_FLASH;
+
+// Config store browser: which entry is selected, and whether the decoded field
+// list for it is open
+static int g_cfg_index = 0;
+static int g_cfg_scroll = 0;
+static bool g_cfg_detail = false;
+
 /*- External symbols from linker script ------------------------------------*/
 extern uint32_t _etext;   // end of .text in flash
 extern uint32_t __etext;  // end of everything in flash, .data image included
@@ -63,9 +93,24 @@ static void analyze_flash_sections(void);
 /*- Implementations ---------------------------------------------------------*/
 
 //-----------------------------------------------------------------------------
+static uint32_t region_base(void)
+{
+    return g_regions[g_region].base;
+}
+
+//-----------------------------------------------------------------------------
+static uint32_t region_end(void)
+{
+    return g_regions[g_region].base + g_regions[g_region].size;
+}
+
+//-----------------------------------------------------------------------------
+// Bounds-checked against the CURRENT region, which is what keeps the viewer
+// from wandering into an unmapped hole and taking the scope down with a bus
+// fault. Out of range reads as erased rather than faulting.
 static uint8_t read_flash_byte(uint32_t addr)
 {
-    if (addr < FLASH_START_ADDR || addr >= g_flash_end)
+    if (addr < region_base() || addr >= region_end())
         return 0xFF;
 
     return *(volatile uint8_t *)addr;
@@ -105,23 +150,36 @@ static int bytes_per_line(void)
 static void set_address(int64_t addr)
 {
     int64_t step = bytes_per_line();
-    int64_t last = (int64_t)g_flash_end - step * LINES_PER_PAGE;
+    int64_t base = region_base();
+    int64_t last = (int64_t)region_end() - step * LINES_PER_PAGE;
     uint32_t offset;
 
-    if (last < FLASH_START_ADDR)
-        last = FLASH_START_ADDR;
+    if (last < base)
+        last = base;
 
-    if (addr < FLASH_START_ADDR)
-        addr = FLASH_START_ADDR;
+    if (addr < base)
+        addr = base;
 
     if (addr > last)
         addr = last;
 
-    offset = (uint32_t)addr - FLASH_START_ADDR;
+    offset = (uint32_t)addr - (uint32_t)base;
 
-    g_current_address = FLASH_START_ADDR + (offset / (uint32_t)step) * (uint32_t)step;
+    g_current_address = (uint32_t)base + (offset / (uint32_t)step) * (uint32_t)step;
 
     g_dirty = true;
+}
+
+//-----------------------------------------------------------------------------
+// Switching regions moves the cursor with it, since an address from the old
+// one is meaningless in the new
+static void set_region(int region)
+{
+    if (region < 0 || region >= MEM_REGION_COUNT)
+        return;
+
+    g_region = region;
+    set_address(region_base());
 }
 
 //-----------------------------------------------------------------------------
@@ -259,9 +317,17 @@ static void draw_header(void)
         snprintf(buf, sizeof(buf), "%d regions   %lu KB total", g_section_count,
             (unsigned long)((g_flash_end - FLASH_START_ADDR) / 1024));
     }
+    else if (FLASH_VIEW_CONFIG == g_view_mode) {
+        snprintf(buf, sizeof(buf), "Settings store   0x%08lX",
+            (unsigned long)(uintptr_t)config_store_entry(0));
+    }
     else {
-        snprintf(buf, sizeof(buf), "0x%08lX   %s",
-            (unsigned long)g_current_address, section_name_at(g_current_address));
+        // The region is named too now that the viewer walks more than one:
+        // an address alone no longer says which space it belongs to
+        snprintf(buf, sizeof(buf), "%s  0x%08lX   %s", g_regions[g_region].name,
+            (unsigned long)g_current_address,
+            (MEM_REGION_FLASH == g_region) ?
+                section_name_at(g_current_address) : "-");
     }
 
     lcd_puts(5, 17, buf);
@@ -460,6 +526,205 @@ static void draw_thumb_view(void)
 }
 
 //-----------------------------------------------------------------------------
+// The settings store, one row per rotation slot. Reading it as hex is possible
+// and useless: what matters about an entry is whether it validates and why
+// not, and that is four checks over 416 bytes rather than something the eye
+// picks out of a dump.
+static void draw_config_list(void)
+{
+    char buf[64];
+    int count = config_store_entries();
+    int live = config_store_live_index();
+    int rows = LINES_PER_PAGE - 1;
+    int y = BODY_Y;
+    int valid = 0;
+
+    clear_body();
+
+    for (int i = 0; i < count; i++) {
+        if (CONFIG_ENTRY_VALID == config_store_entry_state(i))
+            valid++;
+    }
+
+    lcd_set_color(BG, ACCENT);
+    snprintf(buf, sizeof(buf), "%d/%d valid   live %d   %d B/entry",
+        valid, count, live, (int)sizeof(Config));
+    lcd_puts(5, y, buf);
+    y += LINE_H;
+
+    // Keep the selection on screen without a separate scroll key
+    if (g_cfg_index < g_cfg_scroll)
+        g_cfg_scroll = g_cfg_index;
+    else if (g_cfg_index >= g_cfg_scroll + rows)
+        g_cfg_scroll = g_cfg_index - rows + 1;
+
+    for (int row = 0; row < rows && g_cfg_scroll + row < count; row++) {
+        int i = g_cfg_scroll + row;
+        ConfigEntryState state = config_store_entry_state(i);
+        const Config *entry = config_store_entry(i);
+        bool sel = (i == g_cfg_index);
+
+        if (sel)
+            lcd_fill_rect(0, y - 1, LCD_WIDTH, LINE_H, SEL_BG);
+
+        lcd_set_color(sel ? SEL_BG : BG,
+            (CONFIG_ENTRY_VALID == state) ? FG : ACCENT);
+
+        // count is only meaningful in an entry that validates; in one that
+        // does not it is whatever survived, so it is left off
+        if (CONFIG_ENTRY_VALID == state)
+            snprintf(buf, sizeof(buf), "%c%3d  %-11s cnt %-7d %s",
+                (i == live) ? '>' : ' ', i,
+                config_entry_state_name(state), entry->count,
+                config_store_entry_calib_ok(i) ? "cal ok" : "cal --");
+        else
+            snprintf(buf, sizeof(buf), "%c%3d  %-11s         %s",
+                (i == live) ? '>' : ' ', i,
+                config_entry_state_name(state),
+                config_store_entry_calib_ok(i) ? "cal ok" : "");
+
+        lcd_puts(5, y, buf);
+        y += LINE_H;
+    }
+
+    lcd_set_color(BG, FG);
+    draw_footer("U/D entry   RIGHT decode   MODE next view",
+        "'>' is the live slot; 'cal ok' = calibration seals");
+}
+
+//-----------------------------------------------------------------------------
+// The selected entry decoded field by field, which is the view that answers
+// "is what I set actually what got stored". An entry that failed its CRC is
+// still shown - the fields are readable, they simply cannot be trusted, and
+// seeing which one looks wrong is usually the whole diagnosis.
+static void draw_config_detail(void)
+{
+    char buf[64];
+    const Config *entry = config_store_entry(g_cfg_index);
+    ConfigEntryState state = config_store_entry_state(g_cfg_index);
+    int rows = LINES_PER_PAGE - 1;
+    int y = BODY_Y;
+
+    clear_body();
+
+    lcd_set_color(BG, ACCENT);
+    snprintf(buf, sizeof(buf), "entry %d  %s%s", g_cfg_index,
+        config_entry_state_name(state),
+        (CONFIG_ENTRY_VALID == state) ? "" : "  - values are suspect");
+    lcd_puts(5, y, buf);
+    y += LINE_H;
+
+    lcd_set_color(BG, FG);
+
+    for (int row = 0; row < rows; row++) {
+        if (!config_describe(entry, g_cfg_scroll + row, buf, sizeof(buf)))
+            break;
+
+        lcd_puts(5, y, buf);
+        y += LINE_H;
+    }
+
+    draw_footer("U/D line   L/R page   LEFT at top: back",
+        "MODE next view");
+}
+
+//-----------------------------------------------------------------------------
+static void draw_config_view(void)
+{
+    if (g_cfg_detail)
+        draw_config_detail();
+    else
+        draw_config_list();
+}
+
+//-----------------------------------------------------------------------------
+// Scrolling the detail list needs its length, and config_describe is the only
+// thing that knows it
+static int config_detail_lines(void)
+{
+    char buf[64];
+    int n = 0;
+
+    while (config_describe(config_store_entry(g_cfg_index), n, buf, sizeof(buf)))
+        n++;
+
+    return n;
+}
+
+//-----------------------------------------------------------------------------
+static void config_buttons(int buttons)
+{
+    int rows = LINES_PER_PAGE - 1;
+
+    if (g_cfg_detail) {
+        int last = config_detail_lines() - rows;
+
+        if (last < 0)
+            last = 0;
+
+        if ((buttons & BTN_LEFT) && 0 == g_cfg_scroll) {
+            // Only from the top, so that paging back through a long entry
+            // does not fall out of it by surprise
+            g_cfg_detail = false;
+            g_cfg_scroll = 0;
+            g_dirty = true;
+            return;
+        }
+
+        if (buttons & BTN_UP)
+            g_cfg_scroll--;
+
+        if (buttons & BTN_DOWN)
+            g_cfg_scroll++;
+
+        if (buttons & BTN_LEFT)
+            g_cfg_scroll -= rows;
+
+        if (buttons & BTN_RIGHT)
+            g_cfg_scroll += rows;
+
+        if (g_cfg_scroll > last)
+            g_cfg_scroll = last;
+
+        if (g_cfg_scroll < 0)
+            g_cfg_scroll = 0;
+
+        g_dirty = true;
+        return;
+    }
+
+    if (buttons & BTN_UP) {
+        if (g_cfg_index > 0)
+            g_cfg_index--;
+
+        g_dirty = true;
+    }
+
+    if (buttons & BTN_DOWN) {
+        if (g_cfg_index < config_store_entries() - 1)
+            g_cfg_index++;
+
+        g_dirty = true;
+    }
+
+    if (buttons & BTN_TRIG_UP) {
+        g_cfg_index = 0;
+        g_dirty = true;
+    }
+
+    if (buttons & BTN_TRIG_DOWN) {
+        g_cfg_index = config_store_live_index();
+        g_dirty = true;
+    }
+
+    if (buttons & BTN_RIGHT) {
+        g_cfg_detail = true;
+        g_cfg_scroll = 0;
+        g_dirty = true;
+    }
+}
+
+//-----------------------------------------------------------------------------
 static void draw_view(void)
 {
     draw_header();
@@ -468,6 +733,7 @@ static void draw_view(void)
         case FLASH_VIEW_ASCII:     draw_ascii_view(); break;
         case FLASH_VIEW_STRUCTURE: draw_structure_view(); break;
         case FLASH_VIEW_THUMB:     draw_thumb_view(); break;
+        case FLASH_VIEW_CONFIG:    draw_config_view(); break;
         default:                   draw_hex_view(); break;
     }
 }
@@ -482,10 +748,23 @@ void flash_viewer_init(void)
 
     g_flash_end = FLASH_START_ADDR + (uint32_t)size_kb * 1024;
 
+    // The bound read_flash_byte enforces, not just the one the layout scan
+    // uses: leaving it at the 512 KB fallback would let the cursor walk off
+    // the end of a smaller part's array, which bus-faults
+    g_regions[MEM_REGION_FLASH].size = g_flash_end - FLASH_START_ADDR;
+
+    // Back to flash whatever the last session left selected - the layout scan
+    // below reads through read_flash_byte, and that answers for the region
+    // that is current
+    g_region = MEM_REGION_FLASH;
+
     g_current_address = FLASH_START_ADDR;
     g_view_mode = FLASH_VIEW_HEX;
     g_section_index = 0;
     g_section_scroll = 0;
+    g_cfg_index = 0;
+    g_cfg_scroll = 0;
+    g_cfg_detail = false;
 
     analyze_flash_sections();
 
@@ -529,7 +808,18 @@ void flash_viewer_buttons_handler(int buttons)
     if ((buttons & BTN_MODE) && !repeat) {
         g_view_mode = (g_view_mode + 1) % FLASH_VIEW_COUNT;
         set_address(g_current_address); // re-align to the new line size
+
+        // Leaving the store view half way into an entry and cycling back to
+        // it should land on the list, not on whatever was being read before
+        g_cfg_detail = false;
+        g_cfg_scroll = 0;
+
         g_dirty = true;
+        return;
+    }
+
+    if (FLASH_VIEW_CONFIG == g_view_mode) {
+        config_buttons(buttons);
         return;
     }
 
@@ -590,6 +880,10 @@ const flash_section_t *flash_get_sections(int *count)
 static void view_mode_changed(void)
 {
     set_address(g_current_address);
+
+    g_cfg_detail = false;
+    g_cfg_scroll = 0;
+
     g_dirty = true;
 }
 
@@ -609,6 +903,51 @@ static void action_goto_image_end(const void *arg)
     menu_close_popups();
 }
 
+//-----------------------------------------------------------------------------
+static void region_changed(void)
+{
+    // The choice item has already written g_region; this puts the cursor
+    // somewhere that exists in it
+    set_region(g_region);
+    g_dirty = true;
+}
+
+//-----------------------------------------------------------------------------
+// Straight to the settings store as raw bytes, for when the decoded view is
+// not what is wanted - a slot that fails its CRC is sometimes only explicable
+// by looking at what is actually in it
+static void action_goto_store(const void *arg)
+{
+    (void)arg;
+    g_region = MEM_REGION_FLASH;
+    g_view_mode = FLASH_VIEW_HEX;
+    set_address((uint32_t)(uintptr_t)config_store_entry(0));
+    menu_close_popups();
+}
+
+//-----------------------------------------------------------------------------
+// ...and to the live one, which is the entry the running scope came from
+static void action_goto_live_entry(const void *arg)
+{
+    (void)arg;
+    g_region = MEM_REGION_FLASH;
+    g_view_mode = FLASH_VIEW_HEX;
+    set_address((uint32_t)(uintptr_t)config_store_entry(config_store_live_index()));
+    menu_close_popups();
+}
+
+//-----------------------------------------------------------------------------
+static void action_open_store(const void *arg)
+{
+    (void)arg;
+    g_view_mode = FLASH_VIEW_CONFIG;
+    g_cfg_detail = false;
+    g_cfg_index = config_store_live_index();
+    g_cfg_scroll = 0;
+    g_dirty = true;
+    menu_close_popups();
+}
+
 static const char *const g_help_lines[] =
 {
     "UP/DOWN     - One line",
@@ -623,6 +962,19 @@ static const char *const g_help_lines[] =
     "Thumb splits the stream into 16 and 32 bit",
     "instructions and names the encoding group -",
     "enough to tell code from data.",
+    "",
+    "Memory picks the address space: flash, SRAM,",
+    "TCM (stack and heap) or the system ROM. Only",
+    "these four are offered because an unmapped",
+    "address bus-faults and a peripheral register",
+    "can change state just from being read.",
+    "",
+    "Config decodes the settings store instead of",
+    "dumping it: one row per rotation slot, why an",
+    "entry is not usable, and RIGHT to read its",
+    "fields. '>' marks the slot in use, and the",
+    "calibration column is its own seal - it can",
+    "hold in an entry that otherwise failed.",
 };
 
 static const info_page_t g_help_page =
@@ -632,18 +984,32 @@ static const info_page_t g_help_page =
     .count = ARRAY_SIZE(g_help_lines),
 };
 
-static const char *const g_view_labels[] = { "Hex", "ASCII", "Layout", "Thumb" };
+static const char *const g_view_labels[] =
+    { "Hex", "ASCII", "Layout", "Thumb", "Config" };
+
+static const char *const g_region_labels[] =
+    { "Flash", "SRAM", "TCM", "System" };
 
 static const menu_item_t g_menu_items[] =
 {
     { .kind = MI_CHOICE, .label = "View",
       .u.choice = { &g_view_mode, g_view_labels, FLASH_VIEW_COUNT,
                     view_mode_changed } },
+    { .kind = MI_CHOICE, .label = "Memory",
+      .u.choice = { &g_region, g_region_labels, MEM_REGION_COUNT,
+                    region_changed } },
     { .kind = MI_SEPARATOR },
     { .kind = MI_ACTION, .label = "Go to start",
       .u.action = { action_goto_start, NULL } },
     { .kind = MI_ACTION, .label = "Go to image end",
       .u.action = { action_goto_image_end, NULL } },
+    { .kind = MI_SEPARATOR },
+    { .kind = MI_ACTION, .label = "Settings store...",
+      .u.action = { action_open_store, NULL } },
+    { .kind = MI_ACTION, .label = "Store as hex",
+      .u.action = { action_goto_store, NULL } },
+    { .kind = MI_ACTION, .label = "Live entry as hex",
+      .u.action = { action_goto_live_entry, NULL } },
 };
 
 const menu_def_t flash_viewer_menu =

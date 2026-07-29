@@ -97,14 +97,35 @@ typedef struct
   int count;
 } menu_def_t;
 
-// Modal text page: a title, a list of lines, and optionally a body() callback
-// for values that have to be computed when the page is opened
+/*
+ * Modal text page: a title and `count` lines, supplied either as a ready-made
+ * array or by a callback that renders them on demand.
+ *
+ * A page never paints itself. There used to be a third option - a body()
+ * callback that drew at its own coordinates - and it was a trap: the page had
+ * to know where the bottom of the panel was, and anything it put below that
+ * was silently lost. Nothing warned, on screen or at build time. The System
+ * Information page had reached the last usable row, so the next field added to
+ * it would just not have appeared.
+ *
+ * With lines, the widget owns the layout. It picks the roomy grid when the
+ * content fits, the tight one when it does not, and scrolls with a scrollbar
+ * past that - so a page can grow by any amount and stays readable, without
+ * anyone checking arithmetic against INFO_BODY_BOTTOM.
+ */
 typedef struct
 {
   const char *title;
-  const char *const *lines; // may be NULL
+  const char *const *lines; // may be NULL if line_fn is set
   int count;
-  void (*body)(void);       // drawn after the lines, may be NULL
+
+  // Renders line `index` instead of reading lines[index]. For text that is
+  // generated rather than stored: the config dump is eighty lines, and
+  // holding all of it would cost 3 KB of a 64 KB TCM that keeps 16 KB back
+  // for stack and heap - the linker rejects that. The callback owns the
+  // storage it returns and it need only stay valid until the next call, so
+  // one shared buffer does. Takes precedence over lines[].
+  const char *(*line_fn)(int index);
 } info_page_t;
 
 /*- Prototypes --------------------------------------------------------------*/

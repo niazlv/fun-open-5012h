@@ -108,8 +108,13 @@ typedef struct
 
   // General settings
   int      screen_brightness;
-  bool     shift_mode_enabled;
+  bool     shift_mode_enabled;  // double click on SHIFT: sticky for one key
   bool     shift_mode_active;
+  // Carved out of the alignment padding that already sat between the bools
+  // above and key_mapping, so sizeof(Config) does not move and a config saved
+  // by the firmware before it stays readable. It reads false there, which is
+  // this switch off - one toggle in the menu, not a lost settings store.
+  bool     shift_hold_lock;     // hold SHIFT: latched until it is tapped off
   
   // Key remapping (store original button codes)
   uint32_t key_mapping[32];  // Map for button remapping
@@ -168,11 +173,18 @@ typedef struct
   int      calib_ref_mv;
 
   // Display processing, carved out of padding (configs saved before these
-  // existed read 0 = both off). display_persist accumulates a per-column
-  // envelope across frames; average_mode is the acquisition averaging depth,
-  // 0 = off, otherwise N = 2 << mode (1..5 -> 4, 8, 16, 32, 64).
-  bool     display_persist;
-  bool     display_reserved[3];
+  // existed read 0 = both off). average_mode is the acquisition averaging
+  // depth, 0 = off, otherwise N = 2 << mode (1..5 -> 4, 8, 16, 32, 64).
+  //
+  // persist_mode: 0 = off, 1 = infinite, 2 = decay. It occupies the four
+  // bytes that were `bool display_persist; bool display_reserved[3];` - same
+  // offset, same size, same alignment (calib_ref_mv above it is an int), so
+  // sizeof(Config) and every field below are untouched. The numbering is not
+  // arbitrary either: little-endian puts the old bool in the low byte, so a
+  // config saved with persistence ON reads back as exactly 1, which is why 1
+  // has to mean the behaviour that bool used to select. No migration code,
+  // and nothing stored is invalidated.
+  int      persist_mode;
   int      average_mode;
 
   // UART decoder baud: index into the menu's rate table, 0 = auto-detect.
@@ -240,8 +252,26 @@ typedef struct
   // Tetris's, on the same terms
   int      tetris_high_score;
 
-  uint32_t padding[2];  // Reduced padding to accommodate new fields
+  // Seals the calibration block below on its own, so it can be believed when
+  // the entry around it cannot. Everything else in here is a preference, and
+  // losing one costs a minute of setting the scope back up. Calibration is not
+  // a preference: it is a measurement of THIS unit's analog chain, it takes a
+  // reference source and a calibration run to reproduce, and the numbers
+  // config_reset_calibration() falls back on belong to a different unit. It
+  // should not die of a checksum failure somewhere else in the struct.
+  //
+  // Carved out of padding like every field above it, so no offset moves. Reads
+  // 0 in a config saved before this existed, which fails to validate and
+  // leaves the recovery path with nothing to find - calibration in such an
+  // entry still loads the ordinary way, vouched for by the entry's own crc.
+  uint32_t calib_crc;
 
+  uint32_t padding[1];  // Reduced padding to accommodate new fields
+
+  // The calibration block. Contiguous, and last before crc, on purpose:
+  // calib_crc covers exactly the bytes from calib_channel_delta up to crc. A
+  // new field must NOT be appended here - put it in padding[] above, or it
+  // lands inside the sealed range and silently changes what the seal means.
   int      calib_channel_delta;
   int      calib_dac_zero;
   int      calib_dac_mult[VS_COUNT];
@@ -255,7 +285,69 @@ extern Config config;
 
 /*- Prototypes --------------------------------------------------------------*/
 void config_init(void);
+
+// Preferences back to defaults. Deliberately does NOT touch the calibration
+// block - the boot-time button combo in main.c means "I have made a mess of
+// the settings", not "throw away this unit's analog calibration", and until
+// the two were separated it meant both.
 void config_reset(void);
+
+// ...which is what this is for: the calibration menu's own way of saying it,
+// and where config_init() lands when there is nothing to recover
+void config_reset_calibration(void);
+
+// Where the calibration in use came from, for the System Information line
+typedef enum
+{
+  CONFIG_CALIB_DEFAULTS,   // another unit's numbers - measurements are a guess
+  CONFIG_CALIB_LOADED,     // came in with a valid config entry
+  CONFIG_CALIB_RECOVERED,  // salvaged from an entry whose config half was bad
+} ConfigCalibSource;
+
+ConfigCalibSource config_calib_source(void);
+
+// One line of the above for the System Information page
+void config_get_calib_state(char *buf, int size);
+
+// The calibration numbers as text, for the page that exists so they can be
+// copied onto paper. Line by line; returns false once past the last one.
+bool config_get_calib_line(int index, char *buf, int size);
+
+//-----------------------------------------------------------------------------
+// Reading the store from outside, for the flash viewer.
+//
+// The point is being able to answer "what is actually on the flash" separately
+// from "what is the scope using", because the two disagreeing is the whole
+// class of bug this store keeps producing. Everything here is read-only.
+//-----------------------------------------------------------------------------
+
+// Why an entry is not being used, which is more useful than a yes/no: a slot
+// that fails on magic has never been written, one that fails on crc was.
+typedef enum
+{
+  CONFIG_ENTRY_BLANK,        // erased, 0xff throughout
+  CONFIG_ENTRY_VALID,
+  CONFIG_ENTRY_BAD_MAGIC,
+  CONFIG_ENTRY_BAD_VERSION,  // written by another firmware
+  CONFIG_ENTRY_BAD_SIZE,     // ...one whose Config was a different size
+  CONFIG_ENTRY_BAD_CRC,      // written, and did not survive
+} ConfigEntryState;
+
+int config_store_entries(void);
+const Config *config_store_entry(int index);
+ConfigEntryState config_store_entry_state(int index);
+const char *config_entry_state_name(ConfigEntryState state);
+
+// Which slot config was loaded from / is being written to, -1 if neither
+int config_store_live_index(void);
+
+// Whether an entry's calibration block seals, independently of the entry
+bool config_store_entry_calib_ok(int index);
+
+// One line of a Config rendered as "name  value", for both the store viewer
+// and the page that shows what is in RAM. cfg may be any entry or &config.
+// Returns false once past the last line.
+bool config_describe(const Config *cfg, int index, char *buf, int size);
 void config_task(void);
 
 // Saves now rather than at the next timer tick, and waits for the flash
