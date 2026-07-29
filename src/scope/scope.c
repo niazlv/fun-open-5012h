@@ -387,11 +387,21 @@ static int  g_trend_timer = TIMER_DISABLE;
 // trace becomes a strip chart - the input's peak envelope over one column's
 // worth of time, appended at the right, everything else one column older.
 //
-// The history IS g_display_buffer, shifted: it is already 300 columns of
-// min/max/flags in display rows, TCM has ~1 KB left over the linker's stack
-// reserve, and a second copy of it would take most of that. What that costs
-// is spelled out in roll_rescale(), which is why the vertical keys remap the
-// stored rows instead of clearing them.
+// The history is kept here rather than in g_display_buffer, and the 900 bytes
+// of TCM that costs buy exactly one thing: the strip survives a look at
+// something else. The spectrum, the trend and the decoder all own the trace
+// columns and write their own picture into them, so a plot that lived there
+// was gone the moment any of them was opened - ten minutes of recording lost
+// to a glance at the spectrum and back.
+//
+// Rows, not millivolts, because that is what a column of the display buffer
+// is and this is copied straight into one. What that costs is spelled out in
+// roll_rescale(), which is why the vertical keys remap the stored rows
+// instead of dropping them.
+static uint8_t g_roll_row_min[GRID_WIDTH];
+static uint8_t g_roll_row_max[GRID_WIDTH];
+static uint8_t g_roll_row_flags[GRID_WIDTH];
+
 static bool g_roll_active = false;
 static int  g_roll_col_us = 0;    // time one display column covers
 static int  g_roll_acc_us = 0;    // ...and how much of it is in the open one
@@ -403,6 +413,7 @@ static int cursor_t_col(int64_t t_ns);
 static int cursor_v_row(int mv);
 static int64_t roll_screen_ns(void);
 static void roll_sync(void);
+static void roll_publish(void);
 
 typedef struct
 {
@@ -3697,30 +3708,49 @@ static int roll_row(int raw)
 }
 
 //-----------------------------------------------------------------------------
-// Start the open column over and put the whole strip back on screen. Every
-// path that rewrites the plotted columns ends here.
-static void roll_reopen(void)
+// The strip onto the screen. The columns are already in display space, so
+// this is a copy - and it is a copy rather than the plot living there in the
+// first place because the display buffer belongs to whatever view is up.
+static void roll_publish(void)
 {
-  g_roll_min   = 255;
-  g_roll_max   = 0;
-  g_roll_acc_us = 0;
-  g_roll_stamp = timer_us();
+  if (!g_roll_active)
+    return; // another view owns the columns; the strip waits its turn
+
+  memcpy(g_display_buffer.min, g_roll_row_min, GRID_WIDTH);
+  memcpy(g_display_buffer.max, g_roll_row_max, GRID_WIDTH);
+  memcpy(g_display_buffer.flags, g_roll_row_flags, GRID_WIDTH);
+
   g_shadow_valid = false;
   redraw_trace();
 }
 
 //-----------------------------------------------------------------------------
-// Forget the plotted history. Only where there is nothing to carry over:
-// entering the view, and coming back to it from one that owned the columns.
+// Start the open column over and put the whole strip back on screen. Every
+// path that rewrites the stored columns ends here.
+//
+// Deliberately does NOT restamp the clock. The strip is anchored to wall
+// clock, and time that passed while the view was elsewhere is time the input
+// was not watched: roll_task shifts blank columns in for it, so a break in
+// the recording is drawn as a break rather than closed up.
+static void roll_reopen(void)
+{
+  g_roll_min   = 255;
+  g_roll_max   = 0;
+  g_roll_acc_us = 0;
+  roll_publish();
+}
+
+//-----------------------------------------------------------------------------
+// Forget the plotted history. Only where there is nothing left to carry over:
+// the first entry since boot, and coming back after longer than the strip
+// spans. Restamps, because a blank strip has no gap left to draw.
 static void roll_clear(void)
 {
-  for (int c = 0; c < GRID_WIDTH; c++)
-  {
-    g_display_buffer.min[c]   = GRID_HEIGHT/2-1;
-    g_display_buffer.max[c]   = GRID_HEIGHT/2-1;
-    g_display_buffer.flags[c] = SAMPLE_FLAG_NONE;
-  }
+  memset(g_roll_row_min, GRID_HEIGHT/2-1, GRID_WIDTH);
+  memset(g_roll_row_max, GRID_HEIGHT/2-1, GRID_WIDTH);
+  memset(g_roll_row_flags, SAMPLE_FLAG_NONE, GRID_WIDTH);
 
+  g_roll_stamp = timer_us();
   roll_reopen();
 }
 
@@ -3741,12 +3771,12 @@ static void roll_clear(void)
 // resolution it was RECORDED at - which is a true statement about the signal,
 // where throwing ten minutes of history away over one keypress is not.
 //
-// In place, because there is no TCM for a second copy of the buffer. The two
-// directions need opposite orders and the arithmetic is what guarantees it:
-// compressing, a new column never reads anything to the right of itself, so
-// the sweep goes right to left; expanding, never anything to the left, so it
-// goes the other way. Either way a column is written only after everything
-// that reads it has been.
+// In place, because a second copy of the strip is another 900 bytes of TCM.
+// The two directions need opposite orders and the arithmetic is what
+// guarantees it: compressing, a new column never reads anything to the right
+// of itself, so the sweep goes right to left; expanding, never anything to
+// the left, so it goes the other way. Either way a column is written only
+// after everything that reads it has been.
 static void roll_retime(int old_us, int new_us)
 {
   int step = (new_us > old_us) ? -1 : 1;
@@ -3770,31 +3800,31 @@ static void roll_retime(int old_us, int new_us)
 
     for (int i = first; i <= last; i++)
     {
-      if (!(g_display_buffer.flags[i] & SAMPLE_FLAG_VALID))
+      if (!(g_roll_row_flags[i] & SAMPLE_FLAG_VALID))
         continue;
 
-      if (g_display_buffer.min[i] < min)
-        min = g_display_buffer.min[i];
+      if (g_roll_row_min[i] < min)
+        min = g_roll_row_min[i];
 
-      if (g_display_buffer.max[i] > max)
-        max = g_display_buffer.max[i];
+      if (g_roll_row_max[i] > max)
+        max = g_roll_row_max[i];
 
-      flags |= g_display_buffer.flags[i];
+      flags |= g_roll_row_flags[i];
     }
 
     // Nothing was ever recorded this far back: the strip now spans more time
     // than it has been running for, and those columns are honestly empty
     if (max < 0)
     {
-      g_display_buffer.min[j]   = GRID_HEIGHT/2-1;
-      g_display_buffer.max[j]   = GRID_HEIGHT/2-1;
-      g_display_buffer.flags[j] = SAMPLE_FLAG_NONE;
+      g_roll_row_min[j]   = GRID_HEIGHT/2-1;
+      g_roll_row_max[j]   = GRID_HEIGHT/2-1;
+      g_roll_row_flags[j] = SAMPLE_FLAG_NONE;
     }
     else
     {
-      g_display_buffer.min[j]   = min;
-      g_display_buffer.max[j]   = max;
-      g_display_buffer.flags[j] = flags;
+      g_roll_row_min[j]   = min;
+      g_roll_row_max[j]   = max;
+      g_roll_row_flags[j] = flags;
     }
   }
 
@@ -3812,29 +3842,30 @@ static void roll_retime(int old_us, int new_us)
 // the bottom of the grid - clip_for_display() threw the rest of it away when
 // the column was written, exactly as it does for the live trace. Zooming out
 // therefore un-clips nothing; it only stops NEW columns from clipping.
+//
+// Runs whether or not the view is up. The strip outlives a look at the
+// spectrum now, and a volts/div change made while looking at it would
+// otherwise leave every stored row meaning something the mapping no longer
+// says.
 static void roll_rescale(int old_scale, int old_vpos)
 {
   int scale = vs_px_value[config.vertical_scale];
 
-  if (!g_roll_active)
-    return;
-
   for (int c = 0; c < GRID_WIDTH; c++)
   {
-    if (!(g_display_buffer.flags[c] & SAMPLE_FLAG_VALID))
+    if (!(g_roll_row_flags[c] & SAMPLE_FLAG_VALID))
       continue;
 
     // clip_for_display() is row = GRID_HEIGHT/2-1 - value, so this runs it
     // backwards into a value, into millivolts, and forwards again
-    int lo = (GRID_HEIGHT/2-1 - g_display_buffer.min[c] - old_vpos) * old_scale;
-    int hi = (GRID_HEIGHT/2-1 - g_display_buffer.max[c] - old_vpos) * old_scale;
+    int lo = (GRID_HEIGHT/2-1 - g_roll_row_min[c] - old_vpos) * old_scale;
+    int hi = (GRID_HEIGHT/2-1 - g_roll_row_max[c] - old_vpos) * old_scale;
 
-    g_display_buffer.min[c] = clip_for_display(lo / scale + config.vertical_position);
-    g_display_buffer.max[c] = clip_for_display(hi / scale + config.vertical_position);
+    g_roll_row_min[c] = clip_for_display(lo / scale + config.vertical_position);
+    g_roll_row_max[c] = clip_for_display(hi / scale + config.vertical_position);
   }
 
-  g_shadow_valid = false;
-  redraw_trace();
+  roll_publish();
 }
 
 //-----------------------------------------------------------------------------
@@ -3844,16 +3875,16 @@ static void roll_commit(void)
 {
   int flags = SAMPLE_FLAG_NONE;
 
-  memmove(&g_display_buffer.min[0], &g_display_buffer.min[1], GRID_WIDTH-1);
-  memmove(&g_display_buffer.max[0], &g_display_buffer.max[1], GRID_WIDTH-1);
-  memmove(&g_display_buffer.flags[0], &g_display_buffer.flags[1], GRID_WIDTH-1);
+  memmove(&g_roll_row_min[0], &g_roll_row_min[1], GRID_WIDTH-1);
+  memmove(&g_roll_row_max[0], &g_roll_row_max[1], GRID_WIDTH-1);
+  memmove(&g_roll_row_flags[0], &g_roll_row_flags[1], GRID_WIDTH-1);
 
   if (g_roll_min <= g_roll_max)
   {
     // min/max are counts here and rows on the way out, and the two run
     // opposite ways: a bigger count is a HIGHER pixel, i.e. a smaller row
-    g_display_buffer.min[GRID_WIDTH-1] = roll_row(g_roll_max);
-    g_display_buffer.max[GRID_WIDTH-1] = roll_row(g_roll_min);
+    g_roll_row_min[GRID_WIDTH-1] = roll_row(g_roll_max);
+    g_roll_row_max[GRID_WIDTH-1] = roll_row(g_roll_min);
 
     flags = SAMPLE_FLAG_VALID;
 
@@ -3863,8 +3894,13 @@ static void roll_commit(void)
     if (g_roll_max == 255)
       flags |= SAMPLE_FLAG_CLIP_H;
   }
+  else
+  {
+    g_roll_row_min[GRID_WIDTH-1] = GRID_HEIGHT/2-1;
+    g_roll_row_max[GRID_WIDTH-1] = GRID_HEIGHT/2-1;
+  }
 
-  g_display_buffer.flags[GRID_WIDTH-1] = flags;
+  g_roll_row_flags[GRID_WIDTH-1] = flags;
 
   g_roll_min = 255;
   g_roll_max = 0;
@@ -3924,11 +3960,10 @@ static void roll_task(void)
 
   if (columns > 0)
   {
-    g_shadow_valid = false;
     // The sweep paints one column per pass and everything moved, so this is
     // a full repaint - ~11 ms of LCD writes spread over the next 300 passes,
     // which is why the roll threshold stops where it does
-    redraw_trace();
+    roll_publish();
   }
 }
 
@@ -3958,13 +3993,32 @@ static void roll_set_active(bool active)
 
   if (active)
   {
+    int old_us = g_roll_col_us;
+    int stale_min, stale_max;
+
     // Panning has nothing to pan: the newest column is the present, and
     // there is no record either side of the screen to walk into
     config.horizontal_position = 0;
     config.horizontal_position_px = 0;
 
     g_roll_col_us = roll_column_us();
-    roll_clear();
+
+    // The ring has been turning the whole time this view was not up, and the
+    // fold's read point with it. Take that stretch and throw it away, or the
+    // first column back would carry up to a ring of signal in it.
+    capture_fold_samples(&stale_min, &stale_max);
+
+    // Whatever is stored is still a strip of the same input at the same
+    // sample rate; it is only OLDER, and roll_task shifts blank columns in
+    // for the time spent away (or clears it, past a screenful). A timebase
+    // moved while another view was up gets the same rescaling as one moved
+    // in here - the stored columns just cover a different amount of time.
+    if (old_us > 0 && old_us != g_roll_col_us)
+      roll_retime(old_us, g_roll_col_us);
+    else if (old_us <= 0)
+      roll_clear(); // first entry since boot: there is no strip yet
+    else
+      roll_publish();
   }
 
   // AUTO while rolling whatever the trigger says, and the user's mode back
@@ -4072,12 +4126,12 @@ static void update_display(void)
     return;
   }
 
-  // ...and it is the roll history while THAT view is up, which the columns
-  // of a record would wipe out. Nothing to rebuild here either: roll_task()
-  // owns those columns and appends to them on its own clock.
+  // ...and it is the roll strip while THAT view is up, which the columns of
+  // a record would wipe out. Nothing to rebuild: roll_task() keeps the strip
+  // in its own store and this only puts it back on screen.
   if (g_roll_active)
   {
-    redraw_trace();
+    roll_publish();
     return;
   }
 
