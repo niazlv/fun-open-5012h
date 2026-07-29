@@ -61,6 +61,13 @@ enum
   // 25.000), while the peak is only as fine as a bin but cannot miss an edge
   // it never had to find. Where the two disagree, the faster signal is why.
   MEASURE_FFT_FREQ,
+  // The lowest frequency above nyquist that would have folded to the reading
+  // shown by the two above. It appears only while the record cannot rule that
+  // reading out - see alias.h - so a blank here is an answer too: it means the
+  // harmonics stand where only an in-band source can put them, or that the
+  // question does not arise. Never a second opinion on a frequency; the only
+  // claim it makes is "could equally be this".
+  MEASURE_ALIAS,
   MEASURE_COUNT,
 };
 
@@ -123,6 +130,16 @@ typedef struct
   int      sample_rate_limit;
 
   bool     measure_display;
+
+  // MEASURE_ALIAS as a panel/status metric. It sits HERE, in the three-byte
+  // alignment hole that already followed measure_display, and not at the end
+  // of the show_* run where it belongs by meaning: that run ends flush against
+  // measure_line, so a bool appended there pushes every later field - crc and
+  // the whole calibration block included - and the store drops an entry whose
+  // sizeof does not match, erasing calibration with it. Same reasoning as
+  // show_jitter and show_fft_freq, which is why neither of those is beside its
+  // siblings either. sizeof(Config) stays 416 and no offset moves.
+  bool     show_alias;
 
   // General settings
 

@@ -609,6 +609,17 @@ static SignalClass g_signal_class = { SIG_UNKNOWN, -1 };
 // when no record or no peak stood out of the floor
 static int g_spectrum_hz = 0;
 
+// The lowest above-nyquist frequency that would have folded to g_spectrum_hz,
+// for the same record; 0 when the record rules that reading out or cannot
+// raise the question. Kept apart from g_fft_alias, which belongs to the
+// SPECTRUM view and is only refreshed while that view is on screen - this one
+// has to answer in the ordinary sweep too. Scratch for it is static rather
+// than automatic: FftAnalysis and AliasAnalysis together are ~240 bytes, and
+// the TCM stack is the one pool with no room to spare.
+static int g_alias_hz = 0;
+static FftAnalysis g_alias_an;
+static AliasAnalysis g_alias_res;
+
 // Measurements panel state: 1bpp text mask, one bit per trace-area pixel
 static bool g_mpanel_active = false;
 static bool g_mpanel_force = false;   // rebuild the panel text on the next tick
@@ -1639,11 +1650,29 @@ static void signal_info_update(void)
     fft_spectrum(g_fft_samples, FFT_SIZE, 0, g_fft_mag);
     classify_signal(&m, g_fft_mag, FFT_BINS, fund_bin, &g_signal_class);
     g_spectrum_hz = fft_peak_frequency(g_fft_mag, period_ns);
+
+    // Same argument as the peak above: the transform is already paid for, and
+    // this reads an answer out of it. The spectrum here is undecimated by
+    // construction - FFT_SIZE samples straight off the record - which is the
+    // one condition alias.c reasons under, since past that the band edge is
+    // the decimation's low-pass rather than the analog frontend.
+    //
+    // Only ALIAS_POSSIBLE produces a number. IN_BAND means the harmonics were
+    // found where only an in-band source can put them, and printing "could be
+    // 108 MHz" beside a reading the record just PROVED honest would be worse
+    // than printing nothing; NO_EVIDENCE means the test was refused rather
+    // than passed, and a refusal is not a candidate either.
+    fft_analyze(g_fft_mag, period_ns, &g_alias_an);
+    alias_check(g_fft_mag, &g_alias_an, ALIAS_FRONTEND_HZ, &g_alias_res);
+
+    g_alias_hz = (ALIAS_POSSIBLE == g_alias_res.verdict && g_alias_res.count > 1) ?
+        (int)(g_alias_res.cand[1].freq + 0.5f) : 0;
   }
   else
   {
     classify_signal(&m, NULL, 0, 0, &g_signal_class);
     g_spectrum_hz = 0;
+    g_alias_hz = 0;
   }
 
   cached_gen = gen;
@@ -1681,6 +1710,17 @@ static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
       signal_info_update();
       tag = "F"; label = "fft";
       value = g_spectrum_hz > 0 ? format_frequency(g_spectrum_hz) : "  --.--  ";
+      break;
+
+    case MEASURE_ALIAS:
+      // '?' rather than a letter, and the same '?' the spectrum panel marks
+      // an unresolvable F0 with: this is not a measurement of anything, it is
+      // the other frequency the same record would look like. Blank most of
+      // the time, and that blank is the normal state - see MEASURE_ALIAS in
+      // config.h for what it means.
+      signal_info_update();
+      tag = "?"; label = "?";
+      value = g_alias_hz > 0 ? format_frequency(g_alias_hz) : "  --.--  ";
       break;
 
     case MEASURE_DUTY:
@@ -1748,7 +1788,7 @@ static int measure_build_items(const ScopeMeasure *sm, MeasureItem *it)
   // A config saved before these flags existed reads all-false: default set
   bool any = config.show_vpp || config.show_freq || config.show_duty ||
       config.show_vrms || config.show_vavg || config.show_type || config.show_thd || config.show_jitter ||
-      config.show_fft_freq;
+      config.show_fft_freq || config.show_alias;
 
   const bool shown[MEASURE_COUNT] =
   {
@@ -1761,6 +1801,7 @@ static int measure_build_items(const ScopeMeasure *sm, MeasureItem *it)
     [MEASURE_THD]  = any && config.show_thd,
     [MEASURE_JITTER] = any && config.show_jitter,
     [MEASURE_FFT_FREQ] = any && config.show_fft_freq,
+    [MEASURE_ALIAS] = any && config.show_alias,
   };
 
   int n = 0;

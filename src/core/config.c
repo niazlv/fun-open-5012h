@@ -1415,6 +1415,7 @@ static const struct
   FIELD(show_thd, FT_BOOL),
   FIELD(show_jitter, FT_BOOL),
   FIELD(show_fft_freq, FT_BOOL),
+  FIELD(show_alias, FT_BOOL),
   FIELD(measure_line_set, FT_BOOL),
   FIELD_N(measure_line, FT_IARR, MEASURE_LINE_SLOTS),
 
@@ -1645,6 +1646,7 @@ void config_reset(void)
   config.show_jitter            = false;
   config.decoder_stop_start     = false;
   config.show_fft_freq          = false;
+  config.show_alias             = false;
 
   config.persist_mode           = 0; // 0 = off, 1 = infinite, 2 = decay
   config.average_mode           = 0;

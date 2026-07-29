@@ -70,7 +70,7 @@ static const char *const g_measure_panel_labels[] = { "On", "Off" };
 static const char *const g_measure_slot_labels[] =
 {
   "Off", "Vpp", "Frequency", "Duty", "Vrms", "Vavg", "Type", "THD", "Jitter",
-  "f (spectrum)",
+  "f (spectrum)", "? (above nyquist)",
 };
 
 // The slot choice cycles through MEASURE_COUNT entries, so this array MUST
@@ -1176,6 +1176,9 @@ static const menu_item_t g_panel_items[] =
   { .kind = MI_TOGGLE, .label = "f (spectrum)",
     .desc = "Frequency off the FFT peak, beside the counter's",
     .u.toggle = { &config.show_fft_freq, NULL } },
+  { .kind = MI_TOGGLE, .label = "? (above nyquist)",
+    .desc = "What it could be if the reading is a fold",
+    .u.toggle = { &config.show_alias, NULL } },
 };
 
 // The status line: exactly two values in the large font, and the user says
