@@ -39,7 +39,24 @@
 #define STATUS_H                16
 
 #define COLOR_W                 256
+
+/*
+ * Always centred, whatever else is on the panel.
+ *
+ * It was briefly moved to the left edge to make one wide column for the
+ * status text, and that was wrong twice over: the picture stopped being
+ * symmetrical in its frame, which reads as a stretched screen, and 64 pixels
+ * of column is more than four numbers need. It gets the right-hand margin
+ * instead, which is 32 pixels and enough.
+ */
 #define COLOR_X                 ((LCD_WIDTH - COLOR_W) / 2)
+
+/*
+ * The battery gauge is drawn at 289,4 by battery.c and belongs to the whole
+ * instrument, not to any application - so the column starts underneath it
+ * rather than on top of it.
+ */
+#define MARGIN_TOP              20
 
 #define MONO_W                  LCD_WIDTH   // a 320 dot window of the 512
 #define MONO_X                  0
@@ -96,16 +113,32 @@ static const uint16_t g_palettes[1][4] =
 };
 #endif
 
+// One bit a dot, for the window mode: index is 0 or 1
 static const uint16_t g_mono[4] =
 {
     LCD_COLOR(0,0,0), LCD_COLOR(255,255,255),
     LCD_COLOR(0,0,0), LCD_COLOR(255,255,255),
 };
 
+/*
+ * Two dots a pixel, for the whole-screen mode: index is the pair.
+ *
+ * Both lit is white, neither is black, and one of the two is grey - which is
+ * not a compromise but the point. Rounding a half-lit pair either way turns a
+ * 512-dot character into a smear or into gaps; a grey column keeps the shape
+ * of it, which is what the eye reads text by.
+ */
+static const uint16_t g_mono_pairs[4] =
+{
+    LCD_COLOR(0,0,0), LCD_COLOR(150,150,150),
+    LCD_COLOR(150,150,150), LCD_COLOR(255,255,255),
+};
+
 static bk_screen_t g_screen = BK_SCREEN_COLOR;
 static bk_fit_t g_fit = BK_FIT_CROP;
 static int g_top = 8;               // crop: which line lands on panel row 0
 static int g_pan;                   // mono: which dot lands on panel column 0
+static bk_mono_t g_mono_fit = BK_MONO_WHOLE;
 static bool g_status;
 
 static uint8_t *g_buf;
@@ -143,6 +176,30 @@ void bk_video_set_fit(bk_fit_t fit)
 }
 
 //-----------------------------------------------------------------------------
+void bk_video_set_mono(bk_mono_t mono)
+{
+    if (mono != g_mono_fit)
+    {
+        g_mono_fit = mono;
+        lcd_fill_rect(0, 0, LCD_WIDTH, VIEW_H_FULL, LCD_BLACK_COLOR);
+        bk_vram_mark_all();
+    }
+}
+
+//-----------------------------------------------------------------------------
+// True when the picture is 256 pixels wide, which is both the colour mode and
+// mono showing the whole screen - the two that leave a margin
+static bool narrow(void)
+{
+#if BK_VIDEO_MONO
+    if (BK_SCREEN_MONO == g_screen)
+        return BK_MONO_WHOLE == g_mono_fit;
+#endif
+
+    return true;
+}
+
+//-----------------------------------------------------------------------------
 void bk_video_set_top(int line)
 {
     g_top = (line < 0) ? 0 : (line > 16 ? 16 : line);
@@ -159,25 +216,80 @@ void bk_video_set_pan(int dot)
 //-----------------------------------------------------------------------------
 void bk_video_set_status(bool on)
 {
-    if (on != g_status)
+    if (on == g_status)
+        return;
+
+    g_status = on;
+
+    /*
+     * Only mono changes shape - it is the one that has to give rows up. In
+     * colour the picture is where it always was and the column is margin that
+     * was black anyway, so nothing under it needs repainting.
+     */
+#if BK_VIDEO_MONO
+    if (BK_SCREEN_MONO == g_screen)
     {
-        g_status = on;
         lcd_fill_rect(0, 0, LCD_WIDTH, VIEW_H_FULL, LCD_BLACK_COLOR);
         bk_vram_mark_all();
+        return;
+    }
+#endif
+
+    if (!on)
+    {
+        int x, y, w, h;
+
+        // Erase where it was, since nothing else draws there
+        x = COLOR_X + COLOR_W;
+        y = MARGIN_TOP;
+        w = LCD_WIDTH - x;
+        h = VIEW_H_FULL - y;
+        lcd_fill_rect(x, y, w, h, LCD_BLACK_COLOR);
     }
 }
 
 //-----------------------------------------------------------------------------
+// Only mono has to give rows up. In colour the text goes beside the picture,
+// not under it.
 int bk_video_bottom(void)
 {
-    return g_status ? (VIEW_H_FULL - STATUS_H) : VIEW_H_FULL;
+    if (g_status && !narrow())
+        return VIEW_H_FULL - STATUS_H;
+
+    return VIEW_H_FULL;
+}
+
+//-----------------------------------------------------------------------------
+void bk_video_spare(int *x, int *y, int *w, int *h)
+{
+    if (!g_status)
+    {
+        *x = *y = *w = *h = 0;
+        return;
+    }
+
+    if (!narrow())
+    {
+        // Nothing spare beside a 320 pixel picture, so it comes off the bottom
+        *x = 0;
+        *y = VIEW_H_FULL - STATUS_H;
+        *w = LCD_WIDTH;
+        *h = STATUS_H;
+        return;
+    }
+
+    // The right-hand margin, under the battery gauge
+    *x = COLOR_X + COLOR_W;
+    *y = MARGIN_TOP;
+    *w = LCD_WIDTH - (COLOR_X + COLOR_W);
+    *h = VIEW_H_FULL - MARGIN_TOP;
 }
 
 //-----------------------------------------------------------------------------
 const uint16_t *bk_video_palette(void)
 {
     if (BK_SCREEN_MONO == g_screen)
-        return g_mono;
+        return (BK_MONO_WHOLE == g_mono_fit) ? g_mono_pairs : g_mono;
 
     return g_palettes[bk_io_palette() % (sizeof(g_palettes) / sizeof(g_palettes[0]))];
 }
@@ -259,17 +371,15 @@ int bk_video_draw(bool full)
     if (NULL == bk_mem || NULL == g_buf)
         return 0;
 
-#if BK_VIDEO_MONO
-    if (BK_SCREEN_MONO == g_screen)
-    {
-        x = MONO_X;
-        w = MONO_W;
-    }
-    else
-#endif
+    if (narrow())
     {
         x = COLOR_X;
         w = COLOR_W;
+    }
+    else
+    {
+        x = MONO_X;
+        w = MONO_W;
     }
 
     /*
@@ -324,8 +434,13 @@ int bk_video_draw(bool full)
             if (0 == run)
                 run_start = row;
 
+            /*
+             * The whole-screen mono mode is the colour expansion with a
+             * different palette: pairs of bits become one pixel either way,
+             * and the only difference is what the four values are painted as.
+             */
 #if BK_VIDEO_MONO
-            if (BK_SCREEN_MONO == g_screen)
+            if (BK_SCREEN_MONO == g_screen && BK_MONO_WINDOW == g_mono_fit)
                 expand_mono(src, dst, g_pan);
             else
 #endif

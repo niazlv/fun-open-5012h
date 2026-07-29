@@ -134,6 +134,13 @@ void bk_io_key(uint8_t code, bool ar2)
 }
 
 //-----------------------------------------------------------------------------
+void bk_io_key_flush(void)
+{
+    g_kbd_status &= (uint16_t)~BK_KBD_READY;
+    g_kbd_deferred = 0;
+}
+
+//-----------------------------------------------------------------------------
 void bk_io_key_release(void)
 {
     g_system |= SYS_SOUND | SYS_READY;

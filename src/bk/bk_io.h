@@ -67,6 +67,26 @@ void bk_io_reset(void);
  */
 void bk_io_key(uint8_t code, bool ar2);
 void bk_io_key_release(void);
+
+/*
+ * Throw away a code nobody has read yet.
+ *
+ * The hardware has one register and one ready flag, and a controller that
+ * refuses to overwrite an unread code - so a keystroke the program has not got
+ * round to reading blocks the next one. That is faithful, and on the real
+ * machine it is nearly invisible: a BK game reads the keyboard every 50 Hz
+ * frame, and nobody presses two keys inside twenty milliseconds.
+ *
+ * It is not invisible here, because a front panel gives state and not events:
+ * the emulator has to invent a repeat to make a held key work, and a repeat
+ * that fires just before the player lets go leaves a stale code in the
+ * register. The player then presses left and walks up.
+ *
+ * So when the key that is physically down changes, the old one goes. Losing a
+ * press the program never read costs a move; delivering it costs the move the
+ * player actually asked for, and in a game like Boulder Dash that is a death.
+ */
+void bk_io_key_flush(void);
 #endif
 
 // The STOP key. Not a code at all: it is a line into the processor.

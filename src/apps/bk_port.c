@@ -85,12 +85,32 @@
 // 50 Hz off the video timing, in processor cycles
 #define EVNT_PERIOD             (BK_CPU_HZ / 50)
 
+/*
+ * How often the panel is repainted, in milliseconds.
+ *
+ * A BK refreshes fifty times a second and that is what its programs are
+ * written against, so anything more often is a picture nobody can see being
+ * paid for in bit-banged pixels. Painting every pass of the task loop came to
+ * seventeen thousand repaints a second, most of them one row - all of it time
+ * the emulated processor could have had.
+ */
+#define REPAINT_MS              20
+
 // How often a held key is presented to the machine again. The BK's own repeat
 // is a key on the keyboard; this is the rate that makes walking feel right.
 #define KEY_REPEAT_MS           60
 
-#define STATUS_Y                226
 #define MAX_FILES               12
+
+/*
+ * The multiple of a real machine, in hundredths.
+ *
+ * The interesting number when the clock comes off. A БК-0010-01 ran its
+ * К1801ВМ1 at 3 MHz in 1985; this part is a 250 MHz Cortex-M4 from 2014
+ * pretending to be one, and how many times over it manages that is the whole
+ * comparison in one figure.
+ */
+#define TIMES_REAL(khz)         ((khz) * 100u / (BK_CPU_HZ / 1000u))
 
 #define HUD_FG                  LCD_COLOR(200, 200, 200)
 #define HUD_HI                  LCD_COLOR(255, 190, 60)
@@ -117,6 +137,7 @@ typedef struct
 
     uint32_t last_ms;
     uint32_t evnt_left;
+    uint32_t draw_ms;
 
     uint8_t key_code;
     uint32_t key_ms;
@@ -143,15 +164,57 @@ static int g_file_sel;
 
 // Settings, all reachable from the application menu
 static int g_screen_mode;           // BK_SCREEN_*
-static int g_fit_mode;              // BK_FIT_*
+/*
+ * Squash by default, not crop.
+ *
+ * 256 lines have to become 240 somehow. Crop keeps every line its own size and
+ * loses sixteen of them off the top and bottom - which is exactly where a BK
+ * game puts its border, its score line and its status text, because that is
+ * where a television has overscan. Boulder Dash loses the top and bottom walls
+ * of the cave that way.
+ *
+ * Squash drops one line in sixteen instead. The seam is there if you look for
+ * it; a missing wall is there whether you look or not.
+ */
+static int g_fit_mode = BK_FIT_SQUASH;
 static int g_top_line = 8;
 static int g_pan;
-static int g_speed = 100;           // per cent of 3 MHz
+static int g_mono_fit;              // BK_MONO_*
+/*
+ * How fast the machine runs, as a preset and a trim.
+ *
+ * The preset is what the emulated processor is nominally clocked at; the trim
+ * is the correction on top, and it goes down to 5% because the cycle counts in
+ * bk_cpu.c are the shape of the 1801's timings rather than measured silicon.
+ * If a game runs wrong, this is the knob - and the status column shows the
+ * rate actually achieved, so it can be dialled in against a number.
+ *
+ * Unlimited is the last preset: no clock at all, just as much of the machine
+ * as fits between two repaints. What that comes to depends entirely on what
+ * the program is doing.
+ */
+static int g_speed_preset;          // index into g_speed_labels
+static int g_speed_trim = 100;      // per cent
 static bool g_show_status;
 static bool g_joystick = true;
 
+// The multipliers behind the preset names, and Unlimited as the last of them
+static const char *const g_speed_labels[] =
+{
+    "Original 3 MHz", "x2", "x4", "Unlimited"
+};
+
+#define SPEED_UNLIMITED         (ARRAY_SIZE(g_speed_labels) - 1)
+
+static const uint8_t g_speed_mult[] = { 1, 2, 4, 1 };
+
+// How long a pass may spend inside the machine when nothing is throttling it.
+// The panel still has to be painted and the keys still have to be read.
+#define UNLIMITED_BUDGET_US     8000u
+
 static const char *const g_screen_labels[] = { "Colour 256", "Mono 512" };
 static const char *const g_fit_labels[] = { "Crop", "Squash" };
+static const char *const g_mono_labels[] = { "Whole 512", "1:1 window" };
 
 /*- Local prototypes --------------------------------------------------------*/
 static void draw_picker(void);
@@ -167,6 +230,7 @@ static void apply_video(void)
     bk_video_set_screen((bk_screen_t)g_screen_mode);
     bk_video_set_fit((bk_fit_t)g_fit_mode);
     bk_video_set_top(g_top_line);
+    bk_video_set_mono((bk_mono_t)g_mono_fit);
     bk_video_set_pan(g_pan);
     bk_video_set_status(g_show_status);
 }
@@ -267,10 +331,18 @@ static void poll_keys(void)
             return;
         }
 
-        if (code != rt->key_code || now - rt->key_ms >= KEY_REPEAT_MS)
+        if (code != rt->key_code)
         {
+            // A different key is down now, so whatever is still sitting in the
+            // register unread is not what the player means any more
+            bk_io_key_flush();
             bk_io_key(code, false);
             rt->key_code = code;
+            rt->key_ms = now;
+        }
+        else if (now - rt->key_ms >= KEY_REPEAT_MS)
+        {
+            bk_io_key(code, false);
             rt->key_ms = now;
         }
     }
@@ -280,29 +352,25 @@ static void poll_keys(void)
 }
 
 //-----------------------------------------------------------------------------
-// Run the processor for as much emulated time as has really passed, stopping
-// at each 50 Hz edge to raise the line the whole machine's tempo comes from.
-static void run_slice(uint32_t ms)
+// One chunk of the machine, stopping at each 50 Hz edge to raise the line the
+// whole tempo comes from. Returns the cycles spent.
+static uint32_t run_cycles(uint32_t budget)
 {
-    uint32_t budget;
-
-    if (bk_cpu.stopped)
-        return;
-
-    budget = ms * (BK_CPU_HZ / 1000u) / 100u * (uint32_t)g_speed;
+    uint32_t spent = 0;
 
     while (budget > 0 && !bk_cpu.stopped)
     {
         uint32_t chunk = (budget < rt->evnt_left) ? budget : rt->evnt_left;
-        uint32_t spent;
+        uint32_t used;
 
         if (0 == chunk)
             chunk = 1;
 
-        spent = bk_cpu_run(chunk);
+        used = bk_cpu_run(chunk);
+        spent += used;
 
-        budget -= (spent > budget) ? budget : spent;
-        rt->evnt_left -= (spent > rt->evnt_left) ? rt->evnt_left : spent;
+        budget -= (used > budget) ? budget : used;
+        rt->evnt_left -= (used > rt->evnt_left) ? rt->evnt_left : used;
 
         if (0 == rt->evnt_left)
         {
@@ -311,18 +379,84 @@ static void run_slice(uint32_t ms)
         }
     }
 
+    return spent;
+}
+
+//-----------------------------------------------------------------------------
+// Run for as much emulated time as has really passed - or, with no clock at
+// all, for as much of the panel's time as can be spared.
+static void run_slice(uint32_t ms)
+{
+    uint32_t budget;
+    uint32_t spent;
+
+    if (bk_cpu.stopped)
+        return;
+
+    if (SPEED_UNLIMITED == (unsigned)g_speed_preset)
+    {
+        uint32_t start = timer_us();
+
+        spent = 0;
+
+        do
+        {
+            spent += run_cycles(BK_CPU_HZ / 1000u);
+        }
+        while (!bk_cpu.stopped && timer_us() - start < UNLIMITED_BUDGET_US);
+
+        // Time still passes for the machine, at whatever rate it managed
+        bk_io_advance(spent / (BK_CPU_HZ / 1000000u));
+        return;
+    }
+
+    budget = ms * (BK_CPU_HZ / 1000u) * g_speed_mult[g_speed_preset];
+    budget = budget / 100u * (uint32_t)g_speed_trim;
+
+    run_cycles(budget);
+
     bk_io_advance(ms * 1000u);
 }
 
 //-----------------------------------------------------------------------------
 #if BK_STATS
-// Rows, not frames per second, is the number that says where the time went:
-// the panel is bit-banged and a row is what it is slow in, so "40 rows" and
-// "240 rows" are two different machines at the same frame rate.
+//-----------------------------------------------------------------------------
+// "x1.0" for a machine keeping the original's time, "x340" for one that is
+// not. Two significant figures below ten, none above - five characters is what
+// the margin holds, and a hundredth of a times-real is nobody's question.
+static void times_real(char *buf, int size)
+{
+    uint32_t pct = TIMES_REAL(rt->khz);
+
+    if (pct >= 1000u)
+        snprintf(buf, size, "x%-4lu", (unsigned long)(pct / 100u));
+    else
+        snprintf(buf, size, "x%lu.%lu", (unsigned long)(pct / 100u),
+            (unsigned long)((pct % 100u) / 10u));
+}
+
+/*
+ * The reporting column.
+ *
+ * It goes in the 64 pixels of panel the picture does not reach, not under the
+ * picture: 256 dots in a 320 pixel display leave a margin that was black, and
+ * taking sixteen rows off a machine that already cannot fit its 256 lines into
+ * 240 is paying twice for the same thing. In mono there is no margin - 512
+ * dots windowed to 320 fills the panel - and there it is a line at the bottom,
+ * because there is nowhere else it could be.
+ *
+ * Rows, not just frames per second, because the panel is bit-banged and a row
+ * is the unit it is slow in: 240 rows and 40 rows at the same frame rate are
+ * two different machines.
+ *
+ * kHz is what the emulated processor actually achieved. That is the number the
+ * Speed setting is dialled against - a real BK-0010-01 reads 3000.
+ */
 static void draw_status(bool force)
 {
-    char buf[sizeof(rt->statline)];
+    char buf[16];
     uint32_t now = timer_ms();
+    int x, y, w, h;
 
     if (!g_show_status)
         return;
@@ -332,27 +466,95 @@ static void draw_status(bool force)
 
     rt->status_ms = now;
 
-    snprintf(buf, sizeof(buf), "%u fps  %lu kHz  %lu rows  PC %06lo",
-        rt->fps, (unsigned long)rt->khz, (unsigned long)rt->rows,
-        (unsigned long)bk_cpu.r[7]);
+    bk_video_spare(&x, &y, &w, &h);
 
-    if (!force && 0 == strcmp(buf, rt->statline))
+    if (w <= 0)
         return;
 
+    lcd_set_font(FONT_SMALL);
+
+    if (w < LCD_WIDTH)
     {
-        int len = strlen(buf);
+        /*
+         * The margin beside the picture: 32 pixels, which is five characters
+         * of the small font, so each number gets a label above it and the
+         * program counter is not here at all - SAVE opens the register view
+         * for that.
+         *
+         * Every value is padded to a fixed width rather than the column being
+         * erased first: a fill here is bit-banged panel like everything else,
+         * and doing it four times a second to make room for five characters
+         * would cost more than the emulator saves by not repainting clean
+         * lines.
+         */
+        static const int line_h = 9;
+        int row = y + 2;
 
-        while (len < (int)sizeof(buf) - 1)
-            buf[len++] = ' ';
+        if (force)
+            lcd_fill_rect(x, y, w, h, LCD_BLACK_COLOR);
 
-        buf[len] = 0;
+        lcd_set_color(LCD_BLACK_COLOR, HUD_FG);
+        lcd_puts(x + 2, row, "fps");
+        lcd_set_color(LCD_BLACK_COLOR, HUD_HI);
+        snprintf(buf, sizeof(buf), "%-5u", rt->fps);
+        lcd_puts(x + 2, row + line_h, buf);
+        row += 2 * line_h + 7;
+
+        lcd_set_color(LCD_BLACK_COLOR, HUD_FG);
+        lcd_puts(x + 2, row, "kHz");
+        lcd_set_color(LCD_BLACK_COLOR, HUD_HI);
+        snprintf(buf, sizeof(buf), "%-5lu", (unsigned long)rt->khz);
+        lcd_puts(x + 2, row + line_h, buf);
+        row += 2 * line_h + 7;
+
+        lcd_set_color(LCD_BLACK_COLOR, HUD_FG);
+        lcd_puts(x + 2, row, "rows");
+        lcd_set_color(LCD_BLACK_COLOR, HUD_HI);
+        snprintf(buf, sizeof(buf), "%-5lu", (unsigned long)rt->rows);
+        lcd_puts(x + 2, row + line_h, buf);
+        row += 2 * line_h + 7;
+
+        // How many real BKs this is worth, which is the number the whole
+        // exercise is really about
+        lcd_set_color(LCD_BLACK_COLOR, HUD_FG);
+        lcd_puts(x + 2, row, "vs BK");
+        lcd_set_color(LCD_BLACK_COLOR, HUD_HI);
+        times_real(buf, sizeof(buf));
+        lcd_puts(x + 2, row + line_h, buf);
+
+        return;
     }
 
-    lcd_set_font(FONT_SMALL);
-    lcd_set_color(LCD_BLACK_COLOR, HUD_FG);
-    lcd_puts(2, STATUS_Y, buf);
+    // Mono: one line across the bottom, which is all there is room for
+    {
+        char line[sizeof(rt->statline)];
 
-    memcpy(rt->statline, buf, sizeof(rt->statline));
+        {
+            char mult[16];
+
+            times_real(mult, sizeof(mult));
+            snprintf(line, sizeof(line), "%u fps  %lu kHz  %s  %lu rows",
+                rt->fps, (unsigned long)rt->khz, mult,
+                (unsigned long)rt->rows);
+        }
+
+        if (!force && 0 == strcmp(line, rt->statline))
+            return;
+
+        {
+            int len = strlen(line);
+
+            while (len < (int)sizeof(line) - 1)
+                line[len++] = ' ';
+
+            line[len] = 0;
+        }
+
+        lcd_set_color(LCD_BLACK_COLOR, HUD_FG);
+        lcd_puts(x + 2, y + 4, line);
+
+        memcpy(rt->statline, line, sizeof(rt->statline));
+    }
 }
 #endif
 
@@ -554,6 +756,7 @@ static void start_machine(void)
 
     rt->evnt_left = EVNT_PERIOD;
     rt->last_ms = timer_ms();
+    rt->draw_ms = rt->last_ms;
     rt->key_code = 0;
 
 #if BK_STATS
@@ -660,9 +863,32 @@ void bk_port_task(void)
         return;
     }
 
+    /*
+     * Paint at the machine's own rate, not the loop's.
+     *
+     * The frame counter used to count passes of this function, which read
+     * seventeen thousand and looked exactly like a machine running four
+     * hundred times too fast - the emulated processor was at 3005 kHz the
+     * whole time, a real BK to within a fifth of a per cent. Only the number
+     * was wrong, and then only because the panel really was being repainted
+     * that often.
+     *
+     * Now it is fifty a second, which is what a BK does, and the number means
+     * something: fifty is keeping up, less is the panel unable to.
+     */
+    if (now - rt->draw_ms >= REPAINT_MS)
+    {
+        rt->draw_ms = now;
+
 #if BK_STATS
-    rt->rows = (uint32_t)bk_video_draw(false);
-    rt->frames++;
+        rt->rows = (uint32_t)bk_video_draw(false);
+        rt->frames++;
+#else
+        bk_video_draw(false);
+#endif
+    }
+
+#if BK_STATS
 
     if (now - rt->fps_ms >= 1000)
     {
@@ -829,22 +1055,42 @@ static const char *const g_help_lines[] =
     "anything at all.",
     "",
     INFO_HEAD "THE SCREEN",
-    "256 lines do not fit in 240 rows. Crop",
-    "keeps the scale and loses sixteen lines,",
-    "split top and bottom by Top line; Squash",
+    "256 lines do not fit in 240 rows. Squash",
     "drops one line in sixteen and shows all",
-    "of it.",
+    "of them - it is the default because a BK",
+    "game puts its border and its score where",
+    "a television had overscan, which is the",
+    "first thing Crop throws away. Crop keeps",
+    "every line its own size and loses sixteen,",
+    "split top and bottom by Top line.",
     "",
     "Mono is 512 dots wide and the panel is",
-    "320, so it shows a window - Pan chooses",
-    "which part.",
+    "320. Whole 512 takes the dots in pairs,",
+    "as the colour mode does, so both modes",
+    "show the same area at the same size; a",
+    "pair with one dot lit is drawn grey,",
+    "which keeps small text readable. 1:1",
+    "window is one dot to one pixel over 320",
+    "of the 512, and Pan chooses which 320.",
     "",
     INFO_HEAD "SPEED",
     "The processor is emulated against real",
-    "time at a nominal 3 MHz. The cycle counts",
-    "are the shape of the 1801's timings, not",
-    "measured silicon, so Speed is here to",
-    "correct for it if a game runs wrong.",
+    "time at a nominal 3 MHz, which is what a",
+    "БК-0010-01 ran at. The cycle counts are",
+    "the shape of the 1801's timings and not",
+    "measured silicon, so Speed trim is here",
+    "to correct for it if a game runs wrong.",
+    "",
+    "Unlimited takes the clock off entirely -",
+    "the machine gets whatever is left between",
+    "two repaints of the panel.",
+    "",
+    "The status column reports kHz, which a",
+    "real BK reads 3000 of, and vs BK, which",
+    "is the same thing as a multiple. That is",
+    "the number to look at with the clock off:",
+    "a 250 MHz Cortex-M4 from 2014 against a",
+    "3 MHz К1801ВМ1 from 1985, in one figure.",
 };
 
 static const info_page_t g_help_page =
@@ -865,11 +1111,17 @@ static const menu_item_t g_menu_items[] =
           on_video_change } },
     { .kind = MI_NUMBER, .label = "Top line",
       .u.number = { &g_top_line, 0, 16, 1, 2, NULL, on_number_change } },
+    { .kind = MI_CHOICE, .label = "512 dots into 320",
+      .u.choice = { &g_mono_fit, g_mono_labels, ARRAY_SIZE(g_mono_labels),
+          on_video_change } },
     { .kind = MI_NUMBER, .label = "Pan",
       .u.number = { &g_pan, 0, 192, 8, 32, " dots", on_number_change } },
     { .kind = MI_SEPARATOR },
-    { .kind = MI_NUMBER, .label = "Speed",
-      .u.number = { &g_speed, 25, 400, 5, 25, "%", NULL } },
+    { .kind = MI_CHOICE, .label = "Speed",
+      .u.choice = { &g_speed_preset, g_speed_labels,
+          ARRAY_SIZE(g_speed_labels), NULL } },
+    { .kind = MI_NUMBER, .label = "Speed trim",
+      .u.number = { &g_speed_trim, 5, 400, 5, 25, "%", NULL } },
     { .kind = MI_TOGGLE, .label = "Joystick from the arrows",
       .u.toggle = { &g_joystick, NULL } },
     { .kind = MI_TOGGLE, .label = "Status line",

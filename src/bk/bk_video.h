@@ -48,6 +48,25 @@ typedef enum
     BK_FIT_SQUASH,
 } bk_fit_t;
 
+/*
+ * 512 dots into a 320 pixel panel, which is the other way this machine does
+ * not fit.
+ *
+ * Whole shows all of it by taking the dots in pairs, exactly as the colour
+ * mode does - so both modes put the same part of the screen in the same place
+ * at the same size, and switching between them stops being a jump. A pair
+ * with one dot lit is drawn grey rather than rounded either way, which keeps
+ * 512-dot text readable at 256 pixels instead of turning it into a smear.
+ *
+ * Window is one dot to one pixel over 320 of the 512, and Pan chooses which
+ * 320. Right when the exact dots matter and nothing else will do.
+ */
+typedef enum
+{
+    BK_MONO_WHOLE = 0,
+    BK_MONO_WINDOW,
+} bk_mono_t;
+
 /*- Definitions -------------------------------------------------------------*/
 /*
  * Scratch for the conversion, supplied by the caller.
@@ -68,6 +87,7 @@ void bk_video_set_buffer(uint8_t *buf);
  * Paint. `full` ignores what has changed and repaints everything, which is
  * what an overlay closing over the top of it needs.
  *
+ *
  * Returns the number of panel rows actually pushed - the useful measure of how
  * much a frame cost, because the panel is bit-banged and rows are the unit it
  * is slow in.
@@ -76,12 +96,29 @@ int bk_video_draw(bool full);
 
 void bk_video_set_screen(bk_screen_t screen);
 void bk_video_set_fit(bk_fit_t fit);
+void bk_video_set_mono(bk_mono_t mono);
 void bk_video_set_top(int line);            // crop: first line shown, 0..16
 void bk_video_set_pan(int dot);             // mono: first dot shown, 0..192
-void bk_video_set_status(bool on);          // keep 16 rows back for text
+/*
+ * Whether anything wants somewhere to write.
+ *
+ * It does not cost the picture anything in colour: 256 dots in a 320 pixel
+ * panel leave 64 pixels over, and those were black. The picture moves to the
+ * left edge instead of the middle and the column on the right becomes the
+ * place for text - so the machine still gets all 256 lines it would otherwise
+ * have had to give sixteen of away.
+ *
+ * Mono has no margin to use - 512 dots windowed to 320 fills the panel - so
+ * there it does cost sixteen rows off the bottom, and there is nowhere else
+ * for them to come from.
+ */
+void bk_video_set_status(bool on);
 
-// Where the machine's picture ends and the status line begins
+// Where the machine's picture ends and anything else may begin
 int bk_video_bottom(void);
+
+// The part of the panel the picture does not cover. Width zero means none.
+void bk_video_spare(int *x, int *y, int *w, int *h);
 
 // The palette the screen is being drawn with, as the panel wants it. For an
 // application that has to draw something of its own in matching colours.
