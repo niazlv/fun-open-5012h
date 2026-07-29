@@ -26,8 +26,16 @@
  * time, so this is also the timing granularity the guest can observe: 256
  * instructions at 250 MHz is roughly a microsecond, fine enough that the
  * firmware's busy-waits on TIMER1 and on the DMA counter behave, and coarse
- * enough that the emulator still runs at a useful fraction of real speed. */
+ * enough that the emulator still runs at a useful fraction of real speed.
+ * The slice ends at the first block boundary past the count, so it is a floor
+ * and not an exact figure - see block_hook below for why it is counted that
+ * way. */
 #define SLICE_INSNS      256
+
+/* Size of the block-length cache, as a power of two. The firmware's whole
+ * working set is a few thousand blocks, so this never evicts in practice; a
+ * collision only costs one redundant decode. */
+#define BLK_BITS         15
 
 /* One instruction per cycle. The real M4 is close to that for the Thumb-2
  * these hot loops are made of (single-cycle ALU, ldm/stm bursts amortised),
@@ -48,6 +56,12 @@ static uc_engine *g_uc;
 static uint64_t g_insns;
 static uint64_t g_time_ns;
 static bool g_wedged;
+static uint64_t g_slice_end;
+
+/* Instructions per basic block, for blocks already seen. Keyed on the address
+ * and size Unicorn reports, so a block is decoded once rather than on every
+ * pass through it. */
+static struct { uint64_t key; uint32_t insns; } g_blk[1u << BLK_BITS];
 
 /*- Implementations ---------------------------------------------------------*/
 
@@ -174,6 +188,80 @@ static bool unmapped_hook(uc_engine *uc, uc_mem_type type, uint64_t addr,
 }
 
 //-----------------------------------------------------------------------------
+// The host copy of a guest address, for reading code without going through
+// Unicorn. Only the three RAM-like regions can hold instructions.
+static const uint8_t *host_ptr(uint64_t addr, uint32_t size)
+{
+  if (addr >= EMU_FLASH_BASE && addr + size <= EMU_FLASH_BASE + EMU_FLASH_SIZE)
+    return emu_flash + (addr - EMU_FLASH_BASE);
+
+  if (addr >= EMU_TCM_BASE && addr + size <= EMU_TCM_BASE + EMU_TCM_SIZE)
+    return emu_tcm + (addr - EMU_TCM_BASE);
+
+  if (addr >= EMU_SRAM_BASE && addr + size <= EMU_SRAM_BASE + EMU_SRAM_SIZE)
+    return emu_sram + (addr - EMU_SRAM_BASE);
+
+  return NULL;
+}
+
+//-----------------------------------------------------------------------------
+// How many instructions a block holds. Thumb-2 says it in the first halfword:
+// top five bits of 11101, 11110 or 11111 open a 32-bit instruction, anything
+// else is a 16-bit one (ARMv7-M A5.1), so the count is exact rather than an
+// estimate from the block's length in bytes.
+static uint32_t block_insns(uint64_t addr, uint32_t size)
+{
+  const uint8_t *p = host_ptr(addr, size);
+  uint32_t off = 0, n = 0;
+
+  if (!p || size < 2)
+    return 1;
+
+  while (off + 1 < size)
+  {
+    uint16_t hw = (uint16_t)(p[off] | ((uint16_t)p[off + 1] << 8));
+    uint32_t top = hw >> 11;
+
+    off += (top == 0x1d || top == 0x1e || top == 0x1f) ? 4 : 2;
+    n++;
+  }
+
+  return n ? n : 1;
+}
+
+//-----------------------------------------------------------------------------
+// Where virtual time comes from, and where a slice ends.
+//
+// uc_emu_start will bound a run by instruction count on its own, but it does
+// that by installing a hook on every single instruction - and on Apple silicon
+// each of those hooks toggles the JIT region's write protection through
+// pthread_jit_write_protect_np. Counting whole blocks instead costs one cache
+// lookup per block and keeps the instruction count exact; only the moment the
+// slice ends moves, from mid-block to the next block boundary.
+static void block_hook(uc_engine *uc, uint64_t address, uint32_t size, void *ud)
+{
+  uint64_t key = (address & 0xffffffffull) | ((uint64_t)size << 32);
+  uint32_t i = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> (64 - BLK_BITS));
+
+  (void)ud;
+
+  if (g_insns >= g_slice_end)
+  {
+    uc_emu_stop(uc);
+    return;
+  }
+
+  // Key + 1, so that a zeroed table never reads as a hit on block 0
+  if (g_blk[i].key != key + 1)
+  {
+    g_blk[i].key = key + 1;
+    g_blk[i].insns = block_insns(address, size);
+  }
+
+  g_insns += g_blk[i].insns;
+}
+
+//-----------------------------------------------------------------------------
 bool cpu_init(void)
 {
   uc_err err;
@@ -230,6 +318,8 @@ bool cpu_init(void)
 
   uc_hook_add(g_uc, &hook, UC_HOOK_MEM_UNMAPPED, (void *)unmapped_hook,
       NULL, 1, 0);
+
+  uc_hook_add(g_uc, &hook, UC_HOOK_BLOCK, (void *)block_hook, NULL, 1, 0);
 
   return true;
 }
@@ -357,9 +447,11 @@ bool cpu_step(void)
   if (g_wedged)
     return false;
 
-  err = uc_emu_start(g_uc, pc | 1, 0, 0, SLICE_INSNS);
+  // No count limit here: block_hook does the counting and stops the run
+  g_slice_end = g_insns + SLICE_INSNS;
 
-  g_insns += SLICE_INSNS;
+  err = uc_emu_start(g_uc, pc | 1, 0, 0, 0);
+
   g_time_ns = (uint64_t)((double)g_insns * NS_PER_INSN);
 
   if (err == UC_ERR_OK)
