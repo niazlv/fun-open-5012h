@@ -62,6 +62,11 @@ void fft_spectrum_decim(const uint8_t *data, int size, int offset, int decim,
 // transform): the value that gives the best frequency resolution.
 int fft_max_decimation(int size);
 
+// Where a component at `f` is actually read when the spectrum only reaches
+// `nyquist`: folded back and forth across the band, as the sampler does it.
+// Below nyquist it returns f unchanged.
+float fft_fold_hz(float f, float nyquist);
+
 // Dominant-peak frequency in Hz from a magnitude spectrum, refined with
 // parabolic interpolation between bins. sample_period_ns is the period of
 // the samples fed to fft_spectrum. Returns 0 when there is no clear peak.

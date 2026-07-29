@@ -46,6 +46,7 @@
 #include "battery.h"
 #include "capture.h"
 #include "fft.h"
+#include "alias.h"
 #include "classify.h"
 #include "logic_decode.h"
 #include "trend.h"
@@ -505,6 +506,14 @@ static float g_fft_mag[FFT_BINS];
 // by `max >> band`: band 0 is the full record (best resolution, narrowest
 // span), every step up doubles the span and halves the resolution.
 static FftAnalysis g_fft_an;
+
+// Above-nyquist reasoning for that analysis. Only ever filled on the
+// undecimated spectrum: everywhere else the band edge is the decimation's
+// own low-pass rather than the frontend, and alias.c reasons about the
+// frontend. The auto band already parks anything fast on the raw transform,
+// so this appears exactly where the ADC is the thing doing the folding.
+static AliasAnalysis g_fft_alias;
+
 static int g_fft_band = 0;
 static bool g_fft_band_auto = true;
 static int64_t g_fft_auto_span = 0; // record time the auto band was picked for
@@ -4657,6 +4666,16 @@ static void fft_update(void)
 
   fft_analyze(g_fft_mag, period_ns * decim, &g_fft_an);
 
+  if (1 == decim)
+  {
+    alias_check(g_fft_mag, &g_fft_an, ALIAS_FRONTEND_HZ, &g_fft_alias);
+  }
+  else
+  {
+    g_fft_alias.verdict = ALIAS_NO_EVIDENCE;
+    g_fft_alias.count = 0;
+  }
+
   g_fft_peak_hz = (int)(g_fft_an.fundamental + 0.5f);
   g_fft_have = true;
 
@@ -6111,13 +6130,19 @@ static void draw_fft_panel(void)
 
   fft_format_hz(num1, sizeof(num1), g_fft_an.fundamental);
 
-  if (g_fft_an.thd_x10 >= 0)
-    snprintf(line, sizeof(line), "F0 %-9s THD%3d.%d%%", num1,
-        g_fft_an.thd_x10 / 10, g_fft_an.thd_x10 % 10);
-  else
-    snprintf(line, sizeof(line), "F0 %s", num1);
+  // A record with no harmonic content cannot say whether F0 is the signal or
+  // the fold of one from above nyquist, so the number gets a question mark
+  // rather than the confidence of the plain reading. The alternatives are
+  // spelled out under the peak list.
+  bool aliasable = (ALIAS_POSSIBLE == g_fft_alias.verdict);
 
-  fft_panel_row(row++, TOAST_COLOR, line);
+  if (g_fft_an.thd_x10 >= 0)
+    snprintf(line, sizeof(line), "F0 %-9s THD%3d.%d%%%s", num1,
+        g_fft_an.thd_x10 / 10, g_fft_an.thd_x10 % 10, aliasable ? " ?" : "");
+  else
+    snprintf(line, sizeof(line), "F0 %s%s", num1, aliasable ? " ?" : "");
+
+  fft_panel_row(row++, aliasable ? CAPTURE_WAIT_COLOR : TOAST_COLOR, line);
 
   fft_format_hz(num1, sizeof(num1), g_fft_an.bin_hz);
   fft_format_hz(num2, sizeof(num2), g_fft_an.nyquist_hz);
@@ -6154,6 +6179,22 @@ static void draw_fft_panel(void)
     snprintf(line, sizeof(line), "%-3s%9s %8s", tag, num1, num2);
 
     fft_panel_row(row++, (p->harmonic > 0) ? LCD_WHITE_COLOR : HPOS_COLOR, line);
+  }
+
+  // The frequencies that would have produced this same spectrum from above
+  // nyquist, listed under the peaks in the same columns. Room is never the
+  // problem: what gets here is a bare tone, and a bare tone leaves most of
+  // the peak rows empty by definition.
+  if (aliasable && row < 2 + FFT_PANEL_ROWS)
+  {
+    fft_panel_row(row++, CAPTURE_WAIT_COLOR, "no h3: sine, or alias of");
+
+    for (int i = 1; i < g_fft_alias.count && row < 2 + FFT_PANEL_ROWS; i++)
+    {
+      fft_format_hz(num1, sizeof(num1), g_fft_alias.cand[i].freq);
+      snprintf(line, sizeof(line), "?%-2d%9s", g_fft_alias.cand[i].order, num1);
+      fft_panel_row(row++, CAPTURE_WAIT_COLOR, line);
+    }
   }
 
   row = 2 + FFT_PANEL_ROWS;

@@ -387,7 +387,7 @@ static void flag_interleave_mirrors(const FftPeak *peak, int count,
 // Where a harmonic at f is OBSERVED in a spectrum bounded by nyquist: content
 // above it folds back (125 MS/s puts the 2nd harmonic of 33.33 MHz at
 // |125 - 66.67| = 58.33). Mirror-fold into [0, nyquist].
-static float fold_freq(float f, float nyquist)
+float fft_fold_hz(float f, float nyquist)
 {
   float r = fmodf(f, 2.0f * nyquist);
 
@@ -440,7 +440,7 @@ static int harmonic_number(float f, float freq, float nyquist, float bin_hz,
       if (n > FOLDED_MAX_HARM)
         return 0; // hf only grows: nothing below can match anymore
 
-      seen = fold_freq(hf, nyquist);
+      seen = fft_fold_hz(hf, nyquist);
       fold = true;
     }
 
@@ -582,7 +582,7 @@ void fft_analyze(const float *mag, int sample_period_ns, FftAnalysis *out)
 
   for (int n = 1; n <= FFT_MAX_HARM; n++)
   {
-    int center = (int)(fold_freq((float)n * out->fundamental,
+    int center = (int)(fft_fold_hz((float)n * out->fundamental,
         out->nyquist_hz) / bin_hz + 0.5f);
     float m = 0.0f;
     bool dup = false;

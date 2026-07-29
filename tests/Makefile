@@ -40,6 +40,7 @@ HOST_SRCS = \
   $(ROOT)/src/hal/input.c \
   $(ROOT)/src/dsp/measure.c \
   $(ROOT)/src/dsp/fft.c \
+  $(ROOT)/src/dsp/alias.c \
   $(ROOT)/src/dsp/classify.c \
   $(ROOT)/src/dsp/record_window.c \
   $(ROOT)/src/dsp/trend.c \

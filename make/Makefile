@@ -116,6 +116,7 @@ SRCS += \
 SRCS += \
   ../src/dsp/measure.c \
   ../src/dsp/fft.c \
+  ../src/dsp/alias.c \
   ../src/dsp/classify.c \
   ../src/dsp/trend.c \
   ../src/dsp/record_window.c \

@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include "measure.h"
 #include "fft.h"
+#include "alias.h"
 #include "classify.h"
 #include "logic_decode.h"
 #include "record_window.h"
@@ -81,6 +82,28 @@ static void synth(uint8_t *buf, int size, int offset,
     if (c > 255) c = 255;
 
     buf[(offset + i) % size] = (uint8_t)c;
+  }
+}
+
+// A hard-edged source as the analog chain actually delivers it: odd
+// harmonics at 1/k, and nothing past `bw_hz`, because that is where the
+// frontend stops. Which of the surviving harmonics are past NYQUIST is left
+// alone deliberately - folding them is the sampler's job and the whole point
+// of what is being tested. amp is the fundamental's amplitude, so h3 arrives
+// at amp/3, i.e. -9.54 dB, with no scaling to reason about.
+static void synth_square_bl(uint8_t *buf, int size, double f0_hz,
+    double period_ns, double bw_hz, double amp, double dc)
+{
+  for (int i = 0; i < size; i++)
+  {
+    double t = i * period_ns * 1e-9;
+    double v = 0;
+
+    for (int k = 1; k * f0_hz <= bw_hz; k += 2)
+      v += sin(2 * M_PI * k * f0_hz * t) / k;
+
+    v = dc + amp * v;
+    buf[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : (int)lround(v));
   }
 }
 
@@ -2001,6 +2024,129 @@ int main(void)
 
       check_near("identical", diff, 0, 0);
     }
+  }
+
+  // ========================= above nyquist ==============================
+  // The instrument's own case: 125 MS/s, an 8 ns record, a 62.5 MHz edge,
+  // and inputs from a source that goes well past it. BW is the frontend, not
+  // the sampler - it is what decides whether a missing harmonic means
+  // anything.
+  {
+    enum { REC = 4096, PER = 8 };
+    const double FS = 1e9 / PER, NYQ = FS / 2, BW = 100e6;
+    FftAnalysis an;
+    AliasAnalysis al;
+    AliasCandidate cand[ALIAS_MAX_CANDIDATES];
+
+    // --- the ladder itself ---
+    printf("alias: candidates for 17 MHz read at 125 MS/s:\n");
+    {
+      int n = alias_candidates(17e6, NYQ, 3 * BW, cand, ALIAS_MAX_CANDIDATES);
+
+      check_near("count", n, 5, 0);
+      check_near("cand[0] in band", cand[0].freq, 17e6, 0.1);
+      check_near("cand[0] order", cand[0].order, 0, 0);
+      check_near("cand[1] Fs-a", cand[1].freq, 108e6, 0.1);
+      check_near("cand[1] order", cand[1].order, 1, 0);
+      check_near("cand[2] Fs+a", cand[2].freq, 142e6, 0.1);
+      check_near("cand[3] 2Fs-a", cand[3].freq, 233e6, 0.1);
+      check_near("cand[4] 2Fs+a", cand[4].freq, 267e6, 0.1);
+    }
+
+    // --- positions carry nothing: the two records ARE the same record ---
+    // 17 MHz and 108 MHz are the first two rungs of that ladder. Sampled at
+    // 125 MS/s they produce the same magnitude spectrum bin for bin, and no
+    // amount of arithmetic over peak positions can separate them. This is
+    // the theorem alias.h states, run as a test.
+    printf("alias: 17 MHz and 108 MHz are one spectrum:\n");
+    {
+      static float mag2[FFT_BINS];
+      double diff = 0, sum = 0;
+
+      synth(buf, REC, 0, fn_sine, NULL, 17e6, PER, 90.0, ZERO_POINT);
+      fft_spectrum(buf, REC, 0, mag);
+      synth(buf, REC, 0, fn_sine, NULL, 108e6, PER, 90.0, ZERO_POINT);
+      fft_spectrum(buf, REC, 0, mag2);
+
+      for (int i = 0; i < FFT_BINS; i++)
+      {
+        diff += fabs(mag[i] - mag2[i]);
+        sum  += mag[i];
+      }
+
+      check_near("spectra differ by", diff / sum * 100.0, 0, 0.01);
+    }
+
+    // --- a real 17 MHz square: h3 stands at 51 MHz, in band ---
+    printf("alias: 17 MHz square (h3 in band at 51 MHz):\n");
+    synth_square_bl(buf, REC, 17e6, PER, BW, 70.0, ZERO_POINT);
+    fft_spectrum(buf, REC, 0, mag);
+    fft_analyze(mag, PER, &an);
+    check_near("fundamental", an.fundamental, 17e6, 1);
+    alias_check(mag, &an, BW, &al);
+    check_near("verdict IN_BAND", al.verdict == ALIAS_IN_BAND, 1, 0);
+    check_near("slots checked", al.slots, 2, 0);
+    check_near("h3 level dB", al.harm_db, -9.54, 12);
+
+    // --- the bench case: 25 MHz square, h3 is at 75 MHz and reads at 50 ---
+    // Measured on hardware at -22.9 dB rather than -9.54, which is the
+    // chain's 13.4 dB of loss at 75 MHz. Synthetic here, so it arrives at
+    // the ideal figure; what the test pins is that the FOLDED position is
+    // where the module goes looking.
+    printf("alias: 25 MHz square (h3 folds 75 -> 50 MHz):\n");
+    synth_square_bl(buf, REC, 25e6, PER, BW, 70.0, ZERO_POINT);
+    fft_spectrum(buf, REC, 0, mag);
+    fft_analyze(mag, PER, &an);
+    check_near("fundamental", an.fundamental, 25e6, 1);
+    alias_check(mag, &an, BW, &al);
+    check_near("verdict IN_BAND", al.verdict == ALIAS_IN_BAND, 1, 0);
+    check_near("slots checked", al.slots, 1, 0);
+    check_near("h3 level dB", al.harm_db, -9.54, 12);
+
+    // --- an aliased 108 MHz source: the harmonics are gone, so the record
+    // cannot tell it from a 17 MHz sine. Saying so IS the answer. ---
+    printf("alias: 108 MHz source read as 17 MHz:\n");
+    synth(buf, REC, 0, fn_sine, NULL, 108e6, PER, 90.0, ZERO_POINT);
+    fft_spectrum(buf, REC, 0, mag);
+    fft_analyze(mag, PER, &an);
+    check_near("reads as", an.fundamental, 17e6, 1);
+    alias_check(mag, &an, BW, &al);
+    check_near("verdict POSSIBLE", al.verdict == ALIAS_POSSIBLE, 1, 0);
+    check_near("108 MHz is on the list", al.cand[1].freq, 108e6, 0.1);
+    check_near("h3 slot was empty", al.harm_db < ALIAS_HARM_MIN_DB, 1, 0);
+
+    // A genuine 17 MHz sine reaches the same verdict, and must: the two are
+    // the same record. The verdict names both readings instead of picking.
+    printf("alias: a real 17 MHz sine reaches the same verdict:\n");
+    synth(buf, REC, 0, fn_sine, NULL, 17e6, PER, 90.0, ZERO_POINT);
+    fft_spectrum(buf, REC, 0, mag);
+    fft_analyze(mag, PER, &an);
+    alias_check(mag, &an, BW, &al);
+    check_near("verdict POSSIBLE", al.verdict == ALIAS_POSSIBLE, 1, 0);
+
+    // --- the two false positives a naive "no h3 -> alias" check produces ---
+    // At Fs/4 every odd harmonic folds back onto the fundamental, so there
+    // is no h3 line to find and the signal is in band anyway.
+    printf("alias: 31.25 MHz square (Fs/4, h3 folds onto F0):\n");
+    synth_square_bl(buf, REC, 31.25e6, PER, BW, 70.0, ZERO_POINT);
+    fft_spectrum(buf, REC, 0, mag);
+    fft_analyze(mag, PER, &an);
+    alias_check(mag, &an, BW, &al);
+    check_near("no evidence", al.verdict == ALIAS_NO_EVIDENCE, 1, 0);
+    check_near("slots checked", al.slots, 0, 0);
+    check_near("reason", 0 == strcmp(al.reason,
+        "harmonics fold onto DC or F0"), 1, 0);
+
+    // And at 50 MHz h3 sits at 150 MHz, past the frontend: it is missing
+    // because the chain removed it, not because the reading is wrong.
+    printf("alias: 50 MHz square (h3 past the frontend):\n");
+    synth_square_bl(buf, REC, 50e6, PER, BW, 70.0, ZERO_POINT);
+    fft_spectrum(buf, REC, 0, mag);
+    fft_analyze(mag, PER, &an);
+    alias_check(mag, &an, BW, &al);
+    check_near("no evidence", al.verdict == ALIAS_NO_EVIDENCE, 1, 0);
+    check_near("reason", 0 == strcmp(al.reason,
+        "h3 is past the frontend"), 1, 0);
   }
 
   // ============================= classifier =============================
