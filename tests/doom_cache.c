@@ -124,6 +124,13 @@ void doom_trace_read(const void *addr)
 
     g_reads++;
 
+    // Since the columns come through w_stream.c, a read points into the cache
+    // rather than into the pack, and there is no offset to model. The models
+    // below stay for the historical comparison against a pack in flash; what
+    // matters now is the fetch count from the cache itself.
+    if (off >= PACK_MAX)
+        return;
+
     if (0 == (g_seen[cl >> 3] & (1u << (cl & 7))))
     {
         g_seen[cl >> 3] |= 1u << (cl & 7);
@@ -217,6 +224,8 @@ int main(int argc, char **argv)
     uint32_t worst_compulsory = 0;
     uint64_t tot_cols = 0, tot_spans = 0, tot_col_bytes = 0, tot_src = 0;
     uint32_t worst_cols = 0, worst_src = 0;
+    uint64_t tot_fetch = 0;
+    uint32_t worst_fetch = 0;
 
     struct { uint64_t misses, worst; } acc[MAX_CACHES] = {{0, 0}};
 
@@ -252,6 +261,14 @@ int main(int argc, char **argv)
     printf("%s cache.  pack %ld KB, map %s, %d subsectors\n\n", warm ? "WARM" : "COLD", size / 1024,
            doom_level_name(), numsubsectors);
 
+    // The two the firmware can actually have: 64 slots of 128 bytes in the
+    // memory borrowed from the oscilloscope, indexed two ways. w_stream.c
+    // picks the slot with `offset >> 4`, and columns in the pack are about 64
+    // bytes apart - so consecutive columns land four slots apart and only a
+    // quarter of the table is ever used. `>> 6` is the same table, used whole.
+    cache_add("as built, offset>>4", 128, 2 * 1024);   // 16 usable slots
+    cache_add("indexed offset>>6", 128, 8 * 1024);     // all 64
+
     // A line is a bus transaction whatever its size, so the small ones are
     // included to show what the per-command overhead does to them.
     cache_add("64 B lines,  8 KB", 64, 8 * 1024);
@@ -282,6 +299,7 @@ int main(int argc, char **argv)
             fixed_t z = sec->floorheight + VIEWHEIGHT;
 
             frame_reset(warm);
+            w_stream_reset_stats();
             R_RenderPlayerView(x, y, z, (angle_t)(a * (ANG45)));
 
             frames++;
@@ -289,6 +307,11 @@ int main(int argc, char **argv)
 
             if (g_compulsory > worst_compulsory)
                 worst_compulsory = g_compulsory;
+
+            tot_fetch += w_stream_fetches();
+
+            if (w_stream_fetches() > worst_fetch)
+                worst_fetch = w_stream_fetches();
 
             tot_cols += g_col_calls;
             tot_spans += g_span_calls;
@@ -307,6 +330,12 @@ int main(int argc, char **argv)
             }
         }
     }
+
+    printf("real cache: %.1f fetches per frame, %u worst (COLUMN_SHIFT %d)\n",
+           (double)tot_fetch / frames, worst_fetch, COLUMN_SHIFT);
+    printf("            %.2f ms per frame at 15.6 MHz, %.2f ms worst\n\n",
+           (double)tot_fetch / frames * 132 * 8 / SPI_HZ * 1000.0,
+           worst_fetch * 132 * 8 / SPI_HZ * 1000.0);
 
     printf("%d frames, %.0f texture reads per frame\n",
            frames, (double)total_reads / frames);

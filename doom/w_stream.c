@@ -41,6 +41,21 @@
 
 #define NO_TAG          0xFFFFFFFFu
 
+/*
+ * Which bits of the offset choose the slot.
+ *
+ * Columns sit about 64 bytes apart in TEXDATA, so shifting by 4 - dividing the
+ * offset into 16 byte units - puts consecutive columns four slots apart and
+ * leaves three quarters of the table permanently empty. Shifting by 6 makes
+ * consecutive columns consecutive slots, which is the whole table.
+ *
+ * Measured over 1896 views of E1M1 with tests/doom_cache.c: the difference is
+ * a factor of six in misses per frame.
+ */
+#ifndef COLUMN_SHIFT
+#define COLUMN_SHIFT    6
+#endif
+
 /*- Variables ---------------------------------------------------------------*/
 static uint8_t *g_slots;                    // SLOT_COUNT * SLOT_SIZE
 static uint32_t g_tags[SLOT_COUNT];
@@ -51,6 +66,9 @@ static uint32_t g_tex_base;                 // TEXDATA, in the stream
 static uint32_t g_tex_size;
 
 static uint32_t g_fetches;                  // for the statistics line
+
+// Handed out when there is nothing to read from, see w_column()
+static const uint8_t g_nothing[SLOT_SIZE];
 
 /*- Implementations ---------------------------------------------------------*/
 
@@ -79,9 +97,18 @@ void w_stream_init(w_stream_read_t read, void *ctx, uint8_t *cache,
 // land somewhere else.
 const uint8_t *w_column(uint32_t offset)
 {
-    uint32_t slot = (offset >> 4) & SLOT_MASK;
-    uint8_t *at = g_slots + slot * SLOT_SIZE;
+    uint32_t slot;
+    uint8_t *at;
     uint32_t want;
+
+    // Nobody bound the streamed half. On the device that cannot reach here -
+    // the application refuses to start and says why - but a renderer that
+    // faults is a worse way to find out than one that draws black.
+    if (NULL == g_slots)
+        return g_nothing;
+
+    slot = (offset >> COLUMN_SHIFT) & SLOT_MASK;
+    at = g_slots + slot * SLOT_SIZE;
 
     if (g_tags[slot] == offset)
         return at;

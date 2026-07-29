@@ -78,6 +78,7 @@ enum
 {
   CMD_PAGE_PROGRAM     = 0x02,
   CMD_READ_DATA        = 0x03,
+  CMD_FAST_READ        = 0x0b,
   CMD_READ_STATUS      = 0x05,
   CMD_WRITE_ENABLE     = 0x06,
   CMD_ERASE_SECTOR     = 0x20,
@@ -173,6 +174,12 @@ static bool flash_command(uint8_t cmd, uint32_t addr, bool has_addr,
     ok = spi_xfer((addr >> 16) & 0xff, NULL) &&
          spi_xfer((addr >> 8) & 0xff, NULL) &&
          spi_xfer(addr & 0xff, NULL);
+
+    // Fast read clocks one byte of nothing between the address and the data,
+    // which is what buys it the higher rate: the part uses that byte to get
+    // its output ready.
+    if (ok && CMD_FAST_READ == cmd)
+      ok = spi_xfer(0, NULL);
   }
 
   for (uint32_t i = 0; ok && i < size; i++)
@@ -279,11 +286,15 @@ void flash_init(void)
 
   RCU->APB2EN_b.SPI0EN = 1;
 
-  // PCLK/8. APB2 is SYSCLK/2, so 15.6 MHz at the 250 MHz overclock. The /4
-  // this used to run at was 21 MHz when the part was clocked at its rated
-  // 168 MHz; the same divider now would be 31 MHz, past what the plain 03h
-  // READ command is rated for on either the documented part or the fitted one.
-  SPI0->CTL0 = SPI0_CTL0_SPIEN_Msk | SPI0_CTL0_MSTMOD_Msk | (2/*PCLK/8*/ << SPI0_CTL0_PSC_Pos) |
+  // PCLK/4. APB2 is SYSCLK/2, so 31.25 MHz at the 250 MHz overclock.
+  //
+  // This was PCLK/8 while reads went through the plain 03h command, which
+  // these parts rate for 50-80 MHz and which did not deserve the risk at a
+  // clock nobody had measured. Everything that reads in bulk now uses fast
+  // read (0Bh) instead, rated past 100 MHz, so the limit is the controller
+  // rather than the flash - and DOOM streams its textures through here, where
+  // the difference is milliseconds a frame.
+  SPI0->CTL0 = SPI0_CTL0_SPIEN_Msk | SPI0_CTL0_MSTMOD_Msk | (1/*PCLK/4*/ << SPI0_CTL0_PSC_Pos) |
       SPI0_CTL0_CKPH_Msk | SPI0_CTL0_CKPL_Msk | SPI0_CTL0_SWNSSEN_Msk | SPI0_CTL0_SWNSS_Msk;
 
   delay_cycles(100);
@@ -328,7 +339,7 @@ bool flash_read(uint32_t addr, uint8_t *data, uint32_t size)
   if (!range_ok(addr, size))
     return false;
 
-  return flash_command(CMD_READ_DATA, addr, true, NULL, data, size);
+  return flash_command(CMD_FAST_READ, addr, true, NULL, data, size);
 }
 
 //-----------------------------------------------------------------------------
