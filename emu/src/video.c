@@ -34,8 +34,12 @@ static SDL_Texture *g_texture;
 static uint32_t g_mouse_btn;    /* what the pointer is currently holding down */
 #endif
 
-/* The panel keys, laid out the way the instrument's front panel is. The bit
- * numbers are buttons.h's BTN_* values. */
+/* The panel keys. The bit numbers are buttons.h's BTN_* values.
+ *
+ * Two keys carry the shape of the firmware's own interface rather than the
+ * name of the button they press: MODE is what confirms a choice, and MENU is
+ * what opens the settings, so Enter and Escape are put on those. The letters
+ * stay as a second way to reach the same buttons - the panel draws both. */
 typedef struct { int key; uint32_t btn; const char *label; } KeyMap;
 
 #ifndef EMU_NO_SDL
@@ -45,12 +49,14 @@ static const KeyMap g_keys[] =
   { SDLK_UP,        1u << 1,  "UP"        },
   { SDLK_e,         1u << 2,  "EDGE"      },
   { SDLK_m,         1u << 3,  "MODE"      },
+  { SDLK_RETURN,    1u << 3,  "MODE"      },
+  { SDLK_KP_ENTER,  1u << 3,  "MODE"      },
   { SDLK_F1,        1u << 4,  "F1"        },
   { SDLK_RIGHT,     1u << 5,  "RIGHT"     },
   { SDLK_c,         1u << 6,  "AC/DC"     },
   { SDLK_a,         1u << 7,  "AUTO"      },
   { SDLK_5,         1u << 8,  "50%"       },
-  { SDLK_RETURN,    1u << 9,  "MENU"      },
+  { SDLK_ESCAPE,    1u << 9,  "MENU"      },
   { SDLK_PAGEUP,    1u << 10, "TRIG UP"   },
   { SDLK_LEFT,      1u << 11, "LEFT"      },
   { SDLK_PAGEDOWN,  1u << 12, "TRIG DOWN" },
@@ -132,7 +138,10 @@ bool video_pump(void)
     {
       bool down = (ev.type == SDL_KEYDOWN);
 
-      if (down && ev.key.keysym.sym == SDLK_ESCAPE)
+      // Escape presses MENU, so leaving is the window's close button, the
+      // platform's own quit chord, or this - which works everywhere.
+      if (down && ev.key.keysym.sym == SDLK_q &&
+          (ev.key.keysym.mod & (KMOD_GUI | KMOD_CTRL)))
         return false;
 
       if (down && ev.key.keysym.sym == SDLK_F12)

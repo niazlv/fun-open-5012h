@@ -82,11 +82,11 @@ static const uint8_t g_font[][5] =
  * band under the screen; the grey keys fill the two rows below that. */
 static const PanelKey g_panel[] =
 {
-  {  16, 284, 64, 30, 1u <<  9, "MENU",  "ENTER", 0,   true  },
-  {  16, 320, 64, 30, 1u << 13, "SAVE",  "S",     0,   true  },
-  {  16, 356, 64, 30, 1u << 14, "TRIG",  "T",     0,   true  },
+  {  16, 284, 64, 30, 1u <<  9, "MENU",  "ESC",     0, true  },
+  {  16, 320, 64, 30, 1u << 13, "SAVE",  "S",       0, true  },
+  {  16, 356, 64, 30, 1u << 14, "TRIG",  "T",       0, true  },
 
-  { 280, 284, 64, 30, 1u <<  3, "MODE",  "M",     0,   true  },
+  { 280, 284, 64, 30, 1u <<  3, "MODE",  "ENTER M", 0, true  },
   { 280, 320, 64, 30, 1u <<  7, "AUTO",  "A",     0,   true  },
   { 280, 356, 64, 30, 1u <<  0, "STOP",  "SPACE", 0,   true  },
 

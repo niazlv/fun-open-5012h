@@ -113,8 +113,10 @@ static void usage(void)
     "the window draws the front panel: the keys can be clicked, and each one\n"
     "carries the keyboard key that does the same thing\n"
     "\n"
-    "window keys: arrows, space=STOP, a=AUTO, m=MODE, e=EDGE, c=AC/DC,\n"
-    "             t=TRIG, s=SAVE, 5=50%%, enter=MENU, F1, F2, shift, F12=shot\n");
+    "window keys: enter=MODE (confirm), esc=MENU, arrows=cursor, left=back\n"
+    "             space=STOP, a=AUTO, m=MODE, e=EDGE, c=AC/DC, t=TRIG,\n"
+    "             s=SAVE, 5=50%%, pgup/pgdn=trigger level, F1, F2, shift\n"
+    "             F12=shot, cmd/ctrl+Q=quit\n");
 }
 
 //-----------------------------------------------------------------------------
