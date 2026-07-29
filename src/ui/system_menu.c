@@ -614,6 +614,12 @@ static const menu_item_t g_general_items[] =
 {
   { .kind = MI_NUMBER, .label = "Brightness",
     .u.number = { &config.lcd_bl_level, 10, 100, 5, 10, "%", apply_backlight } },
+  // Dims to a quarter of the brightness above after this long without a key,
+  // and comes straight back on the next one. Not while the oscilloscope is on
+  // screen - see launcher_app_may_dim.
+  { .kind = MI_CHOICE, .label = "Auto Dim",
+    .u.choice = { &config.lcd_dim_timeout, lcd_dim_labels, LCD_DIM_COUNT,
+        NULL } },
   { .kind = MI_TOGGLE, .label = "Shift x2 Sticky",
     .u.toggle = { &config.shift_mode_enabled, shift_mode_changed } },
   { .kind = MI_TOGGLE, .label = "Shift Hold Lock",

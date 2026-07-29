@@ -261,6 +261,13 @@ void battery_low_handler(void)
 //-----------------------------------------------------------------------------
 void buttons_handler(int buttons)
 {
+  // Before anything is made of the press, including whether it is remapped
+  // away or swallowed: a key is a key, and it is the only evidence this
+  // firmware has that somebody is still in front of the screen. The press
+  // itself is delivered as usual - waking the backlight is not a mode a
+  // button has to be spent getting out of.
+  lcd_backlight_activity();
+
   buttons = input_translate(buttons);
 
 #ifdef DEBUG_F2_HALT  // Debug only, makes it easier to program things
@@ -297,6 +304,7 @@ int main(void)
   lcd_set_font(FONT_LARGE);
   lcd_set_color(LCD_BLACK_COLOR, LCD_WHITE_COLOR);
   lcd_set_backlight_level(config.lcd_bl_level);
+  lcd_backlight_init();
 
   buttons = buttons_state();
 
@@ -325,6 +333,7 @@ int main(void)
     battery_task();
     buttons_task();
     config_task();
+    lcd_backlight_task(launcher_app_may_dim());
 
     // A pass that found nothing to do has nothing to do until the clock moves
     // either: every task above is driven by a millisecond timer or polls a

@@ -107,7 +107,20 @@ typedef struct
   bool     measure_display;
 
   // General settings
-  int      screen_brightness;
+
+  // How long without a key before the backlight dims: an index into
+  // lcd_dim_labels, 0 = Off. See lcd.c for what it does and main.c for who
+  // is allowed to be dimmed.
+  //
+  // This is the word that used to be `int screen_brightness`, which nothing
+  // ever read - the backlight has always been lcd_bl_level, and 80 was
+  // written into this every boot for nobody. Reusing it costs no offset and
+  // leaves padding[] for a field that has to be new. A config saved before
+  // this holds that 80 here, which is out of range for the list and reads as
+  // Off, so no unit starts dimming because its firmware was updated
+  // (lcd_backlight_init writes the 0 back).
+  int      lcd_dim_timeout;     // was screen_brightness
+
   bool     shift_mode_enabled;  // double click on SHIFT: sticky for one key
   bool     shift_mode_active;
   // Carved out of the alignment padding that already sat between the bools

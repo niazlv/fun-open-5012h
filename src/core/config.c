@@ -1126,7 +1126,7 @@ static const struct
   FIELD(charge_cycles, FT_INT),
 
   FIELD(lcd_bl_level, FT_INT),
-  FIELD(screen_brightness, FT_INT),
+  FIELD(lcd_dim_timeout, FT_INT),
 
   FIELD(ac_coupling, FT_BOOL),
   FIELD(x10, FT_BOOL),
@@ -1401,7 +1401,7 @@ void config_reset(void)
   config.roll_from              = 0; // roll only above 500 ms/div
 
   // General settings defaults
-  config.screen_brightness      = 80;  // 80% default brightness
+  config.lcd_dim_timeout        = 0;   // no auto-dim until it is asked for
   // Both ways of getting shift without holding it are on out of the box. They
   // cost nothing until SHIFT is tapped twice or held, and a user who finds one
   // of them in the way can switch that one off on its own.

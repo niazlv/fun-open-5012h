@@ -48,9 +48,34 @@
 #define LCD_GREEN_COLOR        LCD_COLOR(0, 255, 0)
 #define LCD_BLUE_COLOR         LCD_COLOR(0, 0, 255)
 
+/*
+ * Auto-dim on inactivity. The backlight is the largest single draw on the
+ * battery, and a screen nobody has touched for minutes is spending it on
+ * nothing. Dimmed is DIM, never off: the image stays readable, and the panel
+ * is never put to sleep - what is on it is still an instrument's reading.
+ *
+ * How long is config.lcd_dim_timeout, an index into lcd_dim_labels where 0
+ * is Off. The count is a macro because the menu table that offers these is a
+ * const initialiser and needs it at compile time.
+ */
+#define LCD_DIM_COUNT  6
+extern const char *const lcd_dim_labels[LCD_DIM_COUNT];
+
 /*- Prototypes --------------------------------------------------------------*/
 void lcd_init(void);
 void lcd_set_backlight_level(int level);
+
+// Start the inactivity clock. After config_init(), which is where the timeout
+// comes from, and after the first lcd_set_backlight_level().
+void lcd_backlight_init(void);
+
+// The user is here: full brightness, and the wait starts again. Called for
+// every button event, repeats included.
+void lcd_backlight_activity(void);
+
+// One pass of the inactivity clock. may_dim says whether what is on screen
+// right now is allowed to be dimmed - the caller knows that, this does not.
+void lcd_backlight_task(bool may_dim);
 void lcd_draw_pixel(int x, int y, int color);
 void lcd_draw_buf(int x, int y, int w, int h, const uint16_t *buf);
 void lcd_draw_indexed(int x, int y, int w, int h, const uint8_t *pix,

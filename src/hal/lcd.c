@@ -37,6 +37,8 @@
 #include "hal_gpio.h"
 #include "utils.h"
 #include "fonts.h"
+#include "timer.h"    // the inactivity clock at the bottom of this file
+#include "config.h"   // ...and the timeout and brightness it works from
 #include "lcd.h"
 
 /*- Definitions -------------------------------------------------------------*/
@@ -259,6 +261,106 @@ void lcd_set_backlight_level(int level)
   {
     HAL_GPIO_LCD_BL_alt(2);
     pwm_start(level);
+  }
+}
+
+/*- Auto-dim on inactivity --------------------------------------------------*/
+
+// What the choices in the menu mean. The two tables are sized by the same
+// macro, so a label added without its timeout - or the other way round - is a
+// compile error rather than a menu row that does nothing.
+static const int g_dim_seconds[LCD_DIM_COUNT] =
+    { 0, 15, 30, 60, 120, 300 };
+
+const char *const lcd_dim_labels[LCD_DIM_COUNT] =
+    { "Off", "15 s", "30 s", "1 min", "2 min", "5 min" };
+
+// Dimmed is the set brightness over this, and never below DIM_FLOOR, which is
+// also the lowest the brightness item in the menu goes: the screen stays
+// readable across the room, it just stops lighting one.
+#define DIM_DIVIDER    4
+#define DIM_FLOOR      10
+
+static int g_dim_timer = TIMER_DISABLE;
+static bool g_dimmed = false;
+
+//-----------------------------------------------------------------------------
+static int dim_timeout_ms(void)
+{
+  int index = config.lcd_dim_timeout;
+
+  if (index <= 0 || index >= LCD_DIM_COUNT)
+    return TIMER_DISABLE;
+
+  return g_dim_seconds[index] * 1000;
+}
+
+//-----------------------------------------------------------------------------
+// Only ever called on a transition: pwm_start() reloads TIMER2 from zero, and
+// doing that every pass would put a beat on the backlight.
+static void apply_dim(bool dim)
+{
+  int level = config.lcd_bl_level;
+
+  if (dim)
+  {
+    level /= DIM_DIVIDER;
+
+    if (level < DIM_FLOOR)
+      level = DIM_FLOOR;
+
+    // A brightness already below the floor must not be raised by dimming it
+    if (level > config.lcd_bl_level)
+      level = config.lcd_bl_level;
+  }
+
+  g_dimmed = dim;
+  lcd_set_backlight_level(level);
+}
+
+//-----------------------------------------------------------------------------
+void lcd_backlight_init(void)
+{
+  // Out of range means a config written before this setting existed, where
+  // this word was screen_brightness and held 80. Write the 0 back rather than
+  // only tolerating it, so the menu never has to render labels[80].
+  if (config.lcd_dim_timeout < 0 || config.lcd_dim_timeout >= LCD_DIM_COUNT)
+    config.lcd_dim_timeout = 0;
+
+  timer_add(&g_dim_timer);
+
+  g_dimmed = false;
+  g_dim_timer = dim_timeout_ms();
+}
+
+//-----------------------------------------------------------------------------
+void lcd_backlight_activity(void)
+{
+  if (g_dimmed)
+    apply_dim(false);
+
+  g_dim_timer = dim_timeout_ms();
+}
+
+//-----------------------------------------------------------------------------
+void lcd_backlight_task(bool may_dim)
+{
+  if (!may_dim)
+  {
+    // Whatever is on screen now is being watched. Undim if this arrived while
+    // dimmed, and hold the clock at the top so it is the full timeout again
+    // once it is allowed to run.
+    if (g_dimmed)
+      apply_dim(false);
+
+    g_dim_timer = dim_timeout_ms();
+    return;
+  }
+
+  if (0 == g_dim_timer && !g_dimmed)
+  {
+    apply_dim(true);
+    g_dim_timer = TIMER_DISABLE;    // nothing more to time until a key
   }
 }
 

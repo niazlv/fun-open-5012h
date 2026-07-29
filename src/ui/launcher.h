@@ -40,4 +40,8 @@ bool launcher_app_running(void);
 // application runs. See the definition for why the oscilloscope may not.
 bool launcher_app_may_idle(void);
 
+// Whether the backlight may dim on inactivity while this application is on
+// screen. Also false for the oscilloscope, for a different reason.
+bool launcher_app_may_dim(void);
+
 #endif // _LAUNCHER_H_

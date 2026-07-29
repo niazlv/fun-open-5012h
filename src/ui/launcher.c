@@ -310,3 +310,18 @@ bool launcher_app_may_idle(void)
 {
   return NULL == g_running || g_running->idle;
 }
+
+//-----------------------------------------------------------------------------
+// May the backlight dim while this application is on screen?
+//
+// A different question from the one above, and it has a different answer:
+// that one is about who can afford to be woken a millisecond late, this one
+// is about whether nobody having pressed a key means nobody is looking. For
+// the oscilloscope it does not - a trace watched without a key being touched
+// is the instrument doing its job, and dimming it mid-measurement would be a
+// fault, not a feature. Everything else here is watched by someone who is
+// also pressing something.
+bool launcher_app_may_dim(void)
+{
+  return NULL == g_running || scope_task != g_running->task;
+}
