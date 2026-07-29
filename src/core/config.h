@@ -217,7 +217,14 @@ typedef struct
   // padding, like everything above it.
   int      swd_clock_hz;
 
-  uint32_t padding[7];  // Reduced padding to accommodate new fields
+  // Snake's best score. A high score that dies with the power is not a high
+  // score, and the game has nowhere else to keep it. Carved out of padding
+  // like every field above it, so sizeof(Config) and every stored calibration
+  // stay valid; a config saved before it existed reads 0, which is "no score
+  // yet" - the same zero-is-default rule the rest of this struct follows.
+  int      snake_high_score;
+
+  uint32_t padding[6];  // Reduced padding to accommodate new fields
 
   int      calib_channel_delta;
   int      calib_dac_zero;

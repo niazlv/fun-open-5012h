@@ -134,6 +134,7 @@ SRCS += \
   ../src/apps/raytrace_test.c \
   ../src/apps/flappy_bird.c \
   ../src/apps/snake_game.c \
+  ../src/apps/snake_assets.c \
   ../src/apps/doom_port.c \
 
 SRCS += \

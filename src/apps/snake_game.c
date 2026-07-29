@@ -2,12 +2,21 @@
  * Copyright (c) 2026 Niaz Leushkin <niazlv03@gmail.com>
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * Simple Snake Game
+ * Snake
  *
- * The playfield is drawn incrementally: on every step only the new head, the
- * old head and the vacated tail cell are touched. A full repaint of a
- * 320x240 bit-banged display costs more than the whole game tick, so it only
- * happens on a restart or after a menu closed over the game.
+ * The playfield is a 20x13 grid of 16 px cells over a checkerboard, and every
+ * cell is composed in a 16x16 staging buffer before it is blitted. That is the
+ * whole rendering strategy: one lcd_draw_buf() per cell costs the same as the
+ * lcd_fill_rect() the old flat version used, but it buys rounded joints, a
+ * shaded body, eyes that look where the snake is going and sprite fruit - none
+ * of which can be drawn out of axis-aligned rectangles.
+ *
+ * A step touches four cells (vacated tail, new tail, the head that became a
+ * neck, the new head), so the cost of a step is independent of the length of
+ * the snake. A full repaint of the 320x240 bit-banged panel is ~15 ms, which is
+ * why it only happens on a restart or when an overlay closed over the game.
+ *
+ * Artwork and levels are in snake_assets.c.
  */
 
 /*- Includes ----------------------------------------------------------------*/
@@ -16,346 +25,1466 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include "gd32f4xx.h"
+#include "gd32f4xx.h"   // utils.h reaches for __RBIT out of CMSIS
 #include "lcd.h"
 #include "timer.h"
 #include "buttons.h"
 #include "utils.h"
+#include "config.h"
 #include "ui.h"
 #include "menu_widget.h"
+#include "snake_assets.h"
 #include "snake_game.h"
 
 /*- Definitions -------------------------------------------------------------*/
-#define GRID_SIZE           10
-#define STATUS_H            20
-#define FIELD_Y             STATUS_H
-#define GRID_WIDTH          (LCD_WIDTH / GRID_SIZE)
-#define GRID_HEIGHT         ((LCD_HEIGHT - FIELD_Y) / GRID_SIZE)
-#define MAX_SNAKE_LENGTH    (GRID_WIDTH * GRID_HEIGHT)
+#define CELL                SNAKE_CELL
+#define GRID_W              SNAKE_GRID_W
+#define GRID_H              SNAKE_GRID_H
 
-// Step interval in ms, indexed by g_speed
+#define HUD_H               32
+#define FIELD_Y             HUD_H
+#define FIELD_W             (GRID_W * CELL)     // 320
+#define FIELD_H             (GRID_H * CELL)     // 208
+
+#define MAX_SNAKE           (GRID_W * GRID_H)
+
+// Housekeeping tick: countdowns, the bonus clock, the death flash. Short
+// enough that none of them look stepped, long enough to cost nothing.
+#define ANIM_MS             40
+
+#define FRUIT_SCORE         10
+#define BONUS_SCORE         50
+#define BONUS_EVERY         4               // fruit between bonus spawns
+#define BONUS_MS            9000
+#define BONUS_WARN_MS       3000            // it starts blinking with this left
+#define BONUS_BLINK_MS      200
+
+#define READY_MS            600             // per countdown digit
+#define DEATH_FLASHES       6
+#define DEATH_FLASH_MS      90
+#define CLEAR_MS            2000            // level banner, before it advances
+
+// Speed setting, as a percentage of the level's own step interval
 #define SPEED_SLOW          0
 #define SPEED_NORMAL        1
 #define SPEED_FAST          2
+#define SPEED_INSANE        3
 
-// Colors
-#define BG_COLOR            LCD_COLOR(0, 0, 0)        // Black
-#define STATUS_BG           LCD_COLOR(20, 20, 40)
-#define SNAKE_COLOR         LCD_COLOR(0, 200, 0)      // Green
-#define SNAKE_HEAD_COLOR    LCD_COLOR(120, 255, 120)  // Light green
-#define FOOD_COLOR          LCD_COLOR(255, 0, 0)      // Red
-#define BORDER_COLOR        LCD_COLOR(80, 80, 80)
-#define TEXT_COLOR          LCD_COLOR(255, 255, 255)  // White
+#define MODE_LEVELS         0
+#define MODE_CLASSIC        1
+
+#define CLASSIC_STEP_MS     150
+#define MIN_STEP_MS         60
+
+// Direction bits, doubling as the "which sides of this cell continue" mask
+// that the cell renderer is built around
+#define M_UP                (1 << 0)
+#define M_DOWN              (1 << 1)
+#define M_LEFT              (1 << 2)
+#define M_RIGHT             (1 << 3)
+
+/*- Colors ------------------------------------------------------------------*/
+#define C_FIELD_A           LCD_COLOR(170, 215,  81)
+#define C_FIELD_B           LCD_COLOR(162, 209,  73)
+#define C_HUD               LCD_COLOR( 74, 117,  44)
+#define C_HUD_EDGE          LCD_COLOR( 52,  84,  30)
+#define C_TEXT              LCD_COLOR(255, 255, 255)
+#define C_TEXT_DIM          LCD_COLOR(198, 226, 160)
+
+#define C_SNAKE             LCD_COLOR( 70, 117, 235)
+#define C_SNAKE_TOP         LCD_COLOR(126, 168, 255)
+#define C_SNAKE_BOT         LCD_COLOR( 38,  72, 176)
+#define C_DEAD              LCD_COLOR(226,  62,  40)
+#define C_DEAD_TOP          LCD_COLOR(255, 140, 120)
+#define C_DEAD_BOT          LCD_COLOR(150,  24,  12)
+#define C_EYE               LCD_COLOR(255, 255, 255)
+#define C_PUPIL             LCD_COLOR( 24,  28,  44)
+
+#define C_WALL              LCD_COLOR(104, 108, 118)
+#define C_WALL_TOP          LCD_COLOR(154, 158, 168)
+#define C_WALL_BOT          LCD_COLOR( 62,  66,  76)
+
+#define C_PANEL             LCD_COLOR( 26,  44,  16)
+#define C_PANEL_EDGE        LCD_COLOR(126, 176,  74)
+#define C_SHADOW            LCD_COLOR( 92, 128,  44)
+#define C_GOLD              LCD_COLOR(255, 214,  66)
 
 /*- Types -------------------------------------------------------------------*/
-typedef enum {
+typedef enum
+{
     DIR_UP = 0,
     DIR_DOWN,
     DIR_LEFT,
-    DIR_RIGHT
+    DIR_RIGHT,
 } direction_t;
 
-typedef struct {
-    int x, y;
-} point_t;
+typedef enum
+{
+    ST_TITLE = 0,   // the panel that comes up when the app is opened
+    ST_READY,       // 3-2-1 before the snake starts moving
+    ST_PLAY,
+    ST_PAUSE,
+    ST_DYING,       // the snake flashes before the game over panel
+    ST_OVER,
+    ST_CLEAR,       // level complete banner
+} state_t;
 
-typedef struct {
-    point_t segments[MAX_SNAKE_LENGTH];
-    int length;
-    direction_t direction;
-    direction_t next_direction;
-} snake_t;
-
-typedef struct {
-    snake_t snake;
-    point_t food;
-    int score;
-    bool game_over;
-    bool game_started;
-    bool paused;
-} game_state_t;
+enum
+{
+    CELL_EMPTY = 0,
+    CELL_WALL,
+    CELL_SNAKE,
+    CELL_FRUIT,
+    CELL_BONUS,
+};
 
 /*- Variables ---------------------------------------------------------------*/
-static game_state_t g_game;
-static int g_game_timer = TIMER_DISABLE;
-static int g_speed = SPEED_NORMAL;
-static bool g_wrap_walls = false;
-static int g_high_score = 0;
+// The staging buffer one cell is composed in, and the coverage mask the shape
+// helpers build before it is painted. 768 bytes of TCM, against the 5.6 KB the
+// old point_t segment array took - the packed body below gives that back.
+static uint16_t g_tile[CELL * CELL];
+static uint8_t  g_shape[CELL * CELL];
 
-static const int g_step_ms[] = { 250, 150, 90 };
+static uint8_t  g_cell[GRID_H][GRID_W];
+static uint16_t g_body[MAX_SNAKE];      // (y << 8) | x, index 0 is the head
+static int      g_len;
+
+static direction_t g_dir;               // the direction actually being travelled
+static direction_t g_dir_queued;        // the last direction accepted into the queue
+static uint8_t  g_dirq[4];
+static int      g_dirq_count;
+
+static state_t  g_state;
+static int      g_score;
+static int      g_best;
+static int      g_level;                // index into snake_levels
+static int      g_loop;                 // times the campaign has been round
+static int      g_level_score;          // score when the level was entered
+static int      g_eaten;                // fruit eaten in this level
+static int      g_total_eaten;          // fruit since the last bonus
+static bool     g_new_best;
+
+static int      g_fruit_x, g_fruit_y;
+static const sprite_t *g_fruit_spr;
+
+static bool     g_bonus_on;
+static bool     g_bonus_shown;          // blink state while it is expiring
+static int      g_bonus_x, g_bonus_y;
+static int      g_bonus_ms;
+
+static int      g_anim_ms;              // time spent in the current animation
+static int      g_anim_step;            // countdown digit / flash number
+static bool     g_dying_bright;
+
+// The rectangle the open overlay covers, so closing it repaints exactly that
+static int      g_panel_x, g_panel_y, g_panel_w, g_panel_h;
+
+static int      g_step_timer = TIMER_DISABLE;
+static int      g_anim_timer = TIMER_DISABLE;
+
+// Settings, offered in the application menu
+static int      g_mode = MODE_LEVELS;
+static int      g_speed = SPEED_NORMAL;
+static bool     g_wrap = false;
+static bool     g_bonus_enabled = true;
+
+// Percentage of the level's own step interval, by speed setting
+static const int g_speed_pct[] = { 150, 100, 78, 60 };
 
 /*- Forward Declarations ----------------------------------------------------*/
-static void reset_game(void);
-static void spawn_food(void);
-static void draw_status(void);
+static void paint_cell(int cx, int cy);
 static void draw_field(void);
+static void draw_hud(void);
 static void draw_overlay(void);
-static bool is_free_cell(int x, int y);
+static void start_run(void);
+static void load_level(void);
+static void spawn_fruit(void);
 
 /*- Implementations ---------------------------------------------------------*/
 
 //-----------------------------------------------------------------------------
-static void draw_cell(int x, int y, uint16_t color)
+// The tile compositor
+//
+// Everything inside the playfield is drawn by filling g_tile and blitting it.
+// The buffer is exactly one cell, so a partially drawn cell can never reach the
+// panel and there is no tearing to arbitrate.
+//-----------------------------------------------------------------------------
+
+//-----------------------------------------------------------------------------
+static inline void tile_set(int x, int y, uint16_t color)
 {
-    lcd_fill_rect(x * GRID_SIZE + 1, FIELD_Y + y * GRID_SIZE + 1,
-        GRID_SIZE - 2, GRID_SIZE - 2, color);
+    if (x >= 0 && x < CELL && y >= 0 && y < CELL)
+        g_tile[y * CELL + x] = color;
 }
 
 //-----------------------------------------------------------------------------
-static void clear_cell(int x, int y)
+static void tile_fill(uint16_t color)
 {
-    lcd_fill_rect(x * GRID_SIZE, FIELD_Y + y * GRID_SIZE,
-        GRID_SIZE, GRID_SIZE, BG_COLOR);
+    for (int i = 0; i < CELL * CELL; i++)
+        g_tile[i] = color;
 }
 
 //-----------------------------------------------------------------------------
-static void draw_head(int x, int y)
+static void tile_rect(int x, int y, int w, int h, uint16_t color)
 {
-    draw_cell(x, y, SNAKE_HEAD_COLOR);
-
-    lcd_draw_pixel(x * GRID_SIZE + 3, FIELD_Y + y * GRID_SIZE + 3, BG_COLOR);
-    lcd_draw_pixel(x * GRID_SIZE + GRID_SIZE - 4, FIELD_Y + y * GRID_SIZE + 3, BG_COLOR);
-}
-
-//-----------------------------------------------------------------------------
-static void draw_food(void)
-{
-    draw_cell(g_game.food.x, g_game.food.y, FOOD_COLOR);
-    lcd_draw_pixel(g_game.food.x * GRID_SIZE + GRID_SIZE / 2,
-        FIELD_Y + g_game.food.y * GRID_SIZE + GRID_SIZE / 2, LCD_COLOR(255, 255, 0));
-}
-
-//-----------------------------------------------------------------------------
-static void reset_game(void)
-{
-    g_game.snake.length = 3;
-    g_game.snake.direction = DIR_RIGHT;
-    g_game.snake.next_direction = DIR_RIGHT;
-
-    int start_x = GRID_WIDTH / 2;
-    int start_y = GRID_HEIGHT / 2;
-
-    for (int i = 0; i < g_game.snake.length; i++) {
-        g_game.snake.segments[i].x = start_x - i;
-        g_game.snake.segments[i].y = start_y;
+    for (int j = y; j < y + h; j++)
+    {
+        for (int i = x; i < x + w; i++)
+            tile_set(i, j, color);
     }
-
-    g_game.score = 0;
-    g_game.game_over = false;
-    g_game.game_started = false;
-    g_game.paused = false;
-
-    spawn_food();
 }
 
 //-----------------------------------------------------------------------------
-static bool is_free_cell(int x, int y)
+static void tile_blit(int px, int py)
 {
-    if (x < 0 || x >= GRID_WIDTH || y < 0 || y >= GRID_HEIGHT)
-        return false;
-
-    for (int i = 0; i < g_game.snake.length; i++) {
-        if (g_game.snake.segments[i].x == x && g_game.snake.segments[i].y == y)
-            return false;
-    }
-
-    return true;
+    lcd_draw_buf(px, py, CELL, CELL, g_tile);
 }
 
 //-----------------------------------------------------------------------------
-static void spawn_food(void)
+static void tile_checker(int cx, int cy)
 {
-    int attempts = 0;
-
-    do {
-        g_game.food.x = rand() % GRID_WIDTH;
-        g_game.food.y = rand() % GRID_HEIGHT;
-        attempts++;
-    } while (!is_free_cell(g_game.food.x, g_game.food.y) && attempts < 200);
+    tile_fill(((cx + cy) & 1) ? C_FIELD_A : C_FIELD_B);
 }
 
 //-----------------------------------------------------------------------------
-// One step: move, test for a collision, and repaint only the three cells that
-// can have changed
-static void step_game(void)
+static void tile_sprite(const sprite_t *sprite)
 {
-    point_t tail = g_game.snake.segments[g_game.snake.length - 1];
-    point_t head = g_game.snake.segments[0];
+    for (int y = 0; y < CELL; y++)
+    {
+        for (int x = 0; x < CELL; x++)
+        {
+            uint16_t color;
 
-    g_game.snake.direction = g_game.snake.next_direction;
-
-    switch (g_game.snake.direction) {
-        case DIR_UP:    head.y--; break;
-        case DIR_DOWN:  head.y++; break;
-        case DIR_LEFT:  head.x--; break;
-        case DIR_RIGHT: head.x++; break;
+            if (snake_pixel_color(sprite->rows[y][x], &color))
+                g_tile[y * CELL + x] = color;
+        }
     }
+}
 
-    if (g_wrap_walls) {
-        if (head.x < 0) head.x = GRID_WIDTH - 1;
-        if (head.x >= GRID_WIDTH) head.x = 0;
-        if (head.y < 0) head.y = GRID_HEIGHT - 1;
-        if (head.y >= GRID_HEIGHT) head.y = 0;
-    }
-    else if (head.x < 0 || head.x >= GRID_WIDTH ||
-             head.y < 0 || head.y >= GRID_HEIGHT) {
-        g_game.game_over = true;
-        draw_overlay();
-        return;
-    }
+//-----------------------------------------------------------------------------
+// Shapes
+//
+// A body cell is a core square inset by `margin`, with an arm out to each edge
+// the shape continues through. Corners are rounded only where both of their
+// sides are free, which is what makes a straight run read as a tube, an elbow
+// read as an elbow, and two adjacent cells join without a seam.
+//-----------------------------------------------------------------------------
 
-    // The tail cell is vacated by this very move, so running into it is legal
-    for (int i = 0; i < g_game.snake.length - 1; i++) {
-        if (g_game.snake.segments[i].x == head.x &&
-            g_game.snake.segments[i].y == head.y) {
-            g_game.game_over = true;
-            draw_overlay();
-            return;
+//-----------------------------------------------------------------------------
+// Pixel centres against a circle of radius r centred at (r, r), in halves so
+// the whole test stays in integers
+static bool inside_corner(int x, int y, int r)
+{
+    int dx = 2 * x + 1 - 2 * r;
+    int dy = 2 * y + 1 - 2 * r;
+
+    return dx * dx + dy * dy <= 4 * r * r;
+}
+
+//-----------------------------------------------------------------------------
+static void shape_build(int mask, int margin, int radius)
+{
+    int lo = margin;
+    int hi = CELL - 1 - margin;
+    int n = hi - lo;
+
+    memset(g_shape, 0, sizeof(g_shape));
+
+    for (int y = lo; y <= hi; y++)
+    {
+        for (int x = lo; x <= hi; x++)
+        {
+            int lx = x - lo;
+            int ly = y - lo;
+
+            if (!(mask & M_UP) && !(mask & M_LEFT) &&
+                lx < radius && ly < radius && !inside_corner(lx, ly, radius))
+                continue;
+
+            if (!(mask & M_UP) && !(mask & M_RIGHT) &&
+                n - lx < radius && ly < radius &&
+                !inside_corner(n - lx, ly, radius))
+                continue;
+
+            if (!(mask & M_DOWN) && !(mask & M_LEFT) &&
+                lx < radius && n - ly < radius &&
+                !inside_corner(lx, n - ly, radius))
+                continue;
+
+            if (!(mask & M_DOWN) && !(mask & M_RIGHT) &&
+                n - lx < radius && n - ly < radius &&
+                !inside_corner(n - lx, n - ly, radius))
+                continue;
+
+            g_shape[y * CELL + x] = 1;
         }
     }
 
-    point_t prev_head = g_game.snake.segments[0];
-    bool ate = (head.x == g_game.food.x && head.y == g_game.food.y);
-
-    for (int i = g_game.snake.length - 1; i > 0; i--)
-        g_game.snake.segments[i] = g_game.snake.segments[i - 1];
-
-    g_game.snake.segments[0] = head;
-
-    if (ate) {
-        // Grow by putting the tail cell back on the end
-        if (g_game.snake.length < MAX_SNAKE_LENGTH) {
-            g_game.snake.segments[g_game.snake.length] = tail;
-            g_game.snake.length++;
+    // Arms out to the edges the shape continues through. With margin 0 the core
+    // already reaches every edge and these are empty.
+    for (int i = 0; i < margin; i++)
+    {
+        for (int j = lo; j <= hi; j++)
+        {
+            if (mask & M_UP)    g_shape[i * CELL + j] = 1;
+            if (mask & M_DOWN)  g_shape[(CELL - 1 - i) * CELL + j] = 1;
+            if (mask & M_LEFT)  g_shape[j * CELL + i] = 1;
+            if (mask & M_RIGHT) g_shape[j * CELL + CELL - 1 - i] = 1;
         }
-
-        g_game.score += 10;
-
-        if (g_game.score > g_high_score)
-            g_high_score = g_game.score;
-
-        spawn_food();
-        draw_food();
-        draw_status();
     }
-    else {
-        clear_cell(tail.x, tail.y);
-    }
-
-    if (g_game.snake.length > 1)
-        draw_cell(prev_head.x, prev_head.y, SNAKE_COLOR);
-
-    draw_head(head.x, head.y);
 }
 
 //-----------------------------------------------------------------------------
-static void draw_status(void)
+// The tail, tapering from a full-width joint at the connected edge to a two
+// pixel tip at the other one
+static void shape_tail(int mask)
 {
-    char buf[48];
+    memset(g_shape, 0, sizeof(g_shape));
 
-    lcd_fill_rect(0, 0, LCD_WIDTH, STATUS_H, STATUS_BG);
-    lcd_fill_rect(0, STATUS_H - 1, LCD_WIDTH, 1, BORDER_COLOR);
+    for (int i = 0; i < CELL; i++)
+    {
+        // Square law rather than linear: the tail keeps most of the body's
+        // width and only draws in near the tip, which reads as a tail. A
+        // straight taper across the whole cell reads as an arrowhead.
+        int half = 7 - (i * i * 5) / ((CELL - 1) * (CELL - 1));
 
-    lcd_set_font(FONT_SMALL);
-    lcd_set_color(STATUS_BG, TEXT_COLOR);
+        for (int j = 8 - half; j <= 7 + half; j++)
+        {
+            int x, y;
 
-    // The left string reaches 32 characters (192 px) at four-digit scores, so
-    // the mode label starts well clear of it
-    snprintf(buf, sizeof(buf), "Score %d   Best %d   Len %d",
-        g_game.score, g_high_score, g_game.snake.length);
-    lcd_puts(5, 6, buf);
+            switch (mask)
+            {
+                case M_LEFT:  x = i;            y = j;            break;
+                case M_RIGHT: x = CELL - 1 - i; y = j;            break;
+                case M_UP:    x = j;            y = i;            break;
+                default:      x = j;            y = CELL - 1 - i; break;
+            }
 
-    lcd_puts(LCD_WIDTH - 40, 6, g_wrap_walls ? "WRAP" : "WALLS");
+            g_shape[y * CELL + x] = 1;
+        }
+    }
+}
+
+//-----------------------------------------------------------------------------
+// Paints the mask, lighting the pixels whose neighbour above is empty and
+// shading the ones whose neighbour below is empty. That single rule gives every
+// shape a rim light without any of them having to know their own outline.
+//
+// A row at the very edge of the cell is only ever filled where the shape
+// continues into the next cell, so treating off-tile as filled is what keeps
+// the seam between two cells unlit.
+static void shape_paint(uint16_t body, uint16_t top, uint16_t bottom)
+{
+    for (int y = 0; y < CELL; y++)
+    {
+        for (int x = 0; x < CELL; x++)
+        {
+            if (!g_shape[y * CELL + x])
+                continue;
+
+            if (y > 0 && !g_shape[(y - 1) * CELL + x])
+                g_tile[y * CELL + x] = top;
+            else if (y < CELL - 1 && !g_shape[(y + 1) * CELL + x])
+                g_tile[y * CELL + x] = bottom;
+            else
+                g_tile[y * CELL + x] = body;
+        }
+    }
+}
+
+//-----------------------------------------------------------------------------
+static void tile_eye(int x, int y, int px, int py, uint16_t body)
+{
+    tile_rect(x, y, 4, 4, C_EYE);
+
+    // Knocking the corners off is what makes a 4 px eye read as round
+    tile_set(x,     y,     body);
+    tile_set(x + 3, y,     body);
+    tile_set(x,     y + 3, body);
+    tile_set(x + 3, y + 3, body);
+
+    tile_rect(x + px, y + py, 2, 2, C_PUPIL);
+}
+
+//-----------------------------------------------------------------------------
+static void tile_eyes(direction_t dir, uint16_t body)
+{
+    switch (dir)
+    {
+        // Set back one pixel from the snout: an eye against the rim of a
+        // rounded head loses half of itself to the curve
+        case DIR_RIGHT:
+            tile_eye(8, 3, 2, 1, body);
+            tile_eye(8, 9, 2, 1, body);
+            break;
+
+        case DIR_LEFT:
+            tile_eye(4, 3, 0, 1, body);
+            tile_eye(4, 9, 0, 1, body);
+            break;
+
+        case DIR_UP:
+            tile_eye(3, 4, 1, 0, body);
+            tile_eye(9, 4, 1, 0, body);
+            break;
+
+        default:
+            tile_eye(3, 8, 1, 2, body);
+            tile_eye(9, 8, 1, 2, body);
+            break;
+    }
+}
+
+//-----------------------------------------------------------------------------
+// The model
+//-----------------------------------------------------------------------------
+
+//-----------------------------------------------------------------------------
+static inline int body_x(int i) { return g_body[i] & 0xff; }
+static inline int body_y(int i) { return g_body[i] >> 8; }
+
+//-----------------------------------------------------------------------------
+static int body_index_at(int cx, int cy)
+{
+    uint16_t packed = (uint16_t)((cy << 8) | cx);
+
+    for (int i = 0; i < g_len; i++)
+    {
+        if (g_body[i] == packed)
+            return i;
+    }
+
+    return -1;
+}
+
+//-----------------------------------------------------------------------------
+// Which side of cell a its neighbour b is on, wrapping if the walls do
+static int link_mask(int ax, int ay, int bx, int by)
+{
+    int dx = bx - ax;
+    int dy = by - ay;
+
+    if (g_wrap)
+    {
+        if (dx > 1)  dx -= GRID_W;
+        if (dx < -1) dx += GRID_W;
+        if (dy > 1)  dy -= GRID_H;
+        if (dy < -1) dy += GRID_H;
+    }
+
+    if (0 == dy && 1 == dx)  return M_RIGHT;
+    if (0 == dy && -1 == dx) return M_LEFT;
+    if (0 == dx && 1 == dy)  return M_DOWN;
+    if (0 == dx && -1 == dy) return M_UP;
+
+    return 0;
+}
+
+//-----------------------------------------------------------------------------
+static int wall_mask(int cx, int cy)
+{
+    int mask = 0;
+
+    if (cy > 0 && CELL_WALL == g_cell[cy - 1][cx])          mask |= M_UP;
+    if (cy < GRID_H - 1 && CELL_WALL == g_cell[cy + 1][cx]) mask |= M_DOWN;
+    if (cx > 0 && CELL_WALL == g_cell[cy][cx - 1])          mask |= M_LEFT;
+    if (cx < GRID_W - 1 && CELL_WALL == g_cell[cy][cx + 1]) mask |= M_RIGHT;
+
+    // A block on the edge of the panel is drawn square, so the wall reads as
+    // continuing past the screen instead of stopping just short of it
+    if (0 == cy) mask |= M_UP;
+    if (GRID_H - 1 == cy) mask |= M_DOWN;
+    if (0 == cx) mask |= M_LEFT;
+    if (GRID_W - 1 == cx) mask |= M_RIGHT;
+
+    return mask;
+}
+
+//-----------------------------------------------------------------------------
+// Composes and blits one cell from the model, whatever is in it. Everything
+// that changes the field goes through here, so the screen cannot disagree with
+// the model about what a cell holds.
+static void paint_cell(int cx, int cy)
+{
+    uint16_t body = (ST_DYING == g_state && g_dying_bright) ? C_DEAD : C_SNAKE;
+    uint16_t top  = (ST_DYING == g_state && g_dying_bright) ? C_DEAD_TOP : C_SNAKE_TOP;
+    uint16_t bot  = (ST_DYING == g_state && g_dying_bright) ? C_DEAD_BOT : C_SNAKE_BOT;
+
+    tile_checker(cx, cy);
+
+    switch (g_cell[cy][cx])
+    {
+        case CELL_WALL:
+            shape_build(wall_mask(cx, cy), 0, 4);
+            shape_paint(C_WALL, C_WALL_TOP, C_WALL_BOT);
+            break;
+
+        case CELL_FRUIT:
+            tile_sprite(g_fruit_spr);
+            break;
+
+        case CELL_BONUS:
+            if (g_bonus_shown)
+                tile_sprite(&snake_spr_gold);
+            break;
+
+        case CELL_SNAKE:
+        {
+            int i = body_index_at(cx, cy);
+            int mask = 0;
+
+            if (i < 0)
+                break;
+
+            if (i > 0)
+                mask |= link_mask(cx, cy, body_x(i - 1), body_y(i - 1));
+
+            if (i < g_len - 1)
+                mask |= link_mask(cx, cy, body_x(i + 1), body_y(i + 1));
+
+            if (g_len > 1 && i == g_len - 1)
+            {
+                shape_tail(link_mask(cx, cy, body_x(i - 1), body_y(i - 1)));
+                shape_paint(body, top, bot);
+            }
+            else if (0 == i)
+            {
+                shape_build(mask, 1, 6);
+                shape_paint(body, top, bot);
+                tile_eyes(g_dir, body);
+            }
+            else
+            {
+                shape_build(mask, 1, 5);
+                shape_paint(body, top, bot);
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    tile_blit(cx * CELL, FIELD_Y + cy * CELL);
 }
 
 //-----------------------------------------------------------------------------
 static void draw_field(void)
 {
-    lcd_fill_rect(0, FIELD_Y, LCD_WIDTH, LCD_HEIGHT - FIELD_Y, BG_COLOR);
-
-    if (!g_game.game_started)
-        return;
-
-    for (int i = g_game.snake.length - 1; i > 0; i--) {
-        draw_cell(g_game.snake.segments[i].x, g_game.snake.segments[i].y,
-            SNAKE_COLOR);
+    for (int cy = 0; cy < GRID_H; cy++)
+    {
+        for (int cx = 0; cx < GRID_W; cx++)
+            paint_cell(cx, cy);
     }
-
-    draw_head(g_game.snake.segments[0].x, g_game.snake.segments[0].y);
-    draw_food();
 }
 
 //-----------------------------------------------------------------------------
-// Centered message box, used for the title, pause and game over states
-static void draw_box(const char *title, const char *l1, const char *l2)
+// Repaints every cell a rectangle of the panel touches. Used to take an
+// overlay back off the field without repainting all 260 cells for it.
+static void repaint_region(int x, int y, int w, int h)
 {
-    int w = 240;
-    int h = 80;
-    int x = (LCD_WIDTH - w) / 2;
-    int y = FIELD_Y + (LCD_HEIGHT - FIELD_Y - h) / 2;
+    int cx0 = x / CELL;
+    int cx1 = (x + w - 1) / CELL;
+    int cy0 = (y - FIELD_Y) / CELL;
+    int cy1 = (y + h - 1 - FIELD_Y) / CELL;
 
-    lcd_fill_rect(x, y, w, h, STATUS_BG);
-    lcd_draw_rect(x, y, w - 1, h - 1, BORDER_COLOR);
+    if (cx0 < 0) cx0 = 0;
+    if (cy0 < 0) cy0 = 0;
+    if (cx1 > GRID_W - 1) cx1 = GRID_W - 1;
+    if (cy1 > GRID_H - 1) cy1 = GRID_H - 1;
 
-    lcd_set_font(FONT_LARGE);
-    lcd_set_color(STATUS_BG, TEXT_COLOR);
-    lcd_puts(x + (w - (int)strlen(title) * 8) / 2, y + 12, title);
+    for (int cy = cy0; cy <= cy1; cy++)
+    {
+        for (int cx = cx0; cx <= cx1; cx++)
+            paint_cell(cx, cy);
+    }
+}
 
-    lcd_set_font(FONT_SMALL);
+//-----------------------------------------------------------------------------
+// Text
+//-----------------------------------------------------------------------------
 
-    if (l1)
-        lcd_puts(x + (w - (int)strlen(l1) * 6) / 2, y + 40, l1);
+//-----------------------------------------------------------------------------
+static void put_text(int x, int y, const char *str, const Font *font,
+    uint16_t fg, uint16_t bg)
+{
+    lcd_set_font(font);
+    lcd_set_color(bg, fg);
+    lcd_puts(x, y, str);
+}
 
-    if (l2)
-        lcd_puts(x + (w - (int)strlen(l2) * 6) / 2, y + 55, l2);
+//-----------------------------------------------------------------------------
+static void put_text_centered(int cx, int y, const char *str, const Font *font,
+    uint16_t fg, uint16_t bg)
+{
+    put_text(cx - (int)strlen(str) * font->width / 2, y, str, font, fg, bg);
+}
+
+//-----------------------------------------------------------------------------
+// The panel headings, drawn by scaling the 8x16 font. A row of the glyph is
+// expanded into a line buffer and blitted `scale` times - 8x16 is the largest
+// font in the firmware, and a title has to be bigger than a menu label.
+#define TEXT_MAX_SCALE      3
+
+static void draw_glyph_scaled(int x, int y, char ch, int scale,
+    uint16_t fg, uint16_t bg)
+{
+    const Font *font = FONT_LARGE;
+    uint16_t line[8 * TEXT_MAX_SCALE];
+    const uint8_t *bitmap;
+
+    if (ch < FONT_FIRST_CHAR || ch > FONT_LAST_CHAR)
+        ch = '?';
+
+    bitmap = font->data + (ch - FONT_FIRST_CHAR) * font->pitch;
+
+    for (int gy = 0; gy < font->height; gy++)
+    {
+        for (int gx = 0; gx < font->width; gx++)
+        {
+            int i = gy * font->width + gx;
+            uint16_t c = ((bitmap[i / 8] >> (i % 8)) & 1) ? fg : bg;
+
+            for (int s = 0; s < scale; s++)
+                line[gx * scale + s] = c;
+        }
+
+        for (int s = 0; s < scale; s++)
+            lcd_draw_buf(x, y + gy * scale + s, font->width * scale, 1, line);
+    }
+}
+
+//-----------------------------------------------------------------------------
+static int text_scaled_width(const char *str, int scale)
+{
+    return (int)strlen(str) * (FONT_LARGE)->width * scale;
+}
+
+//-----------------------------------------------------------------------------
+static void draw_text_scaled(int x, int y, const char *str, int scale,
+    uint16_t fg, uint16_t bg)
+{
+    if (scale > TEXT_MAX_SCALE)
+        scale = TEXT_MAX_SCALE;
+
+    while (*str)
+    {
+        draw_glyph_scaled(x, y, *str++, scale, fg, bg);
+        x += (FONT_LARGE)->width * scale;
+    }
+}
+
+//-----------------------------------------------------------------------------
+// The status bar
+//-----------------------------------------------------------------------------
+
+//-----------------------------------------------------------------------------
+static void draw_sprite_at(int px, int py, const sprite_t *sprite, uint16_t bg)
+{
+    tile_fill(bg);
+    tile_sprite(sprite);
+    tile_blit(px, py);
+}
+
+//-----------------------------------------------------------------------------
+static const snake_level_t *current_level(void)
+{
+    // Classic is the campaign's own open field, played forever
+    if (MODE_CLASSIC == g_mode)
+        return &snake_levels[0];
+
+    return &snake_levels[g_level];
+}
+
+//-----------------------------------------------------------------------------
+static int level_target(void)
+{
+    if (MODE_CLASSIC == g_mode)
+        return 0;
+
+    return current_level()->target + 2 * g_loop;
+}
+
+//-----------------------------------------------------------------------------
+static int step_interval(void)
+{
+    int ms = (MODE_CLASSIC == g_mode) ? CLASSIC_STEP_MS : current_level()->step_ms;
+
+    ms = ms * g_speed_pct[g_speed] / 100;
+
+    if (MODE_LEVELS == g_mode)
+        ms -= 10 * g_loop;
+
+    return (ms < MIN_STEP_MS) ? MIN_STEP_MS : ms;
+}
+
+//-----------------------------------------------------------------------------
+static void draw_hud(void)
+{
+    char buf[48];
+
+    lcd_fill_rect(0, 0, LCD_WIDTH, HUD_H, C_HUD);
+    lcd_fill_rect(0, HUD_H - 2, LCD_WIDTH, 2, C_HUD_EDGE);
+
+    draw_sprite_at(6, 8, &snake_spr_apple, C_HUD);
+
+    snprintf(buf, sizeof(buf), "%d", g_score);
+    put_text(28, 8, buf, FONT_LARGE, C_TEXT, C_HUD);
+
+    if (MODE_CLASSIC == g_mode)
+    {
+        snprintf(buf, sizeof(buf), "CLASSIC - %s",
+            g_wrap ? "WRAP" : "WALLS");
+        put_text(112, 4, buf, FONT_SMALL, C_TEXT_DIM, C_HUD);
+
+        snprintf(buf, sizeof(buf), "LENGTH %d", g_len);
+        put_text(112, 16, buf, FONT_SMALL, C_TEXT_DIM, C_HUD);
+    }
+    else
+    {
+        snprintf(buf, sizeof(buf), "LEVEL %d - %s",
+            g_level + 1, current_level()->name);
+        put_text(112, 4, buf, FONT_SMALL, C_TEXT_DIM, C_HUD);
+
+        snprintf(buf, sizeof(buf), "FRUIT %d/%d  LENGTH %d",
+            g_eaten, level_target(), g_len);
+        put_text(112, 16, buf, FONT_SMALL, C_TEXT_DIM, C_HUD);
+    }
+
+    snprintf(buf, sizeof(buf), "BEST %d", g_best);
+    put_text(LCD_WIDTH - 4 - (int)strlen(buf) * (FONT_SMALL)->width, 10, buf,
+        FONT_SMALL, C_GOLD, C_HUD);
+}
+
+//-----------------------------------------------------------------------------
+// Overlay panels
+//-----------------------------------------------------------------------------
+
+//-----------------------------------------------------------------------------
+static void panel_open(int w, int h)
+{
+    g_panel_w = w;
+    g_panel_h = h;
+    g_panel_x = (LCD_WIDTH - w) / 2;
+    g_panel_y = FIELD_Y + (FIELD_H - h) / 2;
+
+    lcd_fill_rect(g_panel_x + 4, g_panel_y + 4, w, h, C_SHADOW);
+    lcd_fill_rect(g_panel_x, g_panel_y, w, h, C_PANEL);
+    lcd_draw_rect(g_panel_x, g_panel_y, w, h, C_PANEL_EDGE);
+    lcd_draw_rect(g_panel_x + 1, g_panel_y + 1, w - 2, h - 2, C_PANEL_EDGE);
+}
+
+//-----------------------------------------------------------------------------
+static void panel_close(void)
+{
+    if (0 == g_panel_w)
+        return;
+
+    repaint_region(g_panel_x, g_panel_y, g_panel_w + 4, g_panel_h + 4);
+    g_panel_w = 0;
+}
+
+//-----------------------------------------------------------------------------
+// The decorative snake on the title panel: the same cell renderer the game
+// uses, so the title shows exactly what the player is about to steer
+static void draw_title_snake(int px, int py)
+{
+    // Where each cell goes and which of its sides continue, tail first. The
+    // cells carry their own column and row because the snake turns: the head
+    // goes UNDER the cell that turns down, not one column past it, and a mask
+    // that says two cells are joined does not make them touch on its own.
+    static const struct { int8_t cx, cy, mask; } piece[] =
+    {
+        { 0, 0, M_RIGHT },              // tail
+        { 1, 0, M_LEFT | M_RIGHT },
+        { 2, 0, M_LEFT | M_RIGHT },
+        { 3, 0, M_LEFT | M_DOWN },      // the turn
+        { 3, 1, M_UP },                 // head, looking down at the apple
+    };
+
+    for (int i = 0; i < ARRAY_SIZE(piece); i++)
+    {
+        tile_fill(C_PANEL);
+
+        if (0 == i)
+        {
+            shape_tail(piece[i].mask);
+            shape_paint(C_SNAKE, C_SNAKE_TOP, C_SNAKE_BOT);
+        }
+        else if (ARRAY_SIZE(piece) - 1 == i)
+        {
+            shape_build(piece[i].mask, 1, 6);
+            shape_paint(C_SNAKE, C_SNAKE_TOP, C_SNAKE_BOT);
+            tile_eyes(DIR_DOWN, C_SNAKE);
+        }
+        else
+        {
+            shape_build(piece[i].mask, 1, 5);
+            shape_paint(C_SNAKE, C_SNAKE_TOP, C_SNAKE_BOT);
+        }
+
+        tile_blit(px + piece[i].cx * CELL, py + piece[i].cy * CELL);
+    }
+
+    draw_sprite_at(px + 3 * CELL, py + 2 * CELL + 2, &snake_spr_apple, C_PANEL);
+}
+
+//-----------------------------------------------------------------------------
+static void draw_title_panel(void)
+{
+    int x, y;
+
+    panel_open(276, 168);
+    x = g_panel_x;
+    y = g_panel_y;
+
+    draw_text_scaled(x + (276 - text_scaled_width("SNAKE", 3)) / 2, y + 14,
+        "SNAKE", 3, C_TEXT, C_PANEL);
+
+    put_text_centered(x + 138, y + 66,
+        (MODE_CLASSIC == g_mode) ? "CLASSIC - ENDLESS FIELD"
+                                 : "CAMPAIGN - 8 LEVELS",
+        FONT_SMALL, C_GOLD, C_PANEL);
+
+    draw_title_snake(x + 24, y + 88);
+
+    put_text(x + 132, y + 92, "MODE   start", FONT_SMALL, C_TEXT, C_PANEL);
+    put_text(x + 132, y + 106, "arrows steer", FONT_SMALL, C_TEXT_DIM, C_PANEL);
+    put_text(x + 132, y + 120, "MENU   settings", FONT_SMALL, C_TEXT_DIM, C_PANEL);
+    put_text(x + 132, y + 134, "SHIFT+MENU exit", FONT_SMALL, C_TEXT_DIM, C_PANEL);
+
+    if (g_best > 0)
+    {
+        char buf[32];
+
+        snprintf(buf, sizeof(buf), "BEST %d", g_best);
+        put_text_centered(x + 138, y + 150, buf, FONT_SMALL, C_GOLD, C_PANEL);
+    }
+}
+
+//-----------------------------------------------------------------------------
+static void draw_ready_panel(void)
+{
+    char buf[4];
+
+    panel_open(96, 96);
+
+    snprintf(buf, sizeof(buf), "%d", g_anim_step);
+    draw_text_scaled(g_panel_x + (96 - text_scaled_width(buf, 3)) / 2,
+        g_panel_y + 12, buf, 3, C_GOLD, C_PANEL);
+
+    put_text_centered(g_panel_x + 48, g_panel_y + 70, "GET READY", FONT_SMALL,
+        C_TEXT, C_PANEL);
+}
+
+//-----------------------------------------------------------------------------
+static void draw_pause_panel(void)
+{
+    panel_open(220, 96);
+
+    draw_text_scaled(g_panel_x + (220 - text_scaled_width("PAUSED", 2)) / 2,
+        g_panel_y + 18, "PAUSED", 2, C_TEXT, C_PANEL);
+
+    put_text_centered(g_panel_x + 110, g_panel_y + 58, "MODE  resume",
+        FONT_SMALL, C_TEXT, C_PANEL);
+    put_text_centered(g_panel_x + 110, g_panel_y + 72, "MENU  settings",
+        FONT_SMALL, C_TEXT_DIM, C_PANEL);
+}
+
+//-----------------------------------------------------------------------------
+static void draw_over_panel(void)
+{
+    char buf[40];
+    int x, y;
+
+    panel_open(268, 140);
+    x = g_panel_x;
+    y = g_panel_y;
+
+    draw_sprite_at(x + 22, y + 20, &snake_spr_skull, C_PANEL);
+    draw_text_scaled(x + 52, y + 14, "GAME OVER", 2, C_TEXT, C_PANEL);
+
+    snprintf(buf, sizeof(buf), "SCORE %d   LENGTH %d", g_score, g_len);
+    put_text_centered(x + 134, y + 54, buf, FONT_SMALL, C_TEXT, C_PANEL);
+
+    if (g_new_best)
+        put_text_centered(x + 134, y + 70, "NEW BEST SCORE", FONT_SMALL,
+            C_GOLD, C_PANEL);
+    else
+    {
+        snprintf(buf, sizeof(buf), "BEST %d", g_best);
+        put_text_centered(x + 134, y + 70, buf, FONT_SMALL, C_GOLD, C_PANEL);
+    }
+
+    if (MODE_LEVELS == g_mode)
+    {
+        snprintf(buf, sizeof(buf), "MODE  retry level %d", g_level + 1);
+        put_text_centered(x + 134, y + 96, buf, FONT_SMALL, C_TEXT, C_PANEL);
+        put_text_centered(x + 134, y + 110, "SHIFT+MODE  new run", FONT_SMALL,
+            C_TEXT_DIM, C_PANEL);
+    }
+    else
+    {
+        put_text_centered(x + 134, y + 96, "MODE  play again", FONT_SMALL,
+            C_TEXT, C_PANEL);
+        put_text_centered(x + 134, y + 110, "SHIFT+MENU  exit", FONT_SMALL,
+            C_TEXT_DIM, C_PANEL);
+    }
+}
+
+//-----------------------------------------------------------------------------
+static void draw_clear_panel(void)
+{
+    char buf[40];
+    int next = (g_level + 1) % snake_level_count;
+
+    panel_open(252, 112);
+
+    snprintf(buf, sizeof(buf), "LEVEL %d", g_level + 1);
+    draw_text_scaled(g_panel_x + (252 - text_scaled_width(buf, 2)) / 2,
+        g_panel_y + 14, buf, 2, C_TEXT, C_PANEL);
+
+    put_text_centered(g_panel_x + 126, g_panel_y + 50, "CLEARED", FONT_SMALL,
+        C_GOLD, C_PANEL);
+
+    if (0 == next)
+        snprintf(buf, sizeof(buf), "CAMPAIGN ROUND %d - FASTER", g_loop + 2);
+    else
+        snprintf(buf, sizeof(buf), "NEXT: %s", snake_levels[next].name);
+
+    put_text_centered(g_panel_x + 126, g_panel_y + 72, buf, FONT_SMALL,
+        C_TEXT, C_PANEL);
+    put_text_centered(g_panel_x + 126, g_panel_y + 90, "MODE  continue",
+        FONT_SMALL, C_TEXT_DIM, C_PANEL);
 }
 
 //-----------------------------------------------------------------------------
 static void draw_overlay(void)
 {
-    if (!g_game.game_started)
-        draw_box("SNAKE", "MODE: start   arrows: steer",
-            "MENU: settings and help");
-    else if (g_game.game_over)
-        draw_box("GAME OVER", "MODE: play again", "SHIFT+MENU: back to the launcher");
-    else if (g_game.paused)
-        draw_box("PAUSED", "MODE: resume", NULL);
+    switch (g_state)
+    {
+        case ST_TITLE: draw_title_panel(); break;
+        case ST_READY: draw_ready_panel(); break;
+        case ST_PAUSE: draw_pause_panel(); break;
+        case ST_OVER:  draw_over_panel();  break;
+        case ST_CLEAR: draw_clear_panel(); break;
+        default: g_panel_w = 0; break;
+    }
 }
 
 //-----------------------------------------------------------------------------
-static void start_or_toggle(void)
+// Game logic
+//-----------------------------------------------------------------------------
+
+//-----------------------------------------------------------------------------
+static void queue_direction(direction_t dir)
 {
-    if (!g_game.game_started) {
-        g_game.game_started = true;
-        draw_field();
+    static const direction_t opposite[] =
+        { DIR_DOWN, DIR_UP, DIR_RIGHT, DIR_LEFT };
+
+    // Validated against the last direction *queued*, not the one being
+    // travelled: that is what lets a left-then-up flick inside a single step
+    // come out as two turns instead of one turn and one ignored press
+    if (dir == g_dir_queued || dir == opposite[g_dir_queued])
         return;
-    }
 
-    if (g_game.game_over) {
-        reset_game();
-        g_game.game_started = true;
-        draw_status();
-        draw_field();
+    if (g_dirq_count >= (int)ARRAY_SIZE(g_dirq))
         return;
-    }
 
-    g_game.paused = !g_game.paused;
-
-    if (g_game.paused)
-        draw_overlay();
-    else
-        draw_field();
+    g_dirq[g_dirq_count++] = (uint8_t)dir;
+    g_dir_queued = dir;
 }
+
+//-----------------------------------------------------------------------------
+static direction_t take_direction(void)
+{
+    direction_t dir;
+
+    if (0 == g_dirq_count)
+        return g_dir;
+
+    dir = (direction_t)g_dirq[0];
+
+    for (int i = 1; i < g_dirq_count; i++)
+        g_dirq[i - 1] = g_dirq[i];
+
+    g_dirq_count--;
+
+    return dir;
+}
+
+//-----------------------------------------------------------------------------
+// Picks uniformly among the free cells rather than retrying random ones, so
+// the last free cell of a nearly full field is found as reliably as the first
+static bool free_cell(int *out_x, int *out_y)
+{
+    int free_count = 0;
+
+    for (int cy = 0; cy < GRID_H; cy++)
+    {
+        for (int cx = 0; cx < GRID_W; cx++)
+        {
+            if (CELL_EMPTY == g_cell[cy][cx])
+                free_count++;
+        }
+    }
+
+    if (0 == free_count)
+        return false;
+
+    int pick = rand() % free_count;
+
+    for (int cy = 0; cy < GRID_H; cy++)
+    {
+        for (int cx = 0; cx < GRID_W; cx++)
+        {
+            if (CELL_EMPTY != g_cell[cy][cx])
+                continue;
+
+            if (0 == pick--)
+            {
+                *out_x = cx;
+                *out_y = cy;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+//-----------------------------------------------------------------------------
+static void spawn_fruit(void)
+{
+    static const sprite_t *const fruit[] =
+        { &snake_spr_apple, &snake_spr_orange, &snake_spr_berry };
+
+    if (!free_cell(&g_fruit_x, &g_fruit_y))
+        return;
+
+    g_fruit_spr = fruit[rand() % ARRAY_SIZE(fruit)];
+    g_cell[g_fruit_y][g_fruit_x] = CELL_FRUIT;
+}
+
+//-----------------------------------------------------------------------------
+static void clear_bonus(void)
+{
+    if (!g_bonus_on)
+        return;
+
+    g_bonus_on = false;
+    g_cell[g_bonus_y][g_bonus_x] = CELL_EMPTY;
+    paint_cell(g_bonus_x, g_bonus_y);
+}
+
+//-----------------------------------------------------------------------------
+static void spawn_bonus(void)
+{
+    if (!g_bonus_enabled || g_bonus_on)
+        return;
+
+    if (!free_cell(&g_bonus_x, &g_bonus_y))
+        return;
+
+    g_bonus_on = true;
+    g_bonus_shown = true;
+    g_bonus_ms = BONUS_MS;
+    g_cell[g_bonus_y][g_bonus_x] = CELL_BONUS;
+    paint_cell(g_bonus_x, g_bonus_y);
+}
+
+//-----------------------------------------------------------------------------
+static void record_best(void)
+{
+    if (g_score <= g_best)
+        return;
+
+    g_best = g_score;
+    g_new_best = true;
+}
+
+//-----------------------------------------------------------------------------
+// Reads the map into the grid and puts the snake on its start cell. The body
+// runs back from the head, so the map only has to keep the two cells behind
+// the start marker clear.
+static void load_level(void)
+{
+    const snake_level_t *level = current_level();
+    int head_x = GRID_W / 2;
+    int head_y = GRID_H / 2;
+
+    g_dir = DIR_RIGHT;
+
+    for (int cy = 0; cy < GRID_H; cy++)
+    {
+        for (int cx = 0; cx < GRID_W; cx++)
+        {
+            char c = level->rows[cy][cx];
+
+            g_cell[cy][cx] = ('#' == c) ? CELL_WALL : CELL_EMPTY;
+
+            switch (c)
+            {
+                case '>': g_dir = DIR_RIGHT; break;
+                case '<': g_dir = DIR_LEFT;  break;
+                case '^': g_dir = DIR_UP;    break;
+                case 'v': g_dir = DIR_DOWN;  break;
+                default: continue;
+            }
+
+            head_x = cx;
+            head_y = cy;
+        }
+    }
+
+    // If the border kills, the border is drawn. An open map with a lethal edge
+    // is the one thing a player cannot learn from looking at the screen, and
+    // the first version of this game died to it constantly; a map that already
+    // has its own frame just gets the same cells set twice.
+    if (!g_wrap)
+    {
+        for (int cx = 0; cx < GRID_W; cx++)
+        {
+            g_cell[0][cx] = CELL_WALL;
+            g_cell[GRID_H - 1][cx] = CELL_WALL;
+        }
+
+        for (int cy = 0; cy < GRID_H; cy++)
+        {
+            g_cell[cy][0] = CELL_WALL;
+            g_cell[cy][GRID_W - 1] = CELL_WALL;
+        }
+    }
+
+    g_dir_queued = g_dir;
+    g_dirq_count = 0;
+
+    g_len = 3;
+
+    for (int i = 0; i < g_len; i++)
+    {
+        int x = head_x;
+        int y = head_y;
+
+        switch (g_dir)
+        {
+            case DIR_RIGHT: x -= i; break;
+            case DIR_LEFT:  x += i; break;
+            case DIR_UP:    y += i; break;
+            default:        y -= i; break;
+        }
+
+        if (x < 0) x += GRID_W;
+        if (x >= GRID_W) x -= GRID_W;
+        if (y < 0) y += GRID_H;
+        if (y >= GRID_H) y -= GRID_H;
+
+        g_body[i] = (uint16_t)((y << 8) | x);
+        g_cell[y][x] = CELL_SNAKE;
+    }
+
+    g_eaten = 0;
+    g_bonus_on = false;
+    g_level_score = g_score;
+
+    spawn_fruit();
+}
+
+//-----------------------------------------------------------------------------
+static void enter_ready(void)
+{
+    g_state = ST_READY;
+    g_anim_step = 3;
+    g_anim_ms = 0;
+    draw_overlay();
+}
+
+//-----------------------------------------------------------------------------
+static void start_run(void)
+{
+    g_score = 0;
+    g_level = 0;
+    g_loop = 0;
+    g_total_eaten = 0;
+    g_new_best = false;
+
+    load_level();
+}
+
+//-----------------------------------------------------------------------------
+static void restart(bool whole_run)
+{
+    if (whole_run || MODE_CLASSIC == g_mode)
+        start_run();
+    else
+    {
+        g_score = g_level_score;
+        load_level();
+    }
+
+    g_panel_w = 0;
+    draw_hud();
+    draw_field();
+    enter_ready();
+}
+
+//-----------------------------------------------------------------------------
+static void die(void)
+{
+    g_state = ST_DYING;
+    g_anim_step = DEATH_FLASHES;
+    g_anim_ms = 0;
+    g_dying_bright = true;
+
+    record_best();
+
+    for (int i = 0; i < g_len; i++)
+        paint_cell(body_x(i), body_y(i));
+}
+
+//-----------------------------------------------------------------------------
+static void level_cleared(void)
+{
+    g_state = ST_CLEAR;
+    g_anim_ms = 0;
+
+    record_best();
+    draw_overlay();
+}
+
+//-----------------------------------------------------------------------------
+static void next_level(void)
+{
+    panel_close();
+
+    g_level++;
+
+    if (g_level >= snake_level_count)
+    {
+        g_level = 0;
+        g_loop++;
+    }
+
+    load_level();
+    draw_hud();
+    draw_field();
+    enter_ready();
+}
+
+//-----------------------------------------------------------------------------
+// One step: move, test for a collision, and repaint only the cells that can
+// have changed
+static void step_game(void)
+{
+    int tail_x = body_x(g_len - 1);
+    int tail_y = body_y(g_len - 1);
+    int old_head_x = body_x(0);
+    int old_head_y = body_y(0);
+    int x = old_head_x;
+    int y = old_head_y;
+    bool ate_fruit, ate_bonus, grew;
+
+    g_dir = take_direction();
+
+    switch (g_dir)
+    {
+        case DIR_UP:    y--; break;
+        case DIR_DOWN:  y++; break;
+        case DIR_LEFT:  x--; break;
+        default:        x++; break;
+    }
+
+    if (g_wrap)
+    {
+        if (x < 0) x = GRID_W - 1;
+        if (x >= GRID_W) x = 0;
+        if (y < 0) y = GRID_H - 1;
+        if (y >= GRID_H) y = 0;
+    }
+    else if (x < 0 || x >= GRID_W || y < 0 || y >= GRID_H)
+    {
+        die();
+        return;
+    }
+
+    if (CELL_WALL == g_cell[y][x])
+    {
+        die();
+        return;
+    }
+
+    ate_fruit = (CELL_FRUIT == g_cell[y][x]);
+    ate_bonus = (CELL_BONUS == g_cell[y][x]);
+    grew = ate_fruit;
+
+    // The tail cell is vacated by this very move, so running into it is legal -
+    // unless this move also grows the snake, in which case it is not vacated
+    if (CELL_SNAKE == g_cell[y][x] &&
+        !(!grew && x == tail_x && y == tail_y))
+    {
+        die();
+        return;
+    }
+
+    if (!grew)
+    {
+        g_cell[tail_y][tail_x] = CELL_EMPTY;
+    }
+    else if (g_len < MAX_SNAKE)
+    {
+        g_body[g_len] = g_body[g_len - 1];
+        g_len++;
+    }
+
+    for (int i = g_len - 1; i > 0; i--)
+        g_body[i] = g_body[i - 1];
+
+    g_body[0] = (uint16_t)((y << 8) | x);
+    g_cell[y][x] = CELL_SNAKE;
+
+    if (ate_bonus)
+    {
+        g_bonus_on = false;
+        g_score += BONUS_SCORE;
+        draw_hud();
+    }
+
+    if (ate_fruit)
+    {
+        g_score += FRUIT_SCORE;
+        g_eaten++;
+        g_total_eaten++;
+
+        spawn_fruit();
+        paint_cell(g_fruit_x, g_fruit_y);
+        draw_hud();
+
+        if (0 == g_total_eaten % BONUS_EVERY)
+            spawn_bonus();
+    }
+
+    if (!grew)
+        paint_cell(tail_x, tail_y);
+
+    paint_cell(body_x(g_len - 1), body_y(g_len - 1));
+    paint_cell(old_head_x, old_head_y);
+    paint_cell(x, y);
+
+    if (MODE_LEVELS == g_mode && g_eaten >= level_target())
+    {
+        clear_bonus();
+        level_cleared();
+    }
+}
+
+//-----------------------------------------------------------------------------
+static void anim_tick(void)
+{
+    g_anim_ms += ANIM_MS;
+
+    switch (g_state)
+    {
+        case ST_READY:
+            if (g_anim_ms < READY_MS)
+                break;
+
+            g_anim_ms = 0;
+            g_anim_step--;
+
+            if (g_anim_step > 0)
+            {
+                draw_ready_panel();
+                break;
+            }
+
+            panel_close();
+            g_state = ST_PLAY;
+            g_step_timer = step_interval();
+            break;
+
+        case ST_DYING:
+            if (g_anim_ms < DEATH_FLASH_MS)
+                break;
+
+            g_anim_ms = 0;
+            g_anim_step--;
+            g_dying_bright = !g_dying_bright;
+
+            if (g_anim_step > 0)
+            {
+                for (int i = 0; i < g_len; i++)
+                    paint_cell(body_x(i), body_y(i));
+                break;
+            }
+
+            g_state = ST_OVER;
+
+            if (g_best > config.snake_high_score)
+                config.snake_high_score = g_best;
+
+            draw_overlay();
+            break;
+
+        case ST_CLEAR:
+            if (g_anim_ms >= CLEAR_MS)
+                next_level();
+            break;
+
+        case ST_PLAY:
+            if (!g_bonus_on)
+                break;
+
+            g_bonus_ms -= ANIM_MS;
+
+            if (g_bonus_ms <= 0)
+            {
+                clear_bonus();
+                break;
+            }
+
+            // It blinks out its last three seconds, so a bonus is something you
+            // decide about rather than something that vanishes
+            if (g_bonus_ms < BONUS_WARN_MS)
+            {
+                bool shown = ((g_bonus_ms / BONUS_BLINK_MS) & 1) != 0;
+
+                if (shown != g_bonus_shown)
+                {
+                    g_bonus_shown = shown;
+                    paint_cell(g_bonus_x, g_bonus_y);
+                }
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+//-----------------------------------------------------------------------------
+// Application interface
+//-----------------------------------------------------------------------------
 
 //-----------------------------------------------------------------------------
 void snake_game_init(void)
 {
-    srand(timer_ms()); // otherwise every game gets the same food sequence
+    srand(timer_us()); // otherwise every game gets the same fruit sequence
 
-    reset_game();
+    g_best = config.snake_high_score;
 
-    timer_add(&g_game_timer);
-    g_game_timer = g_step_ms[g_speed];
+    if (g_best < 0 || g_best > 999999)
+        g_best = 0;
+
+    g_state = ST_TITLE;
+    g_panel_w = 0;
+
+    start_run();
+
+    timer_add(&g_step_timer);
+    timer_add(&g_anim_timer);
+
+    g_step_timer = step_interval();
+    g_anim_timer = ANIM_MS;
 
     snake_game_redraw();
 }
@@ -363,7 +1492,15 @@ void snake_game_init(void)
 //-----------------------------------------------------------------------------
 void snake_game_redraw(void)
 {
-    draw_status();
+    // Reached when a menu or a help page closed over the game. Whatever was on
+    // screen is gone, and a player who was mid-run did not choose to be handed
+    // back a moving snake, so the countdown comes back with it.
+    if (ST_PLAY == g_state)
+        enter_ready();
+
+    g_panel_w = 0;
+
+    draw_hud();
     draw_field();
     draw_overlay();
 }
@@ -371,49 +1508,78 @@ void snake_game_redraw(void)
 //-----------------------------------------------------------------------------
 void snake_game_task(void)
 {
-    if (g_game_timer != 0)
-        return;
+    if (0 == g_anim_timer)
+    {
+        g_anim_timer = ANIM_MS;
+        anim_tick();
+    }
 
-    g_game_timer = g_step_ms[g_speed];
+    if (0 == g_step_timer)
+    {
+        g_step_timer = step_interval();
 
-    if (g_game.game_started && !g_game.game_over && !g_game.paused)
-        step_game();
+        if (ST_PLAY == g_state)
+            step_game();
+    }
+}
+
+//-----------------------------------------------------------------------------
+static void confirm_pressed(bool shift)
+{
+    switch (g_state)
+    {
+        case ST_TITLE:
+            panel_close();
+            enter_ready();
+            break;
+
+        case ST_PLAY:
+            g_state = ST_PAUSE;
+            draw_overlay();
+            break;
+
+        case ST_PAUSE:
+            panel_close();
+            enter_ready();
+            break;
+
+        case ST_OVER:
+            restart(shift);
+            break;
+
+        case ST_CLEAR:
+            next_level();
+            break;
+
+        default:
+            break;
+    }
 }
 
 //-----------------------------------------------------------------------------
 void snake_game_buttons_handler(int buttons)
 {
     bool repeat = (buttons & BTN_REPEAT);
-    direction_t dir = g_game.snake.direction;
 
-    // A 180 degree turn would run the head straight into the neck
-    if (buttons & BTN_UP) {
-        if (dir != DIR_DOWN)
-            g_game.snake.next_direction = DIR_UP;
-    }
-    else if (buttons & BTN_DOWN) {
-        if (dir != DIR_UP)
-            g_game.snake.next_direction = DIR_DOWN;
-    }
-    else if (buttons & BTN_LEFT) {
-        if (dir != DIR_RIGHT)
-            g_game.snake.next_direction = DIR_LEFT;
-    }
-    else if (buttons & BTN_RIGHT) {
-        if (dir != DIR_LEFT)
-            g_game.snake.next_direction = DIR_RIGHT;
-    }
-    else if (buttons & (BTN_MODE | BTN_STOP)) {
-        if (!repeat)
-            start_or_toggle();
-    }
+    if (buttons & BTN_UP)
+        queue_direction(DIR_UP);
+    else if (buttons & BTN_DOWN)
+        queue_direction(DIR_DOWN);
+    else if (buttons & BTN_LEFT)
+        queue_direction(DIR_LEFT);
+    else if (buttons & BTN_RIGHT)
+        queue_direction(DIR_RIGHT);
+    else if ((buttons & (BTN_MODE | BTN_STOP)) && !repeat)
+        confirm_pressed(0 != (buttons & BTN_SHIFT));
 }
 
 //-----------------------------------------------------------------------------
 void snake_game_cleanup(void)
 {
-    g_game_timer = TIMER_DISABLE;
-    timer_remove(&g_game_timer);
+    g_step_timer = TIMER_DISABLE;
+    g_anim_timer = TIMER_DISABLE;
+    timer_remove(&g_step_timer);
+    timer_remove(&g_anim_timer);
 }
 
 //-----------------------------------------------------------------------------
@@ -421,49 +1587,54 @@ void snake_game_cleanup(void)
 //-----------------------------------------------------------------------------
 
 //-----------------------------------------------------------------------------
+// A setting that changes the map or the rules cannot be applied to a run in
+// progress, so it starts a new one. The popup repaints the game when it closes.
+static void settings_changed(void)
+{
+    g_state = ST_TITLE;
+    start_run();
+}
+
+//-----------------------------------------------------------------------------
 static void action_restart(const void *arg)
 {
     (void)arg;
 
-    reset_game();
-    g_game.game_started = true;
-    menu_close_popups(); // the game repaints itself when the popup closes
+    g_state = ST_TITLE;
+    start_run();
+    menu_close_popups();
 }
 
-static const char *const g_help_lines[] =
+//-----------------------------------------------------------------------------
+static void action_reset_best(const void *arg)
 {
-    "UP/DOWN/LEFT/RIGHT - Steer",
-    "MODE (or STOP)     - Start / pause / retry",
-    "MENU               - This menu",
-    "SHIFT+MENU         - Back to the launcher",
-    "",
-    "Eating the food scores 10 points and grows",
-    "the snake by one cell.",
-    "",
-    "With Walls on, the border is lethal; with",
-    "Wrap on, the snake comes back on the other",
-    "side. Either way, running into yourself",
-    "ends the game.",
-};
+    (void)arg;
 
-static const info_page_t g_help_page =
-{
-    .title = "Snake",
-    .lines = g_help_lines,
-    .count = ARRAY_SIZE(g_help_lines),
-};
+    g_best = 0;
+    g_new_best = false;
+    config.snake_high_score = 0;
+    menu_close_popups();
+}
 
-static const char *const g_speed_labels[] = { "Slow", "Normal", "Fast" };
+static const char *const g_mode_labels[] = { "Levels", "Classic" };
+static const char *const g_speed_labels[] = { "Slow", "Normal", "Fast", "Insane" };
 
 static const menu_item_t g_menu_items[] =
 {
+    { .kind = MI_CHOICE, .label = "Game mode",
+      .u.choice = { &g_mode, g_mode_labels, ARRAY_SIZE(g_mode_labels),
+                    settings_changed } },
     { .kind = MI_CHOICE, .label = "Speed",
       .u.choice = { &g_speed, g_speed_labels, ARRAY_SIZE(g_speed_labels), NULL } },
     { .kind = MI_TOGGLE, .label = "Wrap at walls",
-      .u.toggle = { &g_wrap_walls, NULL } },
+      .u.toggle = { &g_wrap, settings_changed } },
+    { .kind = MI_TOGGLE, .label = "Bonus fruit",
+      .u.toggle = { &g_bonus_enabled, NULL } },
     { .kind = MI_SEPARATOR },
     { .kind = MI_ACTION, .label = "Restart",
       .u.action = { action_restart, NULL } },
+    { .kind = MI_ACTION, .label = "Clear best score",
+      .u.action = { action_reset_best, NULL } },
 };
 
 const menu_def_t snake_game_menu =
@@ -473,11 +1644,60 @@ const menu_def_t snake_game_menu =
     .count = ARRAY_SIZE(g_menu_items),
 };
 
+//-----------------------------------------------------------------------------
+static const char *const g_help_lines[] =
+{
+    INFO_HEAD "CONTROLS",
+    "UP/DOWN/LEFT/RIGHT - Steer. Presses are",
+    "queued, so a two-turn flick between steps",
+    "comes out as two turns.",
+    "MODE (or STOP)     - Start / pause / retry",
+    "SHIFT+MODE         - New run, from level 1",
+    "MENU               - This menu",
+    "SHIFT+MENU         - Back to the launcher",
+    "",
+    INFO_HEAD "SCORING",
+    "Fruit is 10 points and one cell of length.",
+    "The golden apple is 50, appears after every",
+    "fourth fruit, and blinks out its last three",
+    "seconds - it is a decision, not a gift.",
+    "The best score is kept in flash and survives",
+    "a power cycle.",
+    "",
+    INFO_HEAD "MODES",
+    "Levels is a campaign of eight maps. Each one",
+    "asks for a few more fruit than the last and",
+    "runs 10 ms quicker; clearing the eighth",
+    "starts the campaign again, faster, with",
+    "higher targets.",
+    "Classic is one open field forever, at a",
+    "fixed speed.",
+    "",
+    INFO_HEAD "WALLS",
+    "With Wrap off the border kills, so the game",
+    "draws it: a ring of wall goes round the map",
+    "whatever the map itself asks for. With Wrap",
+    "on there is no ring and the snake comes back",
+    "on the other side.",
+    "",
+    INFO_HEAD "SPEED",
+    "The setting scales whatever the level asks",
+    "for: Slow 150%, Normal 100%, Fast 78%,",
+    "Insane 60% of its step interval.",
+};
+
+static const info_page_t g_help_page =
+{
+    .title = "Snake",
+    .lines = g_help_lines,
+    .count = ARRAY_SIZE(g_help_lines),
+};
+
 // Read-only pages: the system menu shows them under Help, not among the
 // settings above
 static const menu_item_t g_help_items[] =
 {
-    { .kind = MI_ACTION, .label = "Controls",
+    { .kind = MI_ACTION, .label = "Controls and rules",
       .u.action = { menu_action_info, &g_help_page } },
 };
 

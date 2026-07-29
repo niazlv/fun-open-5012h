@@ -45,12 +45,12 @@ HOST_SRCS = \
   $(ROOT)/src/dsp/trend.c \
   $(wildcard $(ROOT)/src/decode/*.c) \
 
-.PHONY: all test host coredump doomhost clean
+.PHONY: all test host coredump snake doomhost clean
 
 all: test
 
-# The two that run without an asset pack
-test: host coredump
+# The ones that run without an asset pack
+test: host coredump snake
 
 host: $(BUILD)/host_test
 	@./$(BUILD)/host_test
@@ -61,6 +61,22 @@ coredump:
 $(BUILD)/host_test: $(HOST_SRCS) | $(BUILD)
 	@echo CC $@
 	@$(CC) $(CFLAGS) $(HOST_SRCS) $(LIBS) -o $@
+
+# Snake. It needs two things the list above deliberately withholds: the game's
+# own directory, and src/ui for the real fonts - the artwork is drawn here for
+# real, into a framebuffer, so that a blit off the edge of the panel fails a
+# test instead of corrupting a display.
+SNAKE_SRCS = \
+  snake_test.c \
+  $(ROOT)/src/apps/snake_assets.c \
+  $(ROOT)/src/ui/fonts.c \
+
+snake: $(BUILD)/snake_test
+	@./$(BUILD)/snake_test
+
+$(BUILD)/snake_test: $(SNAKE_SRCS) $(ROOT)/src/apps/snake_game.c | $(BUILD)
+	@echo CC $@
+	@$(CC) $(CFLAGS) -I$(ROOT)/src/apps -I$(ROOT)/tests/hoststub $(SNAKE_SRCS) $(LIBS) -o $@
 
 # Renders one DOOM frame to a .ppm. Not part of `test`: it needs the asset
 # pack, which is built from a real IWAD and is not in the repository.
