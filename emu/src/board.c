@@ -110,6 +110,48 @@ static bool g_lcd_wr_prev = true;
 
 static AfeState g_afe;
 
+/* TIMER0/TIMER7 prescalers.
+ *
+ * PSC is a shadow register on this silicon. A write only parks the value; the
+ * prescaler keeps dividing by the old one until an update event - SWEVG.UPG,
+ * or the counter wrapping CAR - hands it over. Reading the register straight
+ * back, the way this model used to derive the sample rate, skips all of that
+ * and makes a timebase change look instantaneous.
+ *
+ * The shadow is load-bearing, which is why it is worth modeling. An update
+ * event also clears the prescaler counter, so firmware that writes PSC and
+ * goes straight to CEN lets TIMER0 (the AD9288 encode clock) and TIMER7 (the
+ * DMA strobe) each latch the new divider at their OWN first overflow, leaving
+ * the two prescalers at an arbitrary relative phase. With CAR = 1 and ADC B's
+ * encode clock inverted, ADC B's sampling edge and the DMA strobe are
+ * nominally the SAME timer instant, so that slip puts the bus read on the
+ * converter's output transition and the ring fills with metastable bytes.
+ *
+ * The analog half of that is NOT modeled and cannot be here: cpu_step()
+ * advances time in 256-instruction slices, ~1 us, while the slip is a few ns
+ * - both CEN writes land on the same emulated instant, so the phase comes out
+ * identically zero however carefully it is derived. Inventing it would be
+ * fiction rather than a model. What IS exactly reproducible is the register
+ * sequence that produces it, and timer_ctl0_write() reports that instead.
+ */
+#define LATE_LATCH_REPORTS  4
+
+typedef struct
+{
+  uint32_t    base;
+  const char *name;
+  uint32_t    psc;      // what the prescaler is dividing by right now
+  uint64_t    due_ns;   // when a parked write takes over; 0 = nothing parked
+  bool        enabled;
+  int         warned;
+  int         late_latches;
+} Prescaler;
+
+/* TIMER0_Type and TIMER7_Type are the same advanced-timer layout, so one set
+ * of offsets serves both. */
+static Prescaler g_tim0 = { TIMER0_BASE, "TIMER0", 0, 0, false, 0, 0 };
+static Prescaler g_tim7 = { TIMER7_BASE, "TIMER7", 0, 0, false, 0, 0 };
+
 /*- Prototypes --------------------------------------------------------------*/
 static void gpio_outputs_changed(int port);
 static void dma_sync(uint64_t now_ns);
@@ -177,6 +219,12 @@ void board_reset(void)
   memset(g_nvic_pending, 0, sizeof(g_nvic_pending));
 
   g_timer1_origin_ns = 0;
+  // Reset value of both prescalers is 0, and nothing is parked yet
+  g_tim0.psc = g_tim7.psc = 0;
+  g_tim0.due_ns = g_tim7.due_ns = 0;
+  g_tim0.enabled = g_tim7.enabled = false;
+  g_tim0.warned = g_tim7.warned = 0;
+  g_tim0.late_latches = g_tim7.late_latches = 0;
   g_fmc_key1_seen = false;
   g_fmc_unlocked = false;
   g_fmc_busy_until_ns = 0;
@@ -506,22 +554,90 @@ bool board_flash_write(uint32_t addr, uint64_t value, unsigned size)
 
 /*- DMA + the acquisition front end -----------------------------------------*/
 
+/*- TIMER0/TIMER7 prescalers ------------------------------------------------*/
+
+//-----------------------------------------------------------------------------
+static uint64_t timer_counter_period_ns(const Prescaler *t, uint64_t psc)
+{
+  uint64_t car = pget(t->base + offsetof(TIMER7_Type, CAR)) & 0xffff;
+
+  return ((psc + 1) * (car + 1) * 1000000000ull + TIMER_APB2_HZ / 2) /
+      TIMER_APB2_HZ;
+}
+
+//-----------------------------------------------------------------------------
+// The divider in force at `now_ns`, applying a parked write once its update
+// event has come due.
+static uint64_t timer_psc(Prescaler *t, uint64_t now_ns)
+{
+  if (t->due_ns && now_ns >= t->due_ns)
+  {
+    t->psc = pget(t->base + offsetof(TIMER7_Type, PSC)) & 0xffff;
+    t->due_ns = 0;
+  }
+
+  return t->psc;
+}
+
+//-----------------------------------------------------------------------------
+// An update event: the parked divider takes over and the prescaler counter
+// restarts from zero.
+static void timer_update_event(Prescaler *t)
+{
+  t->psc = pget(t->base + offsetof(TIMER7_Type, PSC)) & 0xffff;
+  t->due_ns = 0;
+}
+
+//-----------------------------------------------------------------------------
+static void timer_ctl0_write(Prescaler *t, uint32_t value, uint64_t now_ns)
+{
+  bool enable = (value & TIMER7_CTL0_CEN_Msk) != 0;
+  uint64_t parked = pget(t->base + offsetof(TIMER7_Type, PSC)) & 0xffff;
+
+  timer_psc(t, now_ns);
+
+  if (enable && !t->enabled && parked != t->psc)
+  {
+    // Started with a different divider parked and no update event in between.
+    // The prescaler serves one more counter period at the OLD value and
+    // latches at its own first overflow - and clears its counter there, which
+    // is where the TIMER0/TIMER7 phase is lost on hardware. Both timers doing
+    // this independently is the defect; see the block comment above.
+    t->due_ns = now_ns + timer_counter_period_ns(t, t->psc);
+    t->late_latches++;
+
+    // Every distinct divider change is worth naming - the one that bit was
+    // PSC 1 -> 3, and only reporting the first occurrence would have shown
+    // the harmless boot-time 0 -> 1 instead. Capped so a pan that retunes the
+    // timebase every frame cannot bury the log.
+    if (t->warned < LATE_LATCH_REPORTS)
+    {
+      t->warned++;
+      emu_log("%s: CEN set with PSC %llu parked over %llu and no update event"
+          " - the prescaler latches at its own first overflow, so TIMER0 and"
+          " TIMER7 end up out of phase (needles on hardware). Raise SWEVG.UPG"
+          " before CEN.%s",
+          t->name, (unsigned long long)parked, (unsigned long long)t->psc,
+          t->warned == LATE_LATCH_REPORTS ? " Further ones counted silently." : "");
+    }
+  }
+
+  t->enabled = enable;
+}
+
 //-----------------------------------------------------------------------------
 // One DMA request per TIMER7 update event. The firmware sets CAR = 1 and moves
 // PSC to pick the timebase, so this is where "sample rate" actually comes from.
 static uint64_t dma_request_period_ns(void)
 {
-  uint32_t ctl0 = pget(TIMER7_BASE + offsetof(TIMER7_Type, CTL0));
-  uint64_t psc  = pget(TIMER7_BASE + offsetof(TIMER7_Type, PSC)) & 0xffff;
-  uint64_t car  = pget(TIMER7_BASE + offsetof(TIMER7_Type, CAR)) & 0xffff;
-  uint64_t ticks;
+  uint64_t psc = timer_psc(&g_tim7, cpu_now_ns());
+  uint64_t car = pget(TIMER7_BASE + offsetof(TIMER7_Type, CAR)) & 0xffff;
 
-  if (!(ctl0 & TIMER7_CTL0_CEN_Msk))
+  if (!g_tim7.enabled)
     return 0;  // the timer is stopped: no requests at all
 
-  ticks = (psc + 1) * (car + 1);
-
-  return (ticks * 1000000000ull + TIMER_APB2_HZ / 2) / TIMER_APB2_HZ;
+  return ((psc + 1) * (car + 1) * 1000000000ull + TIMER_APB2_HZ / 2) /
+      TIMER_APB2_HZ;
 }
 
 //-----------------------------------------------------------------------------
@@ -917,11 +1033,30 @@ void board_mmio_write(uint64_t address, unsigned size, uint64_t value)
 
       return;
 
+    case TIMER0_BASE:
+      // The AD9288 encode clocks. Nothing downstream reads them - the model
+      // samples the signal directly - but the prescaler is tracked so the
+      // TIMER0/TIMER7 latch check has both halves to compare.
+      pset(addr, word);
+
+      if (off == offsetof(TIMER7_Type, SWEVG) && (word & TIMER0_SWEVG_UPG_Msk))
+        timer_update_event(&g_tim0);
+      else if (off == offsetof(TIMER7_Type, CTL0))
+        timer_ctl0_write(&g_tim0, word, cpu_now_ns());
+
+      return;
+
     case TIMER7_BASE:
       // Changing the sample clock while the channel runs must not retroactively
       // reinterpret samples already produced
       dma_sync(cpu_now_ns());
       pset(addr, word);
+
+      if (off == offsetof(TIMER7_Type, SWEVG) && (word & TIMER7_SWEVG_UPG_Msk))
+        timer_update_event(&g_tim7);
+      else if (off == offsetof(TIMER7_Type, CTL0))
+        timer_ctl0_write(&g_tim7, word, cpu_now_ns());
+
       return;
 
     case TIMER2_BASE:
@@ -1077,6 +1212,17 @@ void board_irq_accepted(int irqn)
 }
 
 //-----------------------------------------------------------------------------
+// How many times a timer was started with a divider change parked and no
+// update event to hand it over. Nonzero means the firmware is leaving the
+// encode clock and the DMA strobe to latch independently; see the Prescaler
+// comment. Reported at the end of every run, since the symptom it causes on
+// hardware is out of this model's reach.
+int board_late_prescaler_latches(void)
+{
+  return g_tim0.late_latches + g_tim7.late_latches;
+}
+
+//-----------------------------------------------------------------------------
 // What the acquisition is doing, for hang reports. A channel that is enabled
 // with an unserviced completion flag is the shape of a capture that has
 // stopped being fed - which is exactly the state worth naming.
@@ -1087,11 +1233,14 @@ void board_describe(char *buf, size_t size)
   uint64_t period = dma_request_period_ns();
 
   snprintf(buf, size,
-      "dma %s buf%d cnt %u/%u %s  irq %s/%s  %s  relay %d dac %d",
+      "dma %s buf%d cnt %u/%u %s  irq %s/%s  %s %lluns  psc %u/%u late %d/%d"
+      "  relay %d dac %d",
       g_dma.enabled ? "run" : "off", dma_mbs() ? 1 : 0,
       g_dma.cnt, g_dma.reload, g_dma.ftf ? "COMPLETION UNSERVICED" : "flowing",
       (g_nvic_enabled[word] & bit) ? "en" : "dis",
       (g_nvic_pending[word] & bit) ? "PENDING" : "idle",
       period ? "sampling" : "sample clock stopped",
+      (unsigned long long)period,
+      g_tim0.psc, g_tim7.psc, g_tim0.late_latches, g_tim7.late_latches,
       g_afe.relay_scale, g_afe.dac_code);
 }

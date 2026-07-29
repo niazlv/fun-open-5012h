@@ -75,6 +75,7 @@ void board_irq_accepted(int irqn);
 bool board_reset_requested(void);
 /* One line describing the acquisition, for hang reports */
 void board_describe(char *buf, size_t size);
+int board_late_prescaler_latches(void);
 
 /* Battery, in millivolts. Read back through the modeled ADC0. */
 extern int emu_battery_mv;

@@ -161,7 +161,7 @@ static bool g_hang_seen;
 //-----------------------------------------------------------------------------
 static void report_hang(const char *why)
 {
-  char cpu[160], board[224];
+  char cpu[160], board[320];
 
   cpu_describe(cpu, sizeof(cpu));
   board_describe(board, sizeof(board));
@@ -632,6 +632,12 @@ int main(int argc, char **argv)
 
   emu_log("ran %.1f ms of emulated time (%llu instructions)",
       cpu_now_ns() / 1e6, (unsigned long long)cpu_instructions());
+
+  if (board_late_prescaler_latches() > 0)
+    emu_log("acquisition: %d prescaler change(s) latched without an update"
+        " event - the encode clock and the DMA strobe are left to align"
+        " themselves (see the first TIMER0/TIMER7 line above)",
+        board_late_prescaler_latches());
 
   video_shutdown();
 
