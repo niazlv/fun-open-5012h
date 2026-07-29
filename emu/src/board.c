@@ -485,6 +485,7 @@ enum
 {
   SPIF_CMD_PAGE_PROGRAM = 0x02,
   SPIF_CMD_READ_DATA    = 0x03,
+  SPIF_CMD_FAST_READ    = 0x0b,
   SPIF_CMD_READ_STATUS  = 0x05,
   SPIF_CMD_WRITE_ENABLE = 0x06,
   SPIF_CMD_ERASE_SECTOR = 0x20,
@@ -599,6 +600,14 @@ static uint8_t spif_byte(uint8_t in)
       out = g_spif.wel ? 0x02 : 0x00;
       break;
 
+    /*
+     * Fast read is 03h with one byte of nothing between the address and the
+     * data: the part needs a clock's grace at the higher rate before it can
+     * answer. The firmware uses it for everything bulk - it is what took the
+     * bus from 15.6 to 31.25 MHz - so a model without it is a model on which
+     * DOOM's textures and every spifs file read as 0xff.
+     */
+    case SPIF_CMD_FAST_READ:
     case SPIF_CMD_READ_DATA:
     case SPIF_CMD_PAGE_PROGRAM:
     case SPIF_CMD_ERASE_SECTOR:
@@ -628,7 +637,11 @@ static uint8_t spif_byte(uint8_t in)
         break;
       }
 
-      if (SPIF_CMD_READ_DATA == g_spif.cmd)
+      // The dummy byte, which is the whole difference between the two reads
+      if (SPIF_CMD_FAST_READ == g_spif.cmd && 4 == phase)
+        break;
+
+      if (SPIF_CMD_READ_DATA == g_spif.cmd || SPIF_CMD_FAST_READ == g_spif.cmd)
       {
         out = mem[g_spif.addr];
         g_spif.addr = (g_spif.addr + 1) % SPIF_SIZE;
