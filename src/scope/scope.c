@@ -983,6 +983,45 @@ static void persist_build_ramp(void)
 }
 
 //-----------------------------------------------------------------------------
+// One edge of the decaying envelope, in this column, drawn as a piece of a
+// CURVE rather than as a dot.
+//
+// The two edges are where the beam has been, so they are what a phosphor
+// leaves behind - filling everything between them turns a trail into a solid
+// olive polygon, which is what the first version did and what nobody wants to
+// look at. But a single pixel per column is not a curve either: on a steep
+// edge the envelope's top moves a long way from one column to the next, and
+// the marks come out as a row of dots with gaps between them.
+//
+// So each column reaches halfway to whichever neighbours still glow - the
+// same halves-meet-in-the-middle trick close_gaps() plays on the trace, and
+// it makes the two ends of the join land on the same pixel.
+static void persist_edge(uint16_t *column, const uint8_t *edge, int c,
+    uint16_t glow)
+{
+  int top = edge[c], bot = edge[c];
+
+  for (int n = -1; n <= 1; n += 2)
+  {
+    int i = c + n, mid;
+
+    if (i < 0 || i >= GRID_WIDTH || !g_persist_lvl[i])
+      continue; // nothing glowing there to join up with
+
+    mid = (edge[c] + edge[i]) / 2;
+
+    if (mid < top)
+      top = mid;
+
+    if (mid > bot)
+      bot = mid;
+  }
+
+  for (int y = top; y <= bot; y++)
+    column[y] = glow;
+}
+
+//-----------------------------------------------------------------------------
 static void update_from_display_buffer(uint16_t *column, DisplayBuffer *db)
 {
   bool clip_h = db->flags[g_trace_column] & SAMPLE_FLAG_CLIP_H;
@@ -994,12 +1033,25 @@ static void update_from_display_buffer(uint16_t *column, DisplayBuffer *db)
   // level any frame ever reached in this column.
   if (config.persist_mode != PERSIST_OFF && g_persist_lvl[g_trace_column])
   {
-    int lvl = g_persist_lvl[g_trace_column];
-    uint16_t glow = (config.persist_mode == PERSIST_DECAY) ?
-        g_persist_ramp[lvl * PERSIST_RAMP_STEPS / 256] : TRACE_PERSIST_COLOR;
+    int c = g_trace_column;
 
-    for (int y = g_persist_min[g_trace_column]; y <= g_persist_max[g_trace_column]; y++)
-      column[y] = glow;
+    if (config.persist_mode == PERSIST_DECAY)
+    {
+      // The trail: two fading curves, the highest and the lowest the beam
+      // has lately been. Not the area between them - see persist_edge.
+      uint16_t glow = g_persist_ramp[g_persist_lvl[c] * PERSIST_RAMP_STEPS / 256];
+
+      persist_edge(column, g_persist_min, c, glow);
+      persist_edge(column, g_persist_max, c, glow);
+    }
+    else
+    {
+      // Infinite is a different question and keeps its answer: everywhere
+      // the signal has EVER been, as an area, so a runt that fired once is
+      // a mark you cannot miss rather than a hairline
+      for (int y = g_persist_min[c]; y <= g_persist_max[c]; y++)
+        column[y] = TRACE_PERSIST_COLOR;
+    }
   }
 
   if (db->flags[g_trace_column] & SAMPLE_FLAG_VALID)
