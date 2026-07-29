@@ -91,6 +91,36 @@
 // live trace in a dimmed tone so the current sweep stays readable over it
 #define TRACE_PERSIST_COLOR    LCD_COLOR(120, 120, 24)
 
+// ...and in decay mode, the brightest step of a ramp down to black. A fresh
+// glow starts above the flat tone infinite persistence uses and falls through
+// it, but stays well under TRACE_COLOR: the beam has to read as the brightest
+// thing on the grid. Taken up to (210,210,60) it did not, and the band that
+// trigger jitter legitimately paints across a steep edge - the beam really
+// does sweep all of it, every frame - stopped looking like a glow and started
+// looking like a solid slab of trace. 16 steps is finer than the eye
+// separates on a dim colour and costs 32 bytes of table.
+//
+// As components, because the ramp has to scale them: an LCD_COLOR() here
+// would have to be unpacked again to be dimmed, and a second copy of the
+// numbers written out beside it is a constant that can be edited without
+// changing anything - which is exactly what happened.
+#define PERSIST_GLOW_R         165
+#define PERSIST_GLOW_G         165
+#define PERSIST_GLOW_B         40
+#define PERSIST_RAMP_STEPS     16
+// How long a glow takes to reach black. Wall clock, not frames: the frame
+// rate here runs from hundreds a second to one per six seconds, and a decay
+// counted in frames would be a different decay on every timebase.
+#define PERSIST_DECAY_MS       1500
+// Persistence modes, in the order config.persist_mode stores them - see the
+// note on the field for why 1 is the infinite one
+enum
+{
+  PERSIST_OFF = 0,
+  PERSIST_INFINITE,
+  PERSIST_DECAY,
+};
+
 // Measurement cursors: the active one is solid, its partner dashed
 #define CURSOR_T_COLOR         LCD_COLOR(0, 200, 255)
 #define CURSOR_V_COLOR         LCD_COLOR(255, 120, 255)
@@ -365,7 +395,12 @@ static bool g_snap_tag = false;
 // the column-to-time mapping they accumulated under is gone.
 static uint8_t  g_persist_min[GRID_WIDTH];
 static uint8_t  g_persist_max[GRID_WIDTH];
-static uint8_t  g_persist_have[GRID_WIDTH];
+// How brightly this column's envelope still glows, 0 = nothing there. Was a
+// plain have/have-not flag; a byte was already being spent on it, so the
+// decay mode costs no RAM at all - infinite persistence simply pins it full.
+static uint8_t  g_persist_lvl[GRID_WIDTH];
+static uint16_t g_persist_ramp[PERSIST_RAMP_STEPS];
+static uint32_t g_persist_stamp;
 static uint16_t g_avg_acc[GRID_WIDTH];
 static uint8_t  g_avg_have[GRID_WIDTH];
 static uint32_t g_avg_gen;
@@ -929,6 +964,25 @@ static void update_column_from_image(int index, uint16_t *column, int x, int y, 
 }
 
 //-----------------------------------------------------------------------------
+// The phosphor ramp: PERSIST_GLOW_COLOR down to black, in equal steps.
+// Built rather than written out because it is indexed by a brightness that
+// falls linearly with time, so the steps have to be linear too - a hand
+// picked set of dim yellows would decay in visible jumps.
+static void persist_build_ramp(void)
+{
+  for (int i = 0; i < PERSIST_RAMP_STEPS; i++)
+  {
+    // i = 0 is the last step before nothing at all, so it is not black: a
+    // glow that reaches zero is dropped, not drawn
+    int n = i + 1;
+
+    g_persist_ramp[i] = LCD_COLOR(PERSIST_GLOW_R * n / PERSIST_RAMP_STEPS,
+        PERSIST_GLOW_G * n / PERSIST_RAMP_STEPS,
+        PERSIST_GLOW_B * n / PERSIST_RAMP_STEPS);
+  }
+}
+
+//-----------------------------------------------------------------------------
 static void update_from_display_buffer(uint16_t *column, DisplayBuffer *db)
 {
   bool clip_h = db->flags[g_trace_column] & SAMPLE_FLAG_CLIP_H;
@@ -938,10 +992,14 @@ static void update_from_display_buffer(uint16_t *column, DisplayBuffer *db)
   // The accumulated envelope first, so the live trace paints over it. This
   // is how a runt that fired once stays visible: the envelope holds every
   // level any frame ever reached in this column.
-  if (config.display_persist && g_persist_have[g_trace_column])
+  if (config.persist_mode != PERSIST_OFF && g_persist_lvl[g_trace_column])
   {
+    int lvl = g_persist_lvl[g_trace_column];
+    uint16_t glow = (config.persist_mode == PERSIST_DECAY) ?
+        g_persist_ramp[lvl * PERSIST_RAMP_STEPS / 256] : TRACE_PERSIST_COLOR;
+
     for (int y = g_persist_min[g_trace_column]; y <= g_persist_max[g_trace_column]; y++)
-      column[y] = TRACE_PERSIST_COLOR;
+      column[y] = glow;
   }
 
   if (db->flags[g_trace_column] & SAMPLE_FLAG_VALID)
@@ -3246,7 +3304,8 @@ static void update_display(void);
 // when the menu toggles the features themselves
 void scope_display_settings_changed(void)
 {
-  memset(g_persist_have, 0, sizeof(g_persist_have));
+  memset(g_persist_lvl, 0, sizeof(g_persist_lvl));
+  g_persist_stamp = timer_ms();
   memset(g_avg_have, 0, sizeof(g_avg_have));
   g_shadow_valid = false;
 }
@@ -3302,30 +3361,112 @@ static void display_average(void)
 }
 
 //-----------------------------------------------------------------------------
-// Persistence: fold what is about to be displayed into the envelope
+// Persistence: fold what is about to be displayed into the envelope.
+//
+// Infinite mode is the plain union of every frame, pinned at full brightness
+// - the runt that fired once an hour ago is still there, which is the whole
+// point of it.
+//
+// Decay mode is the same envelope with a brightness that runs out, and one
+// rule makes it behave like a phosphor: the glow is refreshed only where the
+// envelope GROWS, not merely where the trace is. A steady trace therefore
+// stops refreshing its own column immediately and its envelope fades to
+// nothing underneath it, while the one excursion that reached further lights
+// up and then dies away over PERSIST_DECAY_MS. Refreshing wherever the trace
+// happened to be would pin every column at full brightness forever, which is
+// infinite persistence again with extra steps.
+//
+// A column whose glow has run out drops back to the live band, and by then
+// it is black, so nothing is seen to snap.
 static void display_persist_accum(void)
 {
-  if (!config.display_persist)
+  uint32_t now = timer_ms();
+  int drop = 0;
+
+  if (config.persist_mode == PERSIST_OFF)
     return;
+
+  if (config.persist_mode == PERSIST_DECAY)
+  {
+    drop = (int)(((now - g_persist_stamp) * 255) / PERSIST_DECAY_MS);
+
+    // Only when it came to something: at a few hundred frames a second the
+    // elapsed time per frame rounds to no decay at all, and advancing the
+    // stamp anyway would throw that time away and leave the glow immortal
+    if (drop > 0)
+      g_persist_stamp = now;
+  }
 
   for (int c = 0; c < GRID_WIDTH; c++)
   {
+    int lo = g_display_buffer.min[c], hi = g_display_buffer.max[c];
+    bool grew_top = false, grew_bot = false;
+
     if (!(g_display_buffer.flags[c] & SAMPLE_FLAG_VALID))
       continue;
 
-    if (!g_persist_have[c])
+    if (!g_persist_lvl[c])
     {
-      g_persist_min[c] = g_display_buffer.min[c];
-      g_persist_max[c] = g_display_buffer.max[c];
-      g_persist_have[c] = 1;
+      g_persist_min[c] = lo;
+      g_persist_max[c] = hi;
+      grew_top = grew_bot = true;
     }
     else
     {
-      if (g_display_buffer.min[c] < g_persist_min[c])
-        g_persist_min[c] = g_display_buffer.min[c];
+      if (lo < g_persist_min[c])
+      {
+        g_persist_min[c] = lo;
+        grew_top = true;
+      }
 
-      if (g_display_buffer.max[c] > g_persist_max[c])
-        g_persist_max[c] = g_display_buffer.max[c];
+      if (hi > g_persist_max[c])
+      {
+        g_persist_max[c] = hi;
+        grew_bot = true;
+      }
+    }
+
+    if (config.persist_mode == PERSIST_INFINITE)
+    {
+      g_persist_lvl[c] = 255;
+      continue;
+    }
+
+    if (grew_top || grew_bot)
+      g_persist_lvl[c] = 255;
+    else
+      g_persist_lvl[c] = (g_persist_lvl[c] > drop) ? (g_persist_lvl[c] - drop) : 0;
+
+    // ...and the glow pulls back toward the live trace as it fades.
+    //
+    // Dimming alone is not enough, because it is per column and a column that
+    // grows at all is pinned bright - which is most of them on any steep
+    // edge, where a pixel of trigger jitter moves the band every frame. That
+    // pinned the WHOLE accumulated band, so an excursion from a minute ago
+    // stayed at full brightness underneath a live edge that had nothing to do
+    // with it. Each end therefore retreats on its own, and only the end that
+    // did not just grow: an edge column re-lights the side the beam is on and
+    // sheds the side it left.
+    //
+    // Exponential, with a floor of one pixel so the last few always close.
+    if (drop > 0 && !grew_top)
+    {
+      int step = ((lo - g_persist_min[c]) * drop) / 255;
+
+      g_persist_min[c] += (step > 1) ? step : 1;
+
+      if (g_persist_min[c] > lo)
+        g_persist_min[c] = lo;
+    }
+
+    if (drop > 0 && !grew_bot)
+    {
+      int step = ((g_persist_max[c] - hi) * drop) / 255;
+
+      g_persist_max[c] -= (step > 1) ? step : 1;
+
+      if (g_persist_max[c] < hi)
+        g_persist_max[c] = hi;
     }
   }
 }
@@ -7497,6 +7638,7 @@ void scope_init(bool calibration_mode)
   config.vertical_mult = config.calib_vs_mult[config.vertical_scale];
 
   grid_init();
+  persist_build_ramp();
 
   // The screen was just cleared: previous-frame caches are stale
   g_shadow_valid = false;
