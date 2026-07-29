@@ -214,6 +214,14 @@ proc mb_read {addr len path} {
   dump_image $path [mb_addr 32] $len
 }
 
+# Rebuilds the file table on the device and hands it back. The scan is 1952
+# sector heads; doing it from this side would be that many round trips.
+proc mb_scan {path} {
+  set n [mb_run 6 0 0]
+  if {$n > 0} { dump_image $path [mb_addr 32] [expr {$n * 48}] }
+  echo [format "FILES %d FREE %d" $n [mrw [mb_addr 8]]]
+}
+
 proc mb_crc {addr len} {
   echo [format "CRC %08X" [mb_run 4 $addr $len]]
 }

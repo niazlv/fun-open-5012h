@@ -110,7 +110,7 @@
 #define ENTRY_SIZE         (512)
 #define STORAGE_SIZE       FLASH_STORE_SIZE
 #define STORAGE_START      FLASH_STORE_BASE
-#define ENTRIES_COUNT      (STORAGE_SIZE / ENTRY_SIZE)
+#define ENTRIES_COUNT      ((int)(STORAGE_SIZE / ENTRY_SIZE))
 
 _Static_assert(ENTRY_SIZE >= sizeof(Config), "entry slot smaller than Config");
 _Static_assert(0 == FLASH_SECTOR_SIZE % ENTRY_SIZE, "slots must tile a sector");
@@ -290,8 +290,10 @@ static int g_entry_offset;
 static Config g_config_copy;
 static bool g_flash_erase_busy = false;
 static bool g_flash_write_busy = false;
+#if STORE_INTERNAL
 static uint32_t *g_flash_write_addr = 0;
 static uint32_t *g_flash_write_data = 0;
+#endif
 static uint32_t g_flash_write_size = 0;
 
 // Store health, reported by config_get_state() on the System Information page.

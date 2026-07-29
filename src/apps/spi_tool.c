@@ -38,6 +38,7 @@
 #include "timer.h"
 #include "utils.h"
 #include "flash.h"
+#include "spifs.h"
 #include "capture.h"
 #include "spi_tool.h"
 
@@ -56,6 +57,7 @@ enum
   CMD_READ        = 3,        // len bytes from addr into data[]
   CMD_CRC         = 4,        // crc32 of len bytes at addr, into result
   CMD_ERASE_CHIP  = 5,
+  CMD_SCAN        = 6,        // rebuild the file table, hand it to the host
 };
 
 enum
@@ -285,6 +287,34 @@ static void run_command(uint32_t cmd)
       note(ok ? "chip erased" : "CHIP ERASE FAILED", ok ? OK : BAD);
       break;
 
+    // The host needs the same picture of the part that the firmware has, and
+    // rescanning it from the other side of the debugger would be two thousand
+    // round trips. One command, one table.
+    case CMD_SCAN:
+    {
+      int n;
+
+      spifs_scan();
+      n = spifs_count();
+
+      for (int i = 0; i < n; i++)
+      {
+        memcpy((void *)(MAILBOX->data + i * sizeof(spifs_file_t)),
+            spifs_at(i), sizeof(spifs_file_t));
+      }
+
+      // Where a new file may start, which is the other thing a writer needs
+      MAILBOX->address = spifs_free_base();
+
+      result = (uint32_t)n;
+      ok = true;
+
+      snprintf(text, sizeof(text), "%d file%s, %lu KB used", n,
+          (1 == n) ? "" : "s", (unsigned long)(spifs_used() / 1024));
+      note(text, OK);
+      break;
+    }
+
     default:
       note("unknown command", BAD);
       MAILBOX->status = ST_BAD_REQUEST;
@@ -344,6 +374,32 @@ static void draw_screen(void)
 
   lcd_set_color(LCD_BLACK_COLOR, g_last_color ? g_last_color : FG);
   lcd_puts(10, y, g_last);
+  y += 20;
+
+  // What is actually on the part, by name. The scan is what the host asks for
+  // before writing anything, so by the time this matters it is already fresh.
+  lcd_set_color(LCD_BLACK_COLOR, FG);
+
+  if (!spifs_ready())
+  {
+    lcd_puts(10, y, "files: not scanned yet");
+  }
+  else if (0 == spifs_count())
+  {
+    lcd_puts(10, y, "files: none");
+  }
+  else
+  {
+    for (int i = 0; i < spifs_count() && i < 5; i++)
+    {
+      const spifs_file_t *f = spifs_at(i);
+
+      snprintf(buf, sizeof(buf), "%-24s %6lu B  @%06lX", f->name,
+          (unsigned long)f->size, (unsigned long)f->header);
+      lcd_puts(10, y, buf);
+      y += 12;
+    }
+  }
 
   lcd_set_color(LCD_BLACK_COLOR, DIM);
   lcd_puts(10, LCD_HEIGHT - 26,
@@ -371,6 +427,8 @@ void spi_tool_init(void)
   // Last, so that a host polling for the magic never sees a mailbox whose
   // other fields are still whatever the last application left there
   MAILBOX->magic = MAILBOX_MAGIC;
+
+  spifs_scan();
 
   g_dirty = true;
   draw_screen();

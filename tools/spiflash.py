@@ -270,6 +270,153 @@ def cmd_pull(args):
     print(f"pulled {len(blob)} bytes from {addr:#08x} into {args.path}")
 
 
+# The on-chip file header, see src/hal/spifs.h. Everything is little endian and
+# the payload starts right after it, at the next 64 byte boundary of the sector
+# the header opens.
+SPIFS_MAGIC = b"5012HFS\0"
+SPIFS_HEADER = 64
+SPIFS_NAME = 32
+SPIFS_SECTOR = 4096
+SPIFS_VERSION = 1
+
+
+def spifs_header(name, payload):
+    import struct
+    import zlib
+
+    raw = name.encode()
+
+    if len(raw) >= SPIFS_NAME:
+        raise SystemExit(f"name longer than {SPIFS_NAME - 1} bytes: {name}")
+
+    h = bytearray(SPIFS_HEADER)
+    h[0:8] = SPIFS_MAGIC
+    struct.pack_into("<III", h, 8, SPIFS_VERSION, len(payload),
+                     zlib.crc32(payload) & 0xFFFFFFFF)
+    struct.pack_into("<I", h, 20, 0xFFFFFFFF)           # flags: live
+    h[24:24 + len(raw)] = raw
+    struct.pack_into("<I", h, 60, zlib.crc32(bytes(h[:60])) & 0xFFFFFFFF)
+
+    return bytes(h)
+
+
+def spifs_list(args):
+    """Asks the device for its table. Returns (files, free_base)."""
+    import struct
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="spifs-")
+    path = os.path.join(tmp, "table.bin")
+
+    out = openocd_mailbox(args, [f"mb_scan {path}"])
+
+    m = re.search(r"FILES (\d+) FREE (\d+)", out)
+
+    if not m:
+        raise SystemExit("the device did not answer the scan")
+
+    count, free_base = int(m.group(1)), int(m.group(2))
+    files = []
+
+    if count:
+        with open(path, "rb") as f:
+            table = f.read()
+
+        os.unlink(path)
+
+        for i in range(count):
+            rec = table[i * 48:(i + 1) * 48]
+            header, data, size, crc = struct.unpack_from("<IIII", rec, 0)
+            name = rec[16:48].split(b"\0")[0].decode("ascii", "replace")
+            files.append(dict(name=name, header=header, data=data,
+                              size=size, crc=crc))
+
+    os.rmdir(tmp)
+
+    return files, free_base
+
+
+def cmd_ls(args):
+    files, free_base = spifs_list(args)
+
+    if not files:
+        print("no files")
+    else:
+        print(f"{'name':24} {'size':>9}  {'at':>8}  {'crc32':>8}")
+
+        for f in files:
+            print(f"{f['name']:24} {f['size']:>9}  {f['header']:08X}  "
+                  f"{f['crc']:08X}")
+
+    print(f"\nnext free sector {free_base:#08x}, "
+          f"{(RESERVED_BASE - free_base) // 1024} KB left")
+
+
+def cmd_add(args):
+    """Writes a file wherever there is room. The caller never names an address:
+    that is the whole point of the layout - a file carries its own header, so
+    the order things were written in means nothing."""
+    with open(args.path, "rb") as f:
+        payload = f.read()
+
+    name = args.name or os.path.basename(args.path)
+    files, free_base = spifs_list(args)
+
+    if any(f["name"] == name for f in files):
+        raise SystemExit(f"{name} is already there - rm it first")
+
+    blob = spifs_header(name, payload) + payload
+    need = -(-len(blob) // SPIFS_SECTOR) * SPIFS_SECTOR
+
+    if free_base + need > RESERVED_BASE:
+        raise SystemExit(f"{need // 1024} KB does not fit in the "
+                         f"{(RESERVED_BASE - free_base) // 1024} KB left")
+
+    tmp = args.path + ".spifs"
+
+    with open(tmp, "wb") as f:
+        f.write(blob)
+
+    try:
+        args.addr = str(free_base)
+        args.path = tmp
+        args.unsafe = False
+        args.yes = True     # the free sectors are what it was told to fill
+        cmd_push(args)
+    finally:
+        os.unlink(tmp)
+
+    print(f"{name}: {len(payload)} bytes at {free_base:#08x}")
+
+
+def cmd_rm(args):
+    """Clears the flags word. NOR programming can only clear bits, so this
+    needs no erase - the sectors come back when something writes over them."""
+    files, _ = spifs_list(args)
+    target = next((f for f in files if f["name"] == args.name), None)
+
+    if target is None:
+        raise SystemExit(f"no file called {args.name}")
+
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="spifs-")
+    path = os.path.join(tmp, "flags.bin")
+
+    with open(path, "wb") as f:
+        f.write(b"\0\0\0\0")
+
+    openocd_mailbox(args, [
+        f"load_image {path} 0x20000020 bin",
+        f"mb_run 2 {target['header'] + 20} 4",
+    ])
+
+    os.unlink(path)
+    os.rmdir(tmp)
+
+    print(f"{args.name} removed")
+
+
 def cmd_crc(args):
     out = openocd_mailbox(args,
         [f"mb_crc {int(args.addr, 0)} {int(args.count, 0)}"])
@@ -350,6 +497,18 @@ def main():
     l.add_argument("count")
     l.add_argument("path")
     l.set_defaults(func=cmd_pull)
+
+    ls = sub.add_parser("ls", help="what is on the chip")
+    ls.set_defaults(func=cmd_ls)
+
+    a = sub.add_parser("add", help="write a file, wherever it fits")
+    a.add_argument("path")
+    a.add_argument("--name", help="name on the chip (default: the basename)")
+    a.set_defaults(func=cmd_add)
+
+    r = sub.add_parser("rm", help="mark a file deleted")
+    r.add_argument("name")
+    r.set_defaults(func=cmd_rm)
 
     c = sub.add_parser("crc", help="crc32 of a range, computed on the device")
     c.add_argument("addr")

@@ -88,6 +88,7 @@ SRCS += \
 SRCS += \
   ../src/hal/lcd.c \
   ../src/hal/flash.c \
+  ../src/hal/spifs.c \
   ../src/hal/buttons.c \
   ../src/hal/battery.c \
   ../src/hal/input.c \
