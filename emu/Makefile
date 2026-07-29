@@ -23,9 +23,24 @@ LDFLAGS +=
 LIBS += -lm -lz
 
 ##############################################################################
-# Unicorn provides the Cortex-M4 core
-UNICORN_CFLAGS := $(shell pkg-config --cflags unicorn 2>/dev/null)
-UNICORN_LIBS   := $(shell pkg-config --libs unicorn 2>/dev/null)
+# Unicorn provides the Cortex-M4 core.
+#
+# A local build takes precedence, because that is the one carrying
+# unicorn/no-per-block-jit-toggle.patch - worth about 1.25x on Apple silicon.
+# It is entirely optional: without unicorn/build/ this falls through to
+# whatever unicorn the system has, and the emulator behaves identically either
+# way. See unicorn/build.sh.
+UNICORN_LOCAL := $(wildcard unicorn/build/libunicorn*.dylib unicorn/build/libunicorn*.so)
+
+ifneq ($(UNICORN_LOCAL),)
+  UNICORN_CFLAGS := -I$(abspath unicorn/build/include)
+  UNICORN_LIBS   := -L$(abspath unicorn/build) -lunicorn \
+                    -Wl,-rpath,$(abspath unicorn/build)
+  $(info NOTE using the patched unicorn in unicorn/build)
+else
+  UNICORN_CFLAGS := $(shell pkg-config --cflags unicorn 2>/dev/null)
+  UNICORN_LIBS   := $(shell pkg-config --libs unicorn 2>/dev/null)
+endif
 
 ifeq ($(UNICORN_LIBS),)
   # Homebrew and the usual /usr/local layout, when pkg-config has no .pc

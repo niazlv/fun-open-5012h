@@ -1,0 +1,36 @@
+Leave the JIT region executable between translation blocks.
+
+On Apple silicon a JIT page is either writable or executable, never both, and
+the switch goes through pthread_jit_write_protect_np. Unicorn's cpu_tb_exec()
+locks the region before running a block and unlocks it straight afterwards, so
+every block costs a pair of those calls. Profiling the 5012H emulator, that
+pair was a third of the whole runtime.
+
+The unlock is not needed. Each path that writes into the region - tb_gen_code,
+do_tb_phys_invalidate, tb_add_jump, uc_tb_flush - already brackets itself with
+tb_exec_unlock/tb_exec_lock, so leaving the region executable between blocks
+takes nothing away from them. The lock BEFORE the block does have to stay:
+those writers leave the region writable on the way out and rely on the next
+block to put it back. Removing that one instead is an immediate SIGBUS.
+
+Measured on unicorn 2.1.4, macOS 26.5, M-series: 1.20-1.30x on the emulator's
+own workload, and the six checked-in screenshots come out byte-identical, so
+nothing about what is emulated changes.
+
+index 77168f3..8153746 100644
+--- a/qemu/accel/tcg/cpu-exec.c
++++ b/qemu/accel/tcg/cpu-exec.c
+@@ -58,10 +58,9 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
+     UC_TRACE_START(UC_TRACE_TB_EXEC);
+     tb_exec_lock(cpu->uc);
+     ret = tcg_qemu_tb_exec(env, tb_ptr);
+-    if (cpu->uc->nested_level == 1) {
+-        // Only unlock (allow writing to JIT area) if we are the outmost uc_emu_start
+-        tb_exec_unlock(cpu->uc);
+-    }
++    /* Left executable on purpose: every path that writes code unlocks for
++     * itself, so unlocking here only bought a pthread_jit_write_protect_np
++     * pair per translation block. See no-per-block-jit-toggle.patch. */
+     UC_TRACE_END(UC_TRACE_TB_EXEC, "[uc] exec tb 0x%" PRIx64 ": ", itb->pc);
+ 
+     cpu->can_do_io = 1;

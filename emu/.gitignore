@@ -1,6 +1,10 @@
 # Emulator build output
 build/
 
+# Unicorn checked out and built by unicorn/build.sh; unicorn/build/ is covered
+# by the rule above
+unicorn/src-*/
+
 # Screenshots produced by a run: the ones committed to the repository live in
 # emu/screenshots/, everything else is a working file
 *.png
