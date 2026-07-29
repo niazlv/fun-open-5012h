@@ -207,6 +207,9 @@
 #define FFT_PANEL_ROWS         5     // peak rows
 
 #define FFT_UPDATE_TIMEOUT     100   // recompute the spectrum at most at 10 Hz
+#define FFT_FILL_MIN_MS        1000  // shorter than this, the record fills
+                                     // faster than the readout could be read
+#define FFT_FILL_TICK_MS       500   // ...and it ticks at 2 Hz while it does
 #define FFT_AUTO_BAND_MARGIN   6     // keep the measured frequency this far
                                      // below the analysis Nyquist
 
@@ -5677,6 +5680,45 @@ static void fft_panel_row(int row, int color, const char *str)
 }
 
 //-----------------------------------------------------------------------------
+// Is the record still filling, by enough to be worth saying? Below a second
+// the wait is shorter than the eye, and every pan tick re-times the
+// acquisition - a readout that flickered on all of them would be noise.
+static bool fft_fill_pending(void)
+{
+  int done, total;
+
+  capture_record_fill(&done, &total);
+
+  return (total >= FFT_FILL_MIN_MS && done < total);
+}
+
+//-----------------------------------------------------------------------------
+// The progress row, always row 2 - under the two header rows and above
+// whatever the panel has room for below it. Drawn on its own rather than by
+// repainting the panel around it: this ticks twice a second, and clearing 168
+// by 80 pixels of a bit-banged display that often is a panel that blinks.
+//
+// Expects FONT_SMALL, like fft_panel_row - it is called from the middle of
+// the panel's own rendering, and setting the font back to FONT_LARGE there
+// drew every row under it in the wrong one, off the edge of the panel.
+#define FFT_FILL_ROW  2
+
+static void fft_fill_row_draw(void)
+{
+  char line[40];
+  int done, total;
+
+  capture_record_fill(&done, &total);
+
+  snprintf(line, sizeof(line), "rec %d.%d/%d.%d s filling",
+      done / 1000, (done % 1000) / 100, total / 1000, (total % 1000) / 100);
+
+  lcd_fill_rect(FFT_PANEL_X + 1, FFT_PANEL_Y + 4 + FFT_FILL_ROW * 9,
+      FFT_PANEL_W - 2, 9, BG_COLOR);
+  fft_panel_row(FFT_FILL_ROW, CAPTURE_WAIT_COLOR, line);
+}
+
+//-----------------------------------------------------------------------------
 // The spectrum breakdown: which frequencies the record is actually made of.
 // Peaks that belong to the fundamental's harmonic comb are labelled h1..hN,
 // everything else (interference, a second unrelated source, the noise
@@ -5698,6 +5740,11 @@ static void draw_fft_panel(void)
   {
     fft_panel_row(0, TOAST_COLOR, "Spectrum: no peaks");
     fft_panel_row(1, MEASURE_FREQ_COLOR, "(only noise found)");
+
+    // "No peaks" on a record that is a tenth full is not a finding
+    if (fft_fill_pending())
+      fft_fill_row_draw();
+
     lcd_set_font(FONT_LARGE);
     return;
   }
@@ -5720,7 +5767,19 @@ static void draw_fft_panel(void)
       (g_fft_hold_mode == FFT_HOLD_AVG) ? " A" : "");
   fft_panel_row(row++, MEASURE_FREQ_COLOR, line);
 
-  for (int i = 0; i < g_fft_an.count && i < FFT_PANEL_ROWS; i++)
+  // A record still filling means every number above it was measured on the
+  // one from BEFORE the timebase moved. At 5 ms/div that is over in 100 ms
+  // and saying so would be noise; at 10 s/div it is 51 seconds of a spectrum
+  // that looks finished and answers the wrong question, which is exactly the
+  // trap this whole slow end of the timebase sets.
+  if (fft_fill_pending())
+  {
+    fft_fill_row_draw(); // draws at FFT_FILL_ROW, which is this row
+    row++;
+  }
+
+  // Peaks take what is left between the header and the footer row
+  for (int i = 0; i < g_fft_an.count && row < 2 + FFT_PANEL_ROWS; i++)
   {
     const FftPeak *p = &g_fft_an.peak[i];
     char tag[16];
@@ -7801,6 +7860,24 @@ void scope_task(void)
 
   if (g_fft_mode && g_fft_panel_on && g_fft_panel_pending)
     draw_fft_panel();
+
+  // A filling record delivers no frames while it fills, so fft_tick() - which
+  // is what normally repaints the panel - does not run at all, and the
+  // progress line would sit frozen at whatever it read when the timebase
+  // moved. Tick that ONE row here instead, off the wall clock rather than off
+  // frames, and leave the rest of the panel where it is.
+  if (g_fft_mode && g_fft_panel_on && !g_fft_panel_pending && fft_fill_pending())
+  {
+    static uint32_t last_ms = 0;
+
+    if ((timer_ms() - last_ms) >= FFT_FILL_TICK_MS)
+    {
+      last_ms = timer_ms();
+      lcd_set_font(FONT_SMALL);
+      fft_fill_row_draw();
+      lcd_set_font(FONT_LARGE);
+    }
+  }
 
   if (CAPTURE_STATE_WAIT == capture_get_state())
   {

@@ -171,6 +171,10 @@ static volatile uint32_t g_buffer_generation = 0;
 // survive between calls and has to be put back to the start of the ring
 // whenever dma_start() moves the writer back there.
 static volatile int g_stream_ptr;
+// The buffer generation the acquisition was last re-timed at. While it still
+// matches, no record captured under the CURRENT settings exists yet and the
+// one every consumer reads belongs to the settings before them.
+static volatile uint32_t g_retime_gen;
 
 /*- Prototypes --------------------------------------------------------------*/
 static inline int dma_get_count(void);
@@ -1014,6 +1018,11 @@ void capture_set_trigger_edge(int edge)
 
   g_trigger_edge = edge;
 
+  // Everything published from here on belongs to the OLD timing until a sweep
+  // completes under the new one - which at the slow end of the timebase is
+  // most of a minute away. See capture_record_fill().
+  g_retime_gen = g_buffer_generation;
+
   update_trigger_handler();
 
   if (!g_stopped)
@@ -1029,6 +1038,42 @@ void capture_set_trigger_mode(int mode)
 
   if (!g_stopped)
     dma_start();
+}
+
+//-----------------------------------------------------------------------------
+// How far the acquisition has got toward the first record captured under the
+// CURRENT timing, both in milliseconds of sweep. Equal once one has landed.
+//
+// Worth showing because a record is 98304 samples however long that takes: at
+// the slow end of the timebase a whole sweep is 51 s, and for all of it the
+// spectrum, the measurements and the decoders are reading the record from
+// BEFORE the timebase moved - with nothing on screen to say so. The trace has
+// the same problem and has always looked obviously stale; a spectrum does
+// not, it just quietly answers the wrong question.
+void capture_record_fill(int *done_ms, int *total_ms)
+{
+  int total = (int)(((int64_t)CAPTURE_BUFFER_SIZE * g_sample_period) / 1000000);
+  int64_t bytes;
+
+  if (total < 1)
+    total = 1;
+
+  *total_ms = total;
+
+  // A stopped record is whatever it is and is not going to improve; a
+  // generation past the re-timing means a sweep has completed since
+  if (g_stopped || g_buffer_generation != g_retime_gen)
+  {
+    *done_ms = total;
+    return;
+  }
+
+  bytes = g_sweep_bytes;
+
+  if (bytes > CAPTURE_BUFFER_SIZE)
+    bytes = CAPTURE_BUFFER_SIZE;
+
+  *done_ms = (int)((bytes * total) / CAPTURE_BUFFER_SIZE);
 }
 
 //-----------------------------------------------------------------------------

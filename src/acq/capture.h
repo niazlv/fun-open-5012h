@@ -154,6 +154,12 @@ int capture_read_fast_samples(uint8_t *dst, int max_count, int *period_ns);
 // in which case vmin/vmax are untouched. This is how the roll view reads the
 // input — see the comment on the definition for where samples are lost.
 int capture_fold_samples(int *vmin, int *vmax);
+// Progress toward the first record captured under the CURRENT acquisition
+// timing, in ms of sweep; done == total once one has landed. A sweep is
+// 98304 samples however long that takes - 51 s at the slow end - and until
+// it completes every consumer is reading the record from before the timebase
+// last moved.
+void capture_record_fill(int *done_ms, int *total_ms);
 bool capture_get_record(const uint8_t **data, int *size, int *offset,
     int *period_ns, int *trigger_timepos);
 
