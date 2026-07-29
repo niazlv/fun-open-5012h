@@ -19,10 +19,16 @@
 
 /*- Definitions -------------------------------------------------------------*/
 // A console line is longer than a hex dump: 32 bytes cut "MILKV-UART-TEST
-// 115200-8N1 #0123456789" in half, and the panel scrolls anyway. 64 costs
-// 576 bytes of result, which is why both LogicResults in the firmware are
-// static rather than automatic.
-#define LOGIC_MAX_BYTES  64
+// 115200-8N1 #0123456789" in half, and the panel scrolls anyway. That is what
+// 64 was for, and both LogicResults in the firmware are static rather than
+// automatic because of what it costs.
+//
+// 80 is CAN FD's doing. One FD frame is four bytes of identifier, a length
+// code, sixty-four of payload and three of CRC - seventy-two - and a record
+// that cannot hold the biggest frame a protocol has shows it short, which for
+// a hex dump is the one thing worse than showing it long. 144 bytes more of
+// result, twice over.
+#define LOGIC_MAX_BYTES  80
 #define LOGIC_MAX_RUNS   512
 
 /*- Types -------------------------------------------------------------------*/
@@ -160,19 +166,31 @@ typedef enum
   CAN_R_ID,     // 2 bytes (11-bit id) or 4 (29-bit), right-aligned
   CAN_R_DLC,
   CAN_R_DATA,
-  CAN_R_CRC,    // the 15-bit CRC, high byte
+  // The CRC, high byte first: two bytes of a classic frame's 15-bit one,
+  // three of a CAN FD frame's 17- or 21-bit one
+  CAN_R_CRC,
   CAN_R_ACK,    // its low byte, which is also where the ACK slot is reported
 } can_role_t;
 
 #define CAN_MAX_FRAMES  8
+#define CAN_MAX_DATA    64   // what a CAN FD frame can carry
 
 typedef struct
 {
   uint32_t id;
   uint8_t  dlc;
+  // What the length code stands for. Classic CAN counts 0..8 and the codes
+  // above eight all mean eight; CAN FD reads 9..15 as a table - 12, 16, 20,
+  // 24, 32, 48, 64 - so on an FD frame the code is NOT the byte count.
+  uint8_t  len;
   bool     ext;      // 29-bit identifier
   bool     rtr;      // remote request: a frame that asks rather than tells
-  bool     fd;       // CAN FD: recognised by its FDF bit, not decoded
+  bool     fd;       // CAN FD, and decoded as such
+  bool     brs;      // ...whose data phase ran at the faster of the two rates
+  // The transmitter is error passive: it is still on the bus and its frames
+  // still arrive, but it has been failing long enough to have lost the right
+  // to flag anyone else's errors. Worth seeing before it goes bus-off.
+  bool     esi;
   bool     crc_ok;
   bool     ack;      // somebody on the bus acknowledged it
   bool     cut;      // the record ended inside the frame's end-of-frame field
@@ -182,10 +200,17 @@ typedef struct
 
 typedef struct
 {
-  int      rate;     // bit/s
+  int      rate;      // arbitration bit/s
+  // The data phase's bit rate, which is the whole point of CAN FD. Equal to
+  // `rate` when no frame in the record switched.
+  int      data_rate;
   int      frames;
-  int      crc_ok;   // how many of them checked out
-  bool     fd_seen;  // a CAN FD frame went past; this decoder does not read it
+  int      fd;        // how many of them were CAN FD
+  int      crc_ok;    // how many of them checked out
+  // An FD frame went past that this decoder could NOT read: no data rate it
+  // tried made the CRC agree, or the frame is a non-ISO one (no stuff count,
+  // and a CRC register that starts at zero rather than at one).
+  bool     fd_seen;
   CanFrame frame[CAN_MAX_FRAMES];
   uint8_t  role[LOGIC_MAX_BYTES];
   uint8_t  fidx[LOGIC_MAX_BYTES];  // which frame each byte belongs to
@@ -783,9 +808,10 @@ int nec_decode(const uint8_t *data, int size, int offset, int period_ns,
 int servo_decode(const uint8_t *data, int size, int offset, int period_ns,
     LogicScratch *scratch, LogicResult *out);
 
-// CAN 2.0A/2.0B. Reports only what its CRC-15 confirms, so it is safe to run
-// ahead of the generic decoders. Same accessors as 1-Wire: the frame-level
-// read of the last record, and the per-byte label that comes out of it.
+// CAN 2.0A/2.0B and CAN FD. Reports only what a frame's own CRC confirms, so
+// it is safe to run ahead of the generic decoders. Same accessors as 1-Wire:
+// the frame-level read of the last record, and the per-byte label that comes
+// out of it.
 int can_decode(const uint8_t *data, int size, int offset, int period_ns,
     LogicScratch *scratch, LogicResult *out);
 const CanAnalysis *can_analysis(void);

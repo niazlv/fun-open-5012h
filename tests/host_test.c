@@ -289,6 +289,231 @@ static void can_g_frame(CanGen *g, uint32_t id, int ext, int rtr,
   can_g_idle(g, 7 + 3);                     // EOF + interframe space
 }
 
+// CAN FD (ISO 11898-1:2015) onto a wire. Separate from the classic generator
+// because almost nothing about the tail of the frame is shared: two bit
+// times with the switch at the SAMPLE POINT of BRS rather than at its edge,
+// a CRC over the bits as transmitted from a register that starts at one,
+// fixed stuff bits in the CRC field, and a stuff count in front of it.
+//
+// `sp` is where the sample point sits. It is a knob because the wire does not
+// carry it and the decoder has to work without knowing - so the tests run it
+// at both ends of the range a real controller is configured over.
+typedef struct
+{
+  uint8_t *buf;
+  int      size;
+  double   t;           // exact position of the next bit boundary, in samples
+  double   arb;         // arbitration bit time, in samples
+  double   data;        // data phase bit time, in samples
+  double   sp;          // sample point, as a fraction of a bit
+  int      inv;         // the CAN_H view, where dominant is the HIGH level
+  uint32_t c17, c21;
+  uint32_t crc_xor;     // corrupt the transmitted CRC, for the refusal tests
+  int      last, same;  // dynamic stuffing state
+  int      last_raw;    // the last bit that went out, for the fixed stuff bits
+  int      stuffs;      // dynamic stuff bits since the SOF
+  int      crc_on;
+  int      fast;        // the data phase is running
+  // The 2012 Bosch release: no stuff count, and a CRC register from zero.
+  // A decade obsolete, and the decoder says so rather than reading it wrong.
+  int      noniso;
+} FdGen;
+
+// The two CAN FD polynomials, written out of their exponents rather than
+// copied as a constant: x17+x16+x14+x13+x11+x6+x4+x+1 and
+// x21+x20+x13+x11+x7+x4+x3+1. See the check-value test, which is what says
+// these are the right numbers and not merely the same numbers twice.
+#define FD_CRC17_POLY  ((1u<<16)|(1u<<14)|(1u<<13)|(1u<<11)|(1u<<6)|(1u<<4)| \
+                        (1u<<3)|(1u<<1)|1u)
+#define FD_CRC21_POLY  ((1u<<20)|(1u<<13)|(1u<<11)|(1u<<7)|(1u<<4)|(1u<<3)|1u)
+
+static void fd_g_crc(FdGen *g, int bit)
+{
+  uint32_t inv;
+
+  inv = ((g->c17 >> 16) & 1u) ^ (uint32_t)(bit & 1);
+  g->c17 = ((g->c17 << 1) & 0x1FFFFu) ^ (inv ? FD_CRC17_POLY : 0u);
+
+  inv = ((g->c21 >> 20) & 1u) ^ (uint32_t)(bit & 1);
+  g->c21 = ((g->c21 << 1) & 0x1FFFFFu) ^ (inv ? FD_CRC21_POLY : 0u);
+}
+
+// One bit of any width, painted where it actually falls rather than on a
+// grid: the BRS bit and the CRC delimiter are neither one bit time nor the
+// other, so there is no grid to be on
+static void fd_g_paint(FdGen *g, int bit, double w)
+{
+  int level = g->inv ? !bit : bit;
+  int a = (int)(g->t + 0.5);
+  int b = (int)(g->t + w + 0.5);
+
+  for (int i = a; i < b; i++)
+  {
+    if (i >= 0 && i < g->size)
+      g->buf[i] = level ? 200 : 56;
+  }
+
+  g->t += w;
+  g->last_raw = bit;
+
+  if (g->crc_on)
+    fd_g_crc(g, bit);
+}
+
+static void fd_g_raw(FdGen *g, int bit)
+{
+  fd_g_paint(g, bit, g->fast ? g->data : g->arb);
+}
+
+// One frame bit, dynamically stuffed - and the stuff bit counted, because the
+// stuff count field at the end of the frame is that number
+static void fd_g_bit(FdGen *g, int bit)
+{
+  if (g->same >= 5)
+  {
+    fd_g_raw(g, !g->last);
+    g->last = !g->last;
+    g->same = 1;
+    g->stuffs++;
+  }
+
+  fd_g_raw(g, bit);
+
+  if (bit == g->last) g->same++;
+  else { g->last = bit; g->same = 1; }
+}
+
+static void fd_g_field(FdGen *g, uint32_t v, int bits)
+{
+  for (int i = bits - 1; i >= 0; i--)
+    fd_g_bit(g, (int)((v >> i) & 1));
+}
+
+// A fixed stuff bit: the inverse of the bit before it, in the CRC but not of
+// it, and not counted
+static void fd_g_fixed(FdGen *g)
+{
+  int on = g->crc_on;
+
+  g->crc_on = 0;
+  fd_g_raw(g, !g->last_raw);
+  g->crc_on = on;
+}
+
+static void fd_g_idle(FdGen *g, int bits)
+{
+  for (int i = 0; i < bits; i++)
+    fd_g_raw(g, 1);
+
+  g->last = 1;
+  g->same = 0;
+}
+
+static const uint8_t g_fd_len[16] =
+    { 0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64 };
+
+// The stuff count: three bits of gray code and a parity bit under them
+static int fd_g_sc(int stuffs)
+{
+  int v = stuffs & 7;
+  int gray = v ^ (v >> 1);
+
+  return (gray << 1) | (((gray >> 2) ^ (gray >> 1) ^ gray) & 1);
+}
+
+static void fd_g_frame(FdGen *g, uint32_t id, int ext, int brs, int esi,
+    const uint8_t *data, int dlc, int ack)
+{
+  int len = g_fd_len[dlc & 15];
+  int nbits, i;
+  uint32_t crc;
+
+  g->c17 = g->noniso ? 0u : (1u << 16);
+  g->c21 = g->noniso ? 0u : (1u << 20);
+  g->last = 1;
+  g->same = 0;
+  g->stuffs = 0;
+  g->crc_on = 1;
+  g->fast = 0;
+
+  fd_g_bit(g, 0);                        // SOF
+
+  if (ext)
+  {
+    fd_g_field(g, id >> 18, 11);         // base id
+    fd_g_bit(g, 1);                      // SRR
+    fd_g_bit(g, 1);                      // IDE
+    fd_g_field(g, id & 0x3FFFF, 18);     // extended id
+    fd_g_bit(g, 0);                      // RRS - dominant, FD has no remotes
+    fd_g_bit(g, 1);                      // FDF
+  }
+  else
+  {
+    fd_g_field(g, id, 11);
+    fd_g_bit(g, 0);                      // RRS
+    fd_g_bit(g, 0);                      // IDE
+    fd_g_bit(g, 1);                      // FDF
+  }
+
+  fd_g_bit(g, 0);                        // res
+
+  if (brs)
+  {
+    // The bit rate switches at the SAMPLE POINT of this bit, so it is
+    // arbitration-timed up to there and data-timed after
+    fd_g_paint(g, 1, g->sp * g->arb + (1.0 - g->sp) * g->data);
+    g->last = 1;
+    g->same = 1;
+    g->fast = 1;
+  }
+  else
+  {
+    fd_g_bit(g, 0);
+  }
+
+  fd_g_bit(g, esi ? 1 : 0);
+  fd_g_field(g, (uint32_t)dlc, 4);
+
+  for (i = 0; i < len; i++)
+    fd_g_field(g, data[i], 8);
+
+  // The CRC field: one fixed stuff bit, the stuff count (which the CRC still
+  // covers), then the CRC itself with a fixed stuff bit every four bits. A
+  // non-ISO frame has no stuff count, so the one fixed bit in front of the
+  // CRC sequence is the one the loop below puts there.
+  if (!g->noniso)
+  {
+    int sc = fd_g_sc(g->stuffs);
+
+    fd_g_fixed(g);
+
+    for (i = 3; i >= 0; i--)
+      fd_g_raw(g, (sc >> i) & 1);
+  }
+
+  nbits = (len <= 16) ? 17 : 21;
+  crc = ((nbits == 17) ? g->c17 : g->c21) ^ g->crc_xor;
+  crc &= (nbits == 17) ? 0x1FFFFu : 0x1FFFFFu;
+  g->crc_on = 0;
+
+  for (i = 0; i < nbits; i++)
+  {
+    if (0 == (i % 4))
+      fd_g_fixed(g);
+
+    fd_g_raw(g, (int)((crc >> (nbits - 1 - i)) & 1));
+  }
+
+  // ...and the rate switches back at the sample point of the delimiter
+  fd_g_paint(g, 1, g->sp * (g->fast ? g->data : g->arb) +
+      (1.0 - g->sp) * g->arb);
+  g->fast = 0;
+
+  fd_g_raw(g, ack ? 0 : 1);              // ACK slot
+  fd_g_raw(g, 1);                        // ACK delimiter
+  fd_g_idle(g, 7 + 3);                   // EOF + interframe space
+}
+
 // DHT11 / DHT22 onto a wire at 1 us per sample: the host's start pulse, the
 // sensor's 80/80 answer, then forty bit slots whose HIGH carries the value
 typedef struct { uint8_t *buf; int size; int pos; } DhtGen;
@@ -2779,26 +3004,395 @@ int main(void)
       check_near("refused", can_decode(buf, SIZE, 0, 500, &scratch, &lr), 0, 0);
     }
 
-    // CAN FD says so in the bit classic CAN keeps dominant. Reading its data
-    // phase needs a second bit rate and a different CRC, so it is recognised
-    // and declined rather than half-decoded.
-    printf("can fd:\n");
+    // The two CAN FD polynomials against the check values in the catalogue of
+    // parametrised CRC algorithms: the CRC of the nine ASCII digits, register
+    // from zero. This is the one test here whose expected numbers come from
+    // outside this repository, and it is the reason the rest of the CAN FD
+    // tests mean anything - a generator and a decoder that share a typo in a
+    // polynomial agree with each other perfectly.
+    printf("can fd: the polynomials themselves:\n");
     {
-      CanGen g = { .buf = buf, .size = SIZE, .bit_samples = 4.0 };
+      FdGen g = { .buf = buf, .size = SIZE, .arb = 4.0, .data = 4.0,
+          .sp = 0.8, .crc_on = 1 };
+      const char *s = "123456789";
+
+      g.c17 = 0;
+      g.c21 = 0;
+
+      for (const char *p = s; *p; p++)
+      {
+        for (int i = 7; i >= 0; i--)
+          fd_g_crc(&g, (*p >> i) & 1);
+      }
+
+      check_near("crc-17/can-fd check value", g.c17, 0x04F03, 0);
+      check_near("crc-21/can-fd check value", g.c21, 0x0ED841, 0);
+    }
+
+    // ----- CAN FD: 500 kbit/s arbitration, 2 Mbit/s data -------------------
+    // 100 ns a sample is 20 samples to an arbitration bit and 5 to a data
+    // one. The record has to hold both, which is what makes CAN FD a harder
+    // record than CAN: the fast phase is where the resolution goes.
+    printf("can fd 500k/2M:\n");
+    {
+      uint8_t data[12] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+          0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC };
+      FdGen g = { .buf = buf, .size = SIZE, .arb = 20.0, .data = 5.0,
+          .sp = 0.8 };
 
       memset(buf, 200, SIZE);
-      can_g_idle(&g, 20);
-      g.crc = 0; g.last = 1; g.same = 0;
-      can_g_bit(&g, 0, 1);                 // SOF
-      can_g_field(&g, 0x123, 11, 1);       // id
-      can_g_bit(&g, 0, 1);                 // RRS
-      can_g_bit(&g, 0, 1);                 // IDE
-      can_g_bit(&g, 1, 1);                 // FDF - recessive
-      can_g_field(&g, 0x5555, 16, 1);      // whatever the data phase looks like
-      can_g_idle(&g, 15);
+      g.t = 0;
+      fd_g_idle(&g, 20);
+      fd_g_frame(&g, 0x123, 0, 1, 0, data, 9, 1);   // code 9 is twelve bytes
+      fd_g_idle(&g, 20);
 
-      check_near("not decoded", can_decode(buf, SIZE, 0, 500, &scratch, &lr),
-          0, 0);
+      int n = logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      const CanAnalysis *a = can_analysis();
+
+      check_near("proto can", lr.proto, PROTO_CAN, 0);
+      check_near("arbitration rate", lr.rate, 500000, 0);
+      check_near("data rate", a->data_rate, 2000000, 0);
+      check_near("frames", a->frames, 1, 0);
+      check_near("and it is an FD one", a->frame[0].fd, 1, 0);
+      check_near("crc checked out", a->frame[0].crc_ok, 1, 0);
+      check_near("id 123", a->frame[0].id, 0x123, 0);
+      check_near("bit rate switched", a->frame[0].brs, 1, 0);
+      check_near("error active", a->frame[0].esi, 0, 0);
+      check_near("acknowledged", a->frame[0].ack, 1, 0);
+      // The code is 9 and the length is twelve: on an FD frame the code is a
+      // table index and not a count
+      check_near("length code", a->frame[0].dlc, 9, 0);
+      check_near("twelve bytes", a->frame[0].len, 12, 0);
+      // two identifier bytes, the length code, twelve data, three of CRC
+      check_near("bytes", n, 18, 0);
+      check_near("id high", lr.bytes[0], 0x01, 0);
+      check_near("id low", lr.bytes[1], 0x23, 0);
+      check_near("dlc byte is the code", lr.bytes[2], 9, 0);
+      check_near("data[0]", lr.bytes[3], 0x11, 0);
+      check_near("data[11]", lr.bytes[14], 0xCC, 0);
+      check_near("header", !strcmp(lr.info, "CAN FD 500k/2M 123 12B"), 1, 0);
+
+      char lab[16];
+      can_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("label FD12", !strcmp(lab, "FD12"), 1, 0);
+      can_byte_label(a, 3, lr.bytes[3], lab, sizeof(lab));
+      check_near("label D0", !strcmp(lab, "D0"), 1, 0);
+      can_byte_label(a, 14, lr.bytes[14], lab, sizeof(lab));
+      check_near("label D11", !strcmp(lab, "D11"), 1, 0);
+      can_byte_label(a, 15, lr.bytes[15], lab, sizeof(lab));
+      check_near("label CRC", !strcmp(lab, "CRC"), 1, 0);
+      can_byte_label(a, 17, lr.bytes[17], lab, sizeof(lab));
+      check_near("label ACK", !strcmp(lab, "ACK"), 1, 0);
+    }
+
+    // Nothing on the wire says where the sample point is, and the bit rate
+    // switches AT it - so the BRS bit is a length the decoder cannot compute.
+    // Both ends of the range a controller is configured over have to decode,
+    // and so does the ratio that makes the error worst: at 500k/8M one
+    // arbitration bit is sixteen data bits, and 5% of sample point is most of
+    // a data bit.
+    printf("can fd: the sample point it cannot see:\n");
+    {
+      uint8_t data[8] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04 };
+      double sp[3] = { 0.70, 0.80, 0.90 };
+      int bad = 0, bad8 = 0;
+
+      for (int i = 0; i < 3; i++)
+      {
+        FdGen g = { .buf = buf, .size = SIZE, .arb = 20.0, .data = 5.0,
+            .sp = sp[i] };
+
+        memset(buf, 200, SIZE);
+        g.t = 0;
+        fd_g_idle(&g, 20);
+        fd_g_frame(&g, 0x0A5, 0, 1, 0, data, 8, 1);
+        fd_g_idle(&g, 20);
+
+        can_decode(buf, SIZE, 0, 100, &scratch, &lr);
+
+        if (!can_analysis()->frames || !can_analysis()->frame[0].crc_ok)
+          bad++;
+
+        // ...and the same frame at a sixteen-to-one ratio, 8 samples to a
+        // data bit at 40 ns
+        FdGen h = { .buf = buf, .size = SIZE, .arb = 128.0, .data = 8.0,
+            .sp = sp[i] };
+
+        memset(buf, 200, SIZE);
+        h.t = 0;
+        fd_g_idle(&h, 20);
+        fd_g_frame(&h, 0x0A5, 0, 1, 0, data, 8, 1);
+        fd_g_idle(&h, 20);
+
+        can_decode(buf, SIZE, 0, 40, &scratch, &lr);
+
+        if (!can_analysis()->frames || !can_analysis()->frame[0].crc_ok)
+          bad8++;
+      }
+
+      check_near("500k/2M decodes at every sample point", bad, 0, 0);
+      check_near("500k/8M too", bad8, 0, 0);
+    }
+
+    // Sixty-four bytes is the headline of CAN FD and the one frame that does
+    // not fit anywhere: 5.5 kbit on the wire, 21 bits of CRC rather than 17,
+    // and seventy-two decoded bytes out the other end
+    printf("can fd, 64 bytes:\n");
+    {
+      uint8_t data[64];
+      FdGen g = { .buf = buf, .size = SIZE, .arb = 16.0, .data = 4.0,
+          .sp = 0.8 };
+
+      for (int i = 0; i < 64; i++)
+        data[i] = (uint8_t)(i * 7 + 1);
+
+      memset(buf, 200, SIZE);
+      g.t = 0;
+      fd_g_idle(&g, 20);
+      fd_g_frame(&g, 0x18DAF110, 1, 1, 0, data, 15, 1);
+      fd_g_idle(&g, 20);
+
+      int n = logic_decode(buf, SIZE, 0, 125, PROTO_AUTO, &scratch, &lr);
+      const CanAnalysis *a = can_analysis();
+
+      check_near("proto can", lr.proto, PROTO_CAN, 0);
+      check_near("29-bit id", a->frame[0].id, 0x18DAF110, 0);
+      check_near("marked extended", a->frame[0].ext, 1, 0);
+      check_near("sixty-four bytes", a->frame[0].len, 64, 0);
+      check_near("crc-21 checked out", a->frame[0].crc_ok, 1, 0);
+      // four identifier bytes, the length code, sixty-four data, three of CRC
+      check_near("bytes", n, 72, 0);
+      check_near("data[0]", lr.bytes[5], 1, 0);
+      check_near("data[63]", lr.bytes[68], (uint8_t)(63 * 7 + 1), 0);
+      check_near("header", !strcmp(lr.info, "CAN FD 500k/2M 18DAF110 64B"),
+          1, 0);
+    }
+
+    // An FD frame is allowed not to switch: BRS dominant means the data phase
+    // runs at the arbitration rate. Everything else about it is still FD -
+    // the length table, the stuff count, the 17-bit CRC - so a decoder that
+    // only knew the switch would miss it entirely.
+    printf("can fd without the switch:\n");
+    {
+      uint8_t data[16];
+      FdGen g = { .buf = buf, .size = SIZE, .arb = 4.0, .data = 4.0,
+          .sp = 0.8 };
+
+      for (int i = 0; i < 16; i++)
+        data[i] = (uint8_t)(0xF0 + i);
+
+      memset(buf, 200, SIZE);
+      g.t = 0;
+      fd_g_idle(&g, 20);
+      fd_g_frame(&g, 0x201, 0, 0, 0, data, 10, 1);   // code 10 is sixteen
+      fd_g_idle(&g, 20);
+
+      logic_decode(buf, SIZE, 0, 500, PROTO_AUTO, &scratch, &lr);
+      const CanAnalysis *a = can_analysis();
+
+      check_near("still FD", a->frame[0].fd, 1, 0);
+      check_near("no switch", a->frame[0].brs, 0, 0);
+      check_near("sixteen bytes", a->frame[0].len, 16, 0);
+      check_near("crc checked out", a->frame[0].crc_ok, 1, 0);
+      // One rate, so one rate is what the header says
+      check_near("header", !strcmp(lr.info, "CAN FD 500k 201 16B"), 1, 0);
+    }
+
+    // Error passive, and nobody listening. Both are things a scope is bought
+    // to find, and neither shows up in the data.
+    printf("can fd from a failing node:\n");
+    {
+      uint8_t data[4] = { 0x5A, 0xA5, 0x5A, 0xA5 };
+      FdGen g = { .buf = buf, .size = SIZE, .arb = 20.0, .data = 5.0,
+          .sp = 0.8 };
+
+      memset(buf, 200, SIZE);
+      g.t = 0;
+      fd_g_idle(&g, 20);
+      fd_g_frame(&g, 0x100, 0, 1, 1, data, 4, 0);
+      fd_g_idle(&g, 20);
+
+      logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      const CanAnalysis *a = can_analysis();
+
+      check_near("crc still checks out", a->frame[0].crc_ok, 1, 0);
+      check_near("error passive", a->frame[0].esi, 1, 0);
+      check_near("not acknowledged", a->frame[0].ack, 0, 0);
+      check_near("header says both",
+          !strcmp(lr.info, "CAN FD 500k/2M 100 4B NAK EP"), 1, 0);
+    }
+
+    // On CAN_H the dominant level is the high one. Same frame, upside down.
+    printf("can fd on CAN_H:\n");
+    {
+      uint8_t data[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+      FdGen g = { .buf = buf, .size = SIZE, .arb = 20.0, .data = 5.0,
+          .sp = 0.8, .inv = 1 };
+
+      memset(buf, 56, SIZE);
+      g.t = 0;
+      fd_g_idle(&g, 20);
+      fd_g_frame(&g, 0x7FF, 0, 1, 0, data, 8, 1);
+      fd_g_idle(&g, 20);
+
+      logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      const CanAnalysis *a = can_analysis();
+
+      check_near("id 7FF", a->frame[0].id, 0x7FF, 0);
+      check_near("crc checked out", a->frame[0].crc_ok, 1, 0);
+      check_near("data", lr.bytes[3] == 1 && lr.bytes[10] == 8, 1, 0);
+    }
+
+    // A bus that carries both, which is what a CAN FD bus actually looks
+    // like: the classic frames fix the arbitration rate and the FD ones bring
+    // the second. Getting this wrong means whichever kind came first wins the
+    // record and the other kind is invisible.
+    printf("can classic and fd on one bus:\n");
+    {
+      uint8_t d1[2] = { 0xC0, 0xDE };
+      uint8_t d2[8] = { 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80 };
+      CanGen c = { .buf = buf, .size = SIZE, .bit_samples = 20.0 };
+      FdGen g = { .buf = buf, .size = SIZE, .arb = 20.0, .data = 5.0,
+          .sp = 0.8 };
+
+      memset(buf, 200, SIZE);
+      can_g_idle(&c, 20);
+      can_g_frame(&c, 0x0FF, 0, 0, d1, 2, 1);
+
+      g.t = c.pos;
+      fd_g_idle(&g, 5);
+      fd_g_frame(&g, 0x1AB, 0, 1, 0, d2, 8, 1);
+      fd_g_idle(&g, 20);
+
+      logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      const CanAnalysis *a = can_analysis();
+
+      check_near("both frames", a->frames, 2, 0);
+      check_near("both check out", a->crc_ok, 2, 0);
+      check_near("one of them FD", a->fd, 1, 0);
+      check_near("the classic one first", a->frame[0].fd, 0, 0);
+      check_near("classic id", a->frame[0].id, 0x0FF, 0);
+      check_near("fd id", a->frame[1].id, 0x1AB, 0);
+      check_near("fd flag", a->frame[1].fd, 1, 0);
+      check_near("header", !strcmp(lr.info, "CAN FD 500k/2M 2 frames"), 1, 0);
+    }
+
+    // Every length code, both frame formats, switched and not, over a payload
+    // chosen to force stuff bits (0x00 and 0xFF runs) and one that forces
+    // almost none. This is the sweep that covers what the single cases cannot:
+    // the 17-to-21-bit CRC boundary at sixteen bytes, a stuff count that wraps
+    // its three bits, and the retry over data-rate candidates - a candidate
+    // that guesses wrong reads a bogus length code, and whatever it leaves
+    // behind must not follow the candidate that guesses right.
+    printf("can fd: every length code:\n");
+    {
+      uint8_t data[64];
+      int bad = 0, cases = 0;
+
+      for (int i = 0; i < 64; i++)
+        data[i] = (uint8_t)((i / 4) % 3 == 0 ? 0x00 :
+            (i / 4) % 3 == 1 ? 0xFF : (i * 37 + 5));
+
+      for (int dlc = 0; dlc <= 15; dlc++)
+      {
+        for (int ext = 0; ext < 2; ext++)
+        {
+          for (int brs = 0; brs < 2; brs++)
+          {
+            FdGen g = { .buf = buf, .size = SIZE, .arb = 16.0,
+                .data = brs ? 4.0 : 16.0, .sp = 0.8 };
+
+            memset(buf, 200, SIZE);
+            g.t = 0;
+            fd_g_idle(&g, 20);
+            fd_g_frame(&g, ext ? 0x1BCDEF01 : 0x2AB, ext, brs, 0, data, dlc,
+                1);
+            fd_g_idle(&g, 20);
+
+            can_decode(buf, SIZE, 0, 125, &scratch, &lr);
+
+            const CanAnalysis *a = can_analysis();
+
+            cases++;
+
+            if (1 != a->frames || !a->frame[0].crc_ok ||
+                a->frame[0].len != g_fd_len[dlc] ||
+                a->frame[0].ext != (ext != 0) ||
+                a->frame[0].brs != (brs != 0) ||
+                a->frame[0].id != (uint32_t)(ext ? 0x1BCDEF01 : 0x2AB))
+              bad++;
+          }
+        }
+      }
+
+      check_near("all sixty-four cases", cases, 64, 0);
+      check_near("none of them wrong", bad, 0, 0);
+    }
+
+    // And the refusals. A CRC that does not agree is not proof of anything,
+    // and proof is the whole reason this decoder runs ahead of the others.
+    printf("can fd refused:\n");
+    {
+      uint8_t data[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+      FdGen g = { .buf = buf, .size = SIZE, .arb = 20.0, .data = 5.0,
+          .sp = 0.8, .crc_xor = 0x40 };
+
+      memset(buf, 200, SIZE);
+      g.t = 0;
+      fd_g_idle(&g, 20);
+      fd_g_frame(&g, 0x123, 0, 1, 0, data, 8, 1);
+      fd_g_idle(&g, 20);
+
+      check_near("bad crc refused",
+          can_decode(buf, SIZE, 0, 100, &scratch, &lr), 0, 0);
+
+      // Non-ISO CAN FD - the 2012 release, no stuff count and a CRC register
+      // from zero. Every bit of it is a legal-looking FD frame right up to
+      // the CRC field, and it is refused there rather than half-read.
+      FdGen h = { .buf = buf, .size = SIZE, .arb = 20.0, .data = 5.0,
+          .sp = 0.8, .noniso = 1 };
+
+      memset(buf, 200, SIZE);
+      h.t = 0;
+      fd_g_idle(&h, 20);
+      fd_g_frame(&h, 0x123, 0, 1, 0, data, 8, 1);
+      fd_g_idle(&h, 20);
+
+      check_near("non-iso refused",
+          can_decode(buf, SIZE, 0, 100, &scratch, &lr), 0, 0);
+    }
+
+    // A record with nothing provable in it is refused whole, and there is no
+    // channel for "I saw something" - proof is the only thing this decoder
+    // says out loud. Where the flag DOES reach anybody is a record that holds
+    // both: one FD frame read, and another the decoder had to give up on. The
+    // rate is settled by the first, so the second is known to be a frame and
+    // known not to be readable, which is worth saying.
+    printf("can fd: one read, one given up on:\n");
+    {
+      uint8_t data[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+      FdGen g = { .buf = buf, .size = SIZE, .arb = 20.0, .data = 5.0,
+          .sp = 0.8 };
+      FdGen h;
+
+      memset(buf, 200, SIZE);
+      g.t = 0;
+      fd_g_idle(&g, 20);
+      fd_g_frame(&g, 0x111, 0, 1, 0, data, 8, 1);
+
+      h = g;
+      h.noniso = 1;
+      fd_g_idle(&h, 10);
+      fd_g_frame(&h, 0x222, 0, 1, 0, data, 8, 1);
+      fd_g_idle(&h, 20);
+
+      logic_decode(buf, SIZE, 0, 100, PROTO_AUTO, &scratch, &lr);
+      const CanAnalysis *a = can_analysis();
+
+      check_near("the readable one is read", a->frames, 1, 0);
+      check_near("and it checks out", a->crc_ok, 1, 0);
+      check_near("id 111", a->frame[0].id, 0x111, 0);
+      check_near("the other one is reported as unread", a->fd_seen, 1, 0);
     }
 
     // And the other direction: everything else on this bench must not come
