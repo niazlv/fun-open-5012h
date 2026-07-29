@@ -45,7 +45,7 @@ HOST_SRCS = \
   $(ROOT)/src/dsp/trend.c \
   $(wildcard $(ROOT)/src/decode/*.c) \
 
-.PHONY: all test host coredump snake flappy g2048 tetris bk doomhost doomcache clean
+.PHONY: all test host coredump snake flappy g2048 tetris bk bkhost doomhost doomcache clean
 
 all: test
 
@@ -137,6 +137,14 @@ bk: $(BUILD)/bk_cpu_test
 $(BUILD)/bk_cpu_test: $(BK_SRCS) $(wildcard $(ROOT)/src/bk/*.h) | $(BUILD)
 	@echo CC $@
 	@$(CC) $(CFLAGS) -DBK_LOAD_SPIFS=0 -I$(ROOT)/src/bk $(BK_SRCS) $(LIBS) -o $@
+
+# Runs a real BK tape image. Not part of `test`: it needs one, and those are
+# somebody's software.
+bkhost: $(BUILD)/bk_host
+$(BUILD)/bk_host: bk_host.c $(filter-out bk_cpu_test.c,$(BK_SRCS)) | $(BUILD)
+	@echo CC $@
+	@$(CC) $(CFLAGS) -DBK_LOAD_SPIFS=0 -I$(ROOT)/src/bk \
+	    bk_host.c $(filter-out bk_cpu_test.c,$(BK_SRCS)) $(LIBS) -o $@
 
 # Renders one DOOM frame to a .ppm. Not part of `test`: it needs the asset
 # pack, which is built from a real IWAD and is not in the repository.
