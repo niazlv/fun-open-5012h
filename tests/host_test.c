@@ -3181,6 +3181,58 @@ int main(void)
       check_near("field B1", strcmp(lab, "B1"), 0, 0);
     }
 
+    // ----- a 3 Mbaud console is not a strip, and the rest level says so -----
+    // The block above and this one are the same pulse widths read two ways.
+    // A strip's marks are 400 and 800 ns inside a 1250 ns cell; a 3 Mbaud
+    // UART's runs are 333, 666 and 1000 - two or three clusters in the same
+    // place, so the width histogram genuinely cannot tell them apart and no
+    // amount of care with it ever will.
+    //
+    // What tells them apart is where the line waits. A UART rests HIGH
+    // between messages and a strip rests LOW - its frame is latched by a long
+    // low and every high it sends is one bit's mark, bounded by the cell. So
+    // a mark that outlasts a cell is not a mark, and the strip decoder is
+    // gone before it has counted a single pulse.
+    printf("uart 3M is not ws2812:\n");
+    {
+      const char *msg = "FAST 3M BAUD\r\n";
+      const double bit_ns = 1000.0 / 3.0;  // 333.33 ns, no divider error
+      double t = 5000;                     // some idle in front of the message
+
+      memset(buf, 200, SIZE);              // ...and the line rests high
+
+      #define EMITBIT(level, ns) do { \
+        double e = t + (ns); \
+        for (; t < e; t += 20.0) { int p = (int)(t / 20.0); \
+          if (p < SIZE) buf[p] = (level) ? 200 : 56; } \
+      } while (0)
+
+      for (const char *c = msg; *c; c++)
+      {
+        EMITBIT(0, bit_ns);                        // start
+        for (int b = 0; b < 8; b++)
+          EMITBIT((*c >> b) & 1, bit_ns);          // data, LSB first
+        EMITBIT(1, bit_ns);                        // stop
+      }
+      #undef EMITBIT
+
+      int n = logic_decode(buf, SIZE, 0, 20, PROTO_AUTO, &scratch, &lr);
+
+      check_near("proto uart", lr.proto, PROTO_UART, 0);
+      check_near("bytes", n, 14, 0);
+      check_near("payload match",
+          n == 14 && !memcmp(lr.bytes, msg, 14), 1, 0);
+      check_near("3 Mbaud", lr.rate, 3000000, 1.0);
+      check_near("idle is high", lr.idle_high, 1, 0);
+
+      // Not "the strip decoder lost the argument" - it never entered one. A
+      // 5 ms mark is not a bit at any rate it reads, and that is one
+      // comparison per run, ahead of every histogram it would have built.
+      memset(&scratch, 0, sizeof(scratch));
+      check_near("uart is not ws2812",
+          ws2812_decode(buf, SIZE, 0, 20, &scratch, &lr), 0, 0);
+    }
+
     // ----- NEC: addr 0x04 cmd 0x08, 10 us sample period -----
     printf("nec:\n");
     {

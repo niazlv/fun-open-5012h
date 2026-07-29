@@ -139,6 +139,16 @@ int ws2812_decode(const uint8_t *data, int size, int offset, int period_ns,
 
     int w = scratch->len[r];
 
+    // The line rests LOW, and that is the cheapest thing that tells a strip
+    // from the protocols it shares a pulse-width histogram with. Every high
+    // here is one bit's mark and cannot outlast the cell that holds it, so a
+    // high longer than the widest cell this decoder accepts is not a mark at
+    // all - it is the line idle, which is a UART's rest level and never a
+    // strip's. Before any histogram, before the period, and it costs one
+    // comparison per run.
+    if ((int64_t)w * period_ns >= WS_PERIOD_MAX_NS)
+      return 0;
+
     if (0 == hmin || w < hmin)
       hmin = w;
 
@@ -178,6 +188,16 @@ int ws2812_decode(const uint8_t *data, int size, int offset, int period_ns,
     return 0;
 
   bitp /= bitp_n;
+
+  // The same rule again, now that the cell is known and the bound can be the
+  // real one rather than the widest this decoder allows. A mark is the FIRST
+  // part of a cell and the low that carries the value is the rest of it, so a
+  // high as long as a whole cell is a line at rest that happened to be short.
+  // This is the form that reads a window which never caught the idle at all -
+  // a slice out of the middle of a fast UART packet, where a run of set bits
+  // is a mark several bit times long and still well under 4 us.
+  if ((int64_t)hmax * period_ns >= bitp)
+    return 0;
 
   int thresh = (hmin + hmax) / 2; // samples
 
