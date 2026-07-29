@@ -19,3 +19,6 @@ doom/doom_assets.bin
 * [0-9]
 * [0-9].*
 *.icloud
+
+# Python bytecode from importing tools/ as a module
+__pycache__/
