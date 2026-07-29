@@ -29,6 +29,7 @@
 #include "doom_port.h"
 #include "debug_coredump.h"
 #include "flash_viewer.h"
+#include "spi_tool.h"
 
 /*- Types -------------------------------------------------------------------*/
 typedef struct
@@ -138,6 +139,11 @@ static const app_desc_t g_apps[] =
     flash_viewer_init, flash_viewer_task, flash_viewer_buttons_handler,
     flash_viewer_cleanup, flash_viewer_redraw, &flash_viewer_menu,
     &flash_viewer_help_menu, true },
+  // Deliberately last, and deliberately an application: the SPI part is only
+  // writable while this screen is open
+  { "SPI Flash Loader", "Take data from a PC onto the 8 MB chip",
+    spi_tool_init, spi_tool_task, spi_tool_buttons_handler,
+    spi_tool_cleanup, spi_tool_redraw, NULL, NULL, true },
 };
 
 static menu_item_t g_app_items[ARRAY_SIZE(g_apps)];

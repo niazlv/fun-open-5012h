@@ -138,6 +138,7 @@ SRCS += \
   ../src/apps/tetris.c \
   ../src/apps/snake_game.c \
   ../src/apps/snake_assets.c \
+  ../src/apps/spi_tool.c \
   ../src/apps/doom_port.c \
 
 # Size, not speed, for the 2D games and the toolkit they share.
