@@ -41,6 +41,42 @@
             ],
             "showDevDebugOutput": "raw",
             "gdbPath": "/opt/homebrew/bin/arm-none-eabi-gdb"
+        },
+        {
+            // For looking at a FREEZE. The launch config above resets the chip
+            // and runs to main, which destroys the evidence before you can see
+            // it - that is why a frozen device inspected with it always shows
+            // PC at main and every variable zero. This one attaches to the
+            // running target and halts it where it actually is: no reset, no
+            // runToEntryPoint, no preLaunch build.
+            //
+            // Freeze the device, start this, and read PC - resolve it with
+            // arm-none-eabi-addr2line -i -f -e make/build/open-5012h.elf <PC>,
+            // which names the inlined frame too. A PC inside main() is a clock
+            // wait in the inlined sys_init(); the unbounded spin left in
+            // capture.c is dma_stop()'s wait on CHEN. xPSR bits 8:0 give the
+            // active exception: 0x4a is the capture DMA handler.
+            "name": "Attach (OpenOCD, no reset)",
+            "cwd": "${workspaceRoot}",
+            "executable": "${workspaceRoot}/make/build/open-5012h.elf",
+            "request": "attach",
+            "type": "cortex-debug",
+            "servertype": "openocd",
+            "interface": "swd",
+            "device": "GD32F407VET",
+            "configFiles": [
+                "interface/cmsis-dap.cfg",
+                "target/stm32f4x.cfg"
+            ],
+            "openOCDLaunchCommands": [
+                "transport select swd",
+                "adapter speed 2000"
+            ],
+            "preAttachCommands": [
+                "set mem inaccessible-by-default off"
+            ],
+            "showDevDebugOutput": "raw",
+            "gdbPath": "/opt/homebrew/bin/arm-none-eabi-gdb"
         }
     ]
 }

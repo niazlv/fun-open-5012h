@@ -617,12 +617,55 @@ static inline int dma_get_count(void)
 }
 
 //-----------------------------------------------------------------------------
+// Wait until the DMA has delivered everything up to `count` remaining.
+//
+// CH2CNT only ever falls - but the channel runs in double-buffer mode
+// (SBMEN), so at the end of every buffer it RELOADS to the full transfer size.
+// The window this is waiting for, CH2CNT <= count, therefore opens and closes
+// once per buffer, and a plain `while (CH2CNT > count)` assumes the poll can
+// never step over it.
+//
+// It can. A read of CH2CNT is an AHB access costing tens of core cycles while
+// the converter advances the counter every 8 ns, so several transfers land
+// between two consecutive polls. When `count` is small the window is narrower
+// than that gap and the poll jumps from "above count" straight past zero to
+// the reloaded value - and then waits another buffer, and misses it again.
+// This runs INSIDE irq_handler_dma1_channel2, so missing it is not a glitch:
+// the core never leaves the handler and the whole device is dead, with the
+// clocks and the panel still up and no fault to show for it.
+//
+// How small `count` gets is decided by where the trigger landed, which is why
+// it presents as "froze the moment the trace reached the trigger" and why a
+// signal that never crosses the trigger level never does it.
+//
+// Seeing the counter go UP is exactly that miss: the point being waited for
+// has already gone by, so stop rather than wait for it to come round again.
+// The iteration cap is the backstop for the other way this could hang - the
+// DMA not advancing at all, because its request source stopped. The worst
+// legitimate wait is one buffer at the slowest timebase (32 transfers at
+// 524 us = ~17 ms); at ~20 cycles a poll and 250 MHz that is ~210k
+// iterations, so this sits an order of magnitude above it and still bounded.
+#define DMA_WAIT_MAX_POLLS  4000000u
+
 static inline void dma_wait_count(uint32_t count)
 {
+  uint32_t polls = DMA_WAIT_MAX_POLLS;
+  uint32_t prev;
+
   if (g_dual_channel)
     count /= 2;
 
-  while (DMA1->CH2CNT > count);
+  prev = DMA1->CH2CNT;
+
+  while (prev > count && polls--)
+  {
+    uint32_t now = DMA1->CH2CNT;
+
+    if (now > prev)
+      break;
+
+    prev = now;
+  }
 }
 
 //-----------------------------------------------------------------------------
