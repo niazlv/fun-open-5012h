@@ -110,6 +110,29 @@ _Static_assert(0x20000000u + CAPTURE_BUFFER_SIZE + STORAGE_BUFFER_SIZE == CAPTUR
 #define ADC_A_CLOCK_MODE       6
 #define ADC_B_CLOCK_MODE       7
 
+// Fine adjustment of where in the ADC's period the DMA is asked to read the
+// data bus, in 4 ns steps on top of the coarse position picked in
+// capture_set_horizontal_parameters, indexed by sr_divider. Zero is that
+// position exactly; anything past the end of the table takes zero.
+//
+// It exists because the coarse position can only name two places half a
+// period apart, and the better of the two is not the best there is: the bus
+// transition sits near one of them, but "near" is offset by the fixed
+// request-to-read delay, and this recovers that offset.
+//
+// It has to be per divider because that delay is NOT the same at every
+// request rate - which is what a single global +1 demonstrated. Measured with
+// the input shorted, NORMAL trigger parked at +300 mV so that only a sample
+// pinned to a rail can fire it, counted over 30 s:
+//
+//   sr 1   16 ns period, 4 positions    +0  clean      +1  needles, >10/s
+//   sr 2   32 ns period, 8 positions    +0  19-20/30s  +1  none at all
+//
+// To extend the table, run that same measurement: it turns "caught one now
+// and then" into a number, and the right position reads zero rather than
+// fewer. Single channel only - the interleaved timebases are never moved.
+static const signed char g_strobe_trim[] = { 0, 0, 1, 0 };
+
 
 /*- Types -------------------------------------------------------------------*/
 typedef struct
@@ -938,10 +961,34 @@ void capture_set_horizontal_parameters(int sr_divider, int trigger_offset)
   // one 16-bit snapshot and the pairing of the two converters depends on
   // where in the period that snapshot falls - it is what the 125 MS/s scan of
   // a 50-60 MHz input rides on, and one channel alone cannot reach it.
-  TIMER7->CH0CV = (sr_divider <= 1) ? 1 : 0;
+  // Two positions is what CAR = 1 can name, but the counter does not have to
+  // carry the period in two counts. Run it at the full 250 MHz with the
+  // period in CAR instead and the same one request per period can be placed
+  // to 4 ns, which is what finding the BEST position rather than the better
+  // of two takes (see STROBE_TRIM_TICKS). CAR is 16 bits, so this holds up to
+  // a 262 us period; past that the coarse pair is plenty anyway, since a long
+  // period is all margin.
+  if (!g_dual_channel && divider <= 32767)
+  {
+    int counts = 2 * (divider + 1);              // 4 ns ticks in one period
+    int pos    = (sr_divider <= 1) ? counts / 2 : 0;
+    int trim   = (sr_divider < (int)sizeof(g_strobe_trim)) ?
+        g_strobe_trim[sr_divider] : 0;
+
+    pos = ((pos + trim) % counts + counts) % counts;
+
+    TIMER7->PSC   = 0;
+    TIMER7->CAR   = counts - 1;
+    TIMER7->CH0CV = pos;
+  }
+  else
+  {
+    TIMER7->PSC   = divider;
+    TIMER7->CAR   = 1;
+    TIMER7->CH0CV = (sr_divider <= 1) ? 1 : 0;
+  }
 
   TIMER0->PSC = (divider > 63) ? 63 : divider;
-  TIMER7->PSC = divider;
 
   TIMER0->CNT = 0;
   TIMER7->CNT = 0;
