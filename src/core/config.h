@@ -354,6 +354,15 @@ const char *config_entry_state_name(ConfigEntryState state);
 // Which slot config was loaded from / is being written to, -1 if neither
 int config_store_live_index(void);
 
+// Where the store physically is, for anything that has to point at it rather
+// than read it - the flash viewer's "jump to the store" actions, mainly.
+// `external` distinguishes an address inside the SPI part (where a pointer is
+// meaningless and only the viewer's SPI source can reach it) from one in the
+// MCU's own flash. `base` is the address of entry 0 in whichever it is.
+uint32_t config_store_base(void);
+uint32_t config_store_entry_size(void);
+bool config_store_is_external(void);
+
 // Whether an entry's calibration block seals, independently of the entry
 bool config_store_entry_calib_ok(int index);
 

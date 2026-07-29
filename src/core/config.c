@@ -38,6 +38,7 @@
 #include "utils.h"
 #include "common.h"
 #include "config.h"
+#include "flash.h"
 #include "debug_coredump.h"
 
 /*- Definitions -------------------------------------------------------------*/
@@ -45,27 +46,76 @@
 #define VERSION            1
 
 /*
- * Storage lives in the last 128 KB sector, and the firmware owns everything
- * below it. It used to take the last 256 KB - sectors 6 and 7 - which was free
- * when the firmware was 154 KB, but the DOOM asset pack pushed the image to
- * 372 KB and its tail landed inside sector 6. Nothing failed at build time: the
- * firmware ran, and then config_init erased the sector out from under the pack.
- * The linker script now caps the flash region at 384 KB so an overlap is a
- * build error rather than something the device discovers at runtime.
+ * Where the store lives. Two backends, picked at build time:
  *
- * The cost of a single sector is that rotating past the end has to erase the
- * only copy, so losing power inside that window (once every ENTRIES_COUNT
- * saves) falls back to defaults on the next boot.
+ *   make                        settings on the 8 MB SPI part (default)
+ *   make CONFIG_STORE=internal  settings in the MCU's last 128 KB sector
+ *
+ * The SPI part won because of what the internal sector costs. It is 128 KB of
+ * the 384 the firmware may use - a third of the image budget spent on 416
+ * bytes of settings - and it can only be erased whole, which stalls code fetch
+ * for one to two seconds. That stall is the "watchdog white screen" this
+ * firmware spent a day chasing. On the serial part the same rotation erases
+ * 4 KB at a time in about 45 ms, and the freed sector takes the flash region
+ * from 384 KB back to the whole 512.
+ *
+ * What it costs instead: the settings, and with them this unit's CALIBRATION,
+ * now live on a separate chip. If that chip is absent - a board revision with
+ * a different part, a bad joint - the scope boots on default calibration and
+ * every voltage it reports is approximate. Two things stand against that: the
+ * store falls back to reading the internal sector when the SPI part does not
+ * answer, and the Calibration page still prints the numbers for copying onto
+ * paper. Off the device, `tools/spiflash.py dump 0x7E0000 65536 cal.bin`.
+ *
+ * The internal layout is kept even in the SPI build, because that is where a
+ * migration reads from: the first boot after the switch copies the live entry
+ * across by itself.
  */
+#ifdef CONFIG_STORE_INTERNAL
+#define STORE_INTERNAL     1
+#else
+#define STORE_INTERNAL     0
+#endif
+
 #define FLASH_START        0x08000000
-#define ENTRY_SIZE         (1024)
-#define STORAGE_SIZE       (128*1024)
-#define STORAGE_OFFSET     (384*1024)
-#define STORAGE_START      (FLASH_START + STORAGE_OFFSET)
-#define ENTRIES_COUNT      (STORAGE_SIZE / ENTRY_SIZE)
+#define INT_ENTRY_SIZE     (1024)
+#define INT_STORAGE_SIZE   (128*1024)
+#define INT_STORAGE_OFFSET (384*1024)
+#define INT_STORAGE_START  (FLASH_START + INT_STORAGE_OFFSET)
+#define INT_ENTRIES_COUNT  (INT_STORAGE_SIZE / INT_ENTRY_SIZE)
 
 #define SECTOR_0_INDEX     (7)
 #define SECTOR_0_OFFSET    (0)
+
+#if STORE_INTERNAL
+
+#define ENTRY_SIZE         INT_ENTRY_SIZE
+#define STORAGE_SIZE       INT_STORAGE_SIZE
+#define STORAGE_START      INT_STORAGE_START
+#define ENTRIES_COUNT      INT_ENTRIES_COUNT
+
+#else
+
+/*
+ * On the serial part: 128 slots of 512 bytes in the 64 KB at FLASH_STORE_BASE,
+ * eight to an erase sector. The same rotation count as the internal store, at
+ * an eighth of the entry size - sizeof(Config) is 416, and the internal 1 KB
+ * slot was chosen against a 128 KB erase unit that no longer applies.
+ *
+ * Address 0x7E0000 is above everything an asset image may touch and below the
+ * page that was already on the chip. Both the loader application and its host
+ * tool refuse to write here without an explicit override, which is what keeps
+ * a mispacked image off the calibration.
+ */
+#define ENTRY_SIZE         (512)
+#define STORAGE_SIZE       FLASH_STORE_SIZE
+#define STORAGE_START      FLASH_STORE_BASE
+#define ENTRIES_COUNT      (STORAGE_SIZE / ENTRY_SIZE)
+
+_Static_assert(ENTRY_SIZE >= sizeof(Config), "entry slot smaller than Config");
+_Static_assert(0 == FLASH_SECTOR_SIZE % ENTRY_SIZE, "slots must tile a sector");
+
+#endif
 
 /*
  * How much of an entry the CRC covers. This is offsetof(crc), and it is NOT
@@ -280,6 +330,9 @@ static bool g_have_copy = false;
 
 static ConfigCalibSource g_calib_source = CONFIG_CALIB_DEFAULTS;
 
+// Set once, on the boot that copied the store off the internal sector
+static bool g_migrated = false;
+
 /*
  * Fields whose newest value is not worth a flash write of its own, see
  * LAZY_INTERVAL. Two rules decide membership:
@@ -374,13 +427,64 @@ static bool important_changed(void)
 }
 
 //-----------------------------------------------------------------------------
-static inline Config *get_entry(int index)
+// An entry, wherever the store is.
+//
+// Internal flash is memory mapped, so this is a cast and every caller may hold
+// the pointer for as long as it likes. The serial part is not: an entry has to
+// be fetched over the bus into a buffer, and the pointer handed back is that
+// buffer. One entry deep is enough - nothing here compares two at once, they
+// are all "look at entry i, decide, move on" - but it is a real constraint on
+// anything written later, so it is worth stating: the pointer is valid until
+// the next call.
+#if STORE_INTERNAL
+
+static inline const Config *get_entry(int index)
 {
-  return (Config *)(STORAGE_START + index * ENTRY_SIZE);
+  return (const Config *)(STORAGE_START + index * ENTRY_SIZE);
+}
+
+static inline void entry_cache_drop(void) { }
+
+#else
+
+static Config g_entry_cache;
+static int g_entry_cached = -1;
+
+static const Config *get_entry(int index)
+{
+  if (index != g_entry_cached)
+  {
+    // A read that does not happen leaves the buffer holding the previous
+    // entry, which would validate and be adopted as this one. Fill it with
+    // something that cannot pass is_entry_valid instead.
+    if (!flash_read(STORAGE_START + index * ENTRY_SIZE,
+          (uint8_t *)&g_entry_cache, sizeof(Config)))
+      memset(&g_entry_cache, 0, sizeof(Config));
+
+    g_entry_cached = index;
+  }
+
+  return &g_entry_cache;
+}
+
+static void entry_cache_drop(void)
+{
+  g_entry_cached = -1;
+}
+
+#endif
+
+//-----------------------------------------------------------------------------
+// The internal store, read directly, whatever backend is in use. This is what
+// a migration reads from and what the SPI build falls back to when no chip
+// answers - both of which have to work while STORAGE_START points elsewhere.
+static inline const Config *internal_entry(int index)
+{
+  return (const Config *)(INT_STORAGE_START + index * INT_ENTRY_SIZE);
 }
 
 //-----------------------------------------------------------------------------
-static void flash_clear_flags(void)
+static void fmc_clear_flags(void)
 {
   FMC->STAT = FMC_STAT_ALL_FLAGS;
 }
@@ -446,7 +550,7 @@ static void flash_fail(ConfigStoreStatus status)
   g_saves_failed++;
 
   FMC->CTL = 0;
-  flash_clear_flags();
+  fmc_clear_flags();
 
   g_flash_erase_busy = false;
   g_flash_write_busy = false;
@@ -460,24 +564,30 @@ static void flash_fail(ConfigStoreStatus status)
 }
 
 //-----------------------------------------------------------------------------
-static void flash_unlock(void)
+// The FMC half of the store. Only the internal backend touches these: on the
+// serial part the driver in flash.c does the erasing and programming, and it
+// does both synchronously, so there is no state machine to drive.
+#if STORE_INTERNAL
+
+//-----------------------------------------------------------------------------
+static void fmc_unlock(void)
 {
   FMC->KEY = FMC_KEY_KEY1;
   FMC->KEY = FMC_KEY_KEY2;
   FMC->CTL = 0;
 
-  flash_clear_flags();
+  fmc_clear_flags();
 
   if (FMC->CTL & FMC_CTL_LK_Msk)
     error("Flash unlock error");
 }
 
 //-----------------------------------------------------------------------------
-static void flash_erase(int index)
+static void fmc_erase(int index)
 {
   uint32_t cmd = FMC_CTL_SER_Msk | (index << FMC_CTL_SN_Pos);
 
-  flash_clear_flags();
+  fmc_clear_flags();
 
   FMC->CTL = cmd;
   FMC->CTL = cmd | FMC_CTL_START_Msk;
@@ -501,7 +611,7 @@ static bool flash_erase_task(void)
   }
 
   FMC->CTL = 0;
-  flash_clear_flags();
+  fmc_clear_flags();
 
   g_flash_erase_busy = false;
 
@@ -509,12 +619,12 @@ static bool flash_erase_task(void)
 }
 
 //-----------------------------------------------------------------------------
-static void flash_write(uint32_t *addr, uint32_t *data, int size)
+static void fmc_write(uint32_t *addr, uint32_t *data, int size)
 {
   // Not while an erase is still running: those flags belong to the erase and
   // are checked when it finishes
   if (!g_flash_erase_busy)
-    flash_clear_flags();
+    fmc_clear_flags();
 
   g_flash_write_addr = addr;
   g_flash_write_data = data;
@@ -522,8 +632,10 @@ static void flash_write(uint32_t *addr, uint32_t *data, int size)
   g_flash_write_busy = true;
 }
 
+#endif // STORE_INTERNAL
+
 //-----------------------------------------------------------------------------
-static bool is_entry_valid(Config *entry);
+static bool is_entry_valid(const Config *entry);
 static void store_entry(void);
 
 //-----------------------------------------------------------------------------
@@ -532,7 +644,7 @@ static void store_entry(void);
 // that went nowhere, which is what the store used to do.
 static void write_verify(void)
 {
-  Config *entry = get_entry(g_entry_offset / ENTRY_SIZE);
+  const Config *entry = get_entry(g_entry_offset / ENTRY_SIZE);
 
   if (is_entry_valid(entry))
   {
@@ -562,6 +674,8 @@ static void write_verify(void)
 }
 
 //-----------------------------------------------------------------------------
+#if STORE_INTERNAL
+
 static bool flash_write_task(void)
 {
   if (!g_flash_write_busy)
@@ -614,7 +728,7 @@ static bool flash_write_task(void)
   }
 
   FMC->CTL = 0;
-  flash_clear_flags();
+  fmc_clear_flags();
 
   g_flash_write_busy = false;
 
@@ -622,6 +736,18 @@ static bool flash_write_task(void)
 
   return false;
 }
+
+#else
+
+// Nothing runs in the background on the serial part: an erase is 45 ms and a
+// 512 byte entry is two page programs, both of which have returned by the time
+// store_entry() does. These exist so that config_task and config_drain read
+// the same either way.
+static bool flash_erase_task(void) { return false; }
+static bool flash_write_task(void) { return false; }
+static void fmc_unlock(void) { }
+
+#endif // STORE_INTERNAL
 
 //-----------------------------------------------------------------------------
 // The seal over the calibration block alone, see CALIB_OFFSET
@@ -654,7 +780,7 @@ static void calib_adopt(const Config *entry)
 }
 
 //-----------------------------------------------------------------------------
-static bool is_entry_valid(Config *entry)
+static bool is_entry_valid(const Config *entry)
 {
   if (entry->magic != MAGIC)
     return false;
@@ -679,7 +805,7 @@ static int find_last_entry(void)
 
   for (int i = 0; i < ENTRIES_COUNT; i++)
   {
-    Config *entry = get_entry(i);
+    const Config *entry = get_entry(i);
 
     if (!is_entry_valid(entry))
       continue;
@@ -771,14 +897,56 @@ static void store_entry(void)
    * the slot is blank turns all of them into one recovery - erase and restart
    * the rotation - instead of a store that is dead until reflashed.
    */
+#if STORE_INTERNAL
   if (g_entry_offset == SECTOR_0_OFFSET || !entry_is_blank(g_entry_offset / ENTRY_SIZE))
   {
-    flash_erase(SECTOR_0_INDEX);
+    fmc_erase(SECTOR_0_INDEX);
     g_entry_offset = 0;
   }
 
-  flash_write((uint32_t *)(STORAGE_START + g_entry_offset),
+  fmc_write((uint32_t *)(STORAGE_START + g_entry_offset),
       (uint32_t *)&g_config_copy, sizeof(Config));
+#else
+  /*
+   * Same rule, one sector's worth of consequences instead of the whole store.
+   * The erase unit here is 4 KB and holds eight slots, so a rotation that
+   * steps into a new sector erases that sector and nothing else, and the
+   * recovery from a used slot costs seven neighbours rather than 127.
+   *
+   * Note the order: the check has to come before the write, and the erase has
+   * to be the whole sector the slot is in - programming into a slot whose
+   * sector still holds an older entry would AND the two together exactly as
+   * the internal store used to.
+   */
+  if (0 == (g_entry_offset % FLASH_SECTOR_SIZE) ||
+      !entry_is_blank(g_entry_offset / ENTRY_SIZE))
+  {
+    uint32_t sector = STORAGE_START +
+        (g_entry_offset & ~(FLASH_SECTOR_SIZE - 1));
+
+    entry_cache_drop();
+
+    if (!flash_erase_sector(sector))
+    {
+      flash_fail(CONFIG_STORE_ERASE_ERROR);
+      return;
+    }
+  }
+
+  entry_cache_drop();
+
+  if (!flash_write(STORAGE_START + g_entry_offset,
+        (const uint8_t *)&g_config_copy, sizeof(Config)))
+  {
+    flash_fail(CONFIG_STORE_WRITE_ERROR);
+    return;
+  }
+
+  // The read-back is the whole point of the exercise, and on this backend it
+  // can happen right here rather than three main-loop passes later
+  entry_cache_drop();
+  write_verify();
+#endif
 }
 
 //-----------------------------------------------------------------------------
@@ -842,11 +1010,72 @@ static void config_save(bool lazy)
 }
 
 //-----------------------------------------------------------------------------
+#if !STORE_INTERNAL
+/*
+ * The one-way move onto the serial part.
+ *
+ * The internal sector is still there and still readable - the flash region
+ * only grew, nothing erased it - so the first boot after the switch finds the
+ * settings and the calibration exactly where the previous firmware left them
+ * and copies the live entry across. No manual step, and in particular no
+ * "recalibrate your scope because the storage moved".
+ *
+ * It stays armed rather than running once: if the serial store is ever wiped -
+ * a power cut inside the erase window, a chip replaced - and the internal
+ * sector still holds something valid, importing an old calibration beats
+ * booting on somebody else's defaults. It stops being possible on its own,
+ * the day the image grows past 384 KB and overwrites the sector.
+ */
+static bool migrate_from_internal(void)
+{
+  int best = -1;
+  int max_count = -1;
+
+  for (int i = 0; i < INT_ENTRIES_COUNT; i++)
+  {
+    const Config *entry = internal_entry(i);
+
+    if (!is_entry_valid(entry))
+      continue;
+
+    if (entry->count > max_count)
+    {
+      max_count = entry->count;
+      best = i;
+    }
+  }
+
+  if (best < 0)
+    return false;
+
+  g_config_copy = *internal_entry(best);
+  g_have_copy = true;
+  g_save_attempt = 1;
+
+  // One slot short of the end, so store_entry wraps to zero and starts the
+  // rotation by erasing the sector it is about to write into
+  g_entry_offset = STORAGE_SIZE - ENTRY_SIZE;
+
+  store_entry();
+
+  return find_last_entry() >= 0;
+}
+#endif
+
+//-----------------------------------------------------------------------------
 void config_init(void)
 {
   int index = find_last_entry();
 
-  flash_unlock();
+  fmc_unlock();
+
+#if !STORE_INTERNAL
+  if (index < 0 && migrate_from_internal())
+  {
+    index = find_last_entry();
+    g_migrated = true;
+  }
+#endif
 
   if (index == -1)
   {
@@ -856,7 +1085,12 @@ void config_init(void)
     // as a whole.
     bool salvaged = calib_recover();
 
-    flash_erase(SECTOR_0_INDEX);
+#if STORE_INTERNAL
+    fmc_erase(SECTOR_0_INDEX);
+#else
+    entry_cache_drop();
+    flash_erase_sector(STORAGE_START);
+#endif
 
     config_reset();
 
@@ -881,7 +1115,7 @@ void config_init(void)
   }
   else
   {
-    Config *entry = get_entry(index);
+    const Config *entry = get_entry(index);
     config = *entry;
     g_entry_offset = index * ENTRY_SIZE;
 
@@ -977,8 +1211,10 @@ void config_get_state(char *buf, int size)
         name, (unsigned long)g_last_fmc_stat,
         g_entry_offset / ENTRY_SIZE, ENTRIES_COUNT, g_saves_failed);
   else
-    snprintf(buf, size, "Cfg: %s  entry %d/%d  saves %d  boot %d",
-        name, g_entry_offset / ENTRY_SIZE, ENTRIES_COUNT,
+    snprintf(buf, size, "Cfg: %s%s  %s entry %d/%d  saves %d  boot %d",
+        name, g_migrated ? " (migrated)" : "",
+        STORE_INTERNAL ? "int" : "spi",
+        g_entry_offset / ENTRY_SIZE, ENTRIES_COUNT,
         g_saves_ok, config.power_cycles);
 }
 
@@ -1036,6 +1272,24 @@ const Config *config_store_entry(int index)
 int config_store_live_index(void)
 {
   return g_entry_offset / ENTRY_SIZE;
+}
+
+//-----------------------------------------------------------------------------
+uint32_t config_store_base(void)
+{
+  return STORAGE_START;
+}
+
+//-----------------------------------------------------------------------------
+uint32_t config_store_entry_size(void)
+{
+  return ENTRY_SIZE;
+}
+
+//-----------------------------------------------------------------------------
+bool config_store_is_external(void)
+{
+  return !STORE_INTERNAL;
 }
 
 //-----------------------------------------------------------------------------

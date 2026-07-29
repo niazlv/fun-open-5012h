@@ -35,6 +35,24 @@ LDFLAGS += -Wl,--print-memory-usage
 LDFLAGS += -Wl,-Map=$(BUILD)/$(BIN).map
 LDFLAGS += -Wl,--script=$(LDSCRIPT)
 
+# Where the settings store lives. `spi` puts it on the 8 MB serial part at
+# 0x7A0000 and hands the whole 512 KB of internal flash back to code; the
+# firmware migrates the existing store across by itself on the first boot.
+# `internal` is the old arrangement - the last 128 KB sector - and costs a
+# third of the image budget. See the comment at the top of config.c.
+CONFIG_STORE ?= spi
+
+ifeq ($(CONFIG_STORE),internal)
+  CFLAGS += -DCONFIG_STORE_INTERNAL=1
+  STORE_RESERVED = 131072
+else ifeq ($(CONFIG_STORE),spi)
+  STORE_RESERVED = 0
+else
+  $(error CONFIG_STORE must be spi or internal, not "$(CONFIG_STORE)")
+endif
+
+LDFLAGS += -Wl,--defsym=__store_reserved=$(STORE_RESERVED)
+
 # One -I per subsystem, so a source keeps including a header by its bare name
 # ("measure.h", not "../dsp/measure.h"). The directories are an index for the
 # reader; they are deliberately not part of the include graph, so a file can be
@@ -241,6 +259,20 @@ $(shell $(MKDIR) -p $(BUILD); \
     echo "$(DOOM_ASSETS)" | cmp -s - $(DOOM_STAMP) || { \
       echo "$(DOOM_ASSETS)" > $(DOOM_STAMP); \
       rm -f $(BUILD)/doom_assets.o $(BUILD)/$(BIN).elf \
+            $(BUILD)/$(BIN).bin $(BUILD)/$(BIN).hex; })
+
+# Same trick for the store backend, and for a worse reason than DOOM's: that
+# one only decides which objects are linked, while this one changes what
+# config.c compiles to AND how much flash the image may occupy. Switching
+# without a rebuild leaves objects from the other backend in place - a store
+# that reads one place and writes another, which would look like settings that
+# save and then come back wrong.
+CONFIG_STORE_STAMP = $(BUILD)/config_store.stamp
+
+$(shell $(MKDIR) -p $(BUILD); \
+    echo "$(CONFIG_STORE)" | cmp -s - $(CONFIG_STORE_STAMP) || { \
+      echo "$(CONFIG_STORE)" > $(CONFIG_STORE_STAMP); \
+      rm -f $(BUILD)/*.o $(BUILD)/$(BIN).elf \
             $(BUILD)/$(BIN).bin $(BUILD)/$(BIN).hex; })
 
 all: directory $(BUILD)/$(BIN).elf $(BUILD)/$(BIN).hex $(BUILD)/$(BIN).bin size

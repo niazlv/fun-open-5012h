@@ -26,14 +26,20 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-/* The part has 512K of flash, but the last 128K sector is the configuration
-   store (see config.c), which is erased whole. The firmware must therefore stay
-   below it - a firmware that overruns runs perfectly until the first settings
-   save erases its own tail, which is not a failure anyone should have to debug
-   on the device. Keeping the region short makes it a link error instead. */
+/* The part has 512K of flash. Whether the firmware may use all of it depends
+   on where the settings store lives, which is a build-time choice (config.c):
+
+     make                        store on the SPI part, all 512K is code
+     make CONFIG_STORE=internal  store in the last 128K sector, code stops at 384K
+
+   The Makefile passes the reserved tail in as __store_reserved, and the assert
+   at the bottom is what enforces it. It has to be enforced somewhere: a
+   firmware that overruns into the store runs perfectly until the first
+   settings save erases its own tail, and that is not a failure anyone should
+   have to debug on the device. */
 MEMORY
 {
-  flash (rx) : ORIGIN = 0x08000000, LENGTH = 384K
+  flash (rx) : ORIGIN = 0x08000000, LENGTH = 512K
   ram (rwx)  : ORIGIN = 0x20000000, LENGTH = 128K
   tcm (rwx)  : ORIGIN = 0x10000000, LENGTH = 64K
 }
@@ -92,4 +98,10 @@ SECTIONS
      ring at 0x20000000 + 24K storage buffer at 0x20018000. Nothing may be
      linked there. Guard the TCM stack/heap headroom at build time. */
   ASSERT(_stack_top - _end >= 16K, "TCM overflow: less than 16K left for stack+heap")
+
+  /* Everything the image occupies, including the .data initialisers, has to
+     end before the reserved tail. __store_reserved is 128K when the settings
+     store is in the internal sector and 0 when it is on the SPI part. */
+  ASSERT(__etext <= __top_flash - __store_reserved,
+      "image runs into the settings store: build with CONFIG_STORE=spi or make it smaller")
 }
