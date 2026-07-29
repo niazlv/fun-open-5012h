@@ -45,4 +45,8 @@ uint32_t timer_ms(void);
 // single pass of the main loop with it measures zero.
 uint32_t timer_us(void);
 
+// Sleep the core until the next interrupt. Peripherals keep their clocks, so
+// nothing that is running stops; the wake-up is at worst one millisecond away.
+void timer_idle(void);
+
 #endif // _TIMER_H_

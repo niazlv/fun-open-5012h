@@ -42,6 +42,21 @@ typedef struct
   void (*redraw)(void);       // full repaint after an overlay closes
   const menu_def_t *menu;     // application section of the system menu
   const menu_def_t *help;     // its pages in the system menu's Help section
+
+  // May the main loop sleep the core when a pass of this application finds
+  // nothing to do (see launcher_app_may_idle)? It qualifies when it paints a
+  // whole frame in one pass and then waits for its next tick: the games, the
+  // cube, the two viewers.
+  //
+  // The incremental renderers do not. The oscilloscope paints one column of
+  // the sweep per pass, the ray tracer one line, the 3D engine a slice of
+  // lines, and DOOM renders flat out with no tick at all - for those a pass
+  // IS the frame budget, and a millisecond of sleep between passes would
+  // divide the frame rate by the number of passes a frame takes.
+  //
+  // Every row below answers this explicitly, and one left unset reads as
+  // false, which is the safe way round for anything added here later.
+  bool idle;
 } app_desc_t;
 
 /*- Variables ---------------------------------------------------------------*/
@@ -60,6 +75,20 @@ static void scope_init_wrapper(void)
 static void scope_cleanup_wrapper(void)
 {
   capture_stop();
+
+  // capture_stop() ends the acquisition, not the converter. The encode clocks
+  // TIMER0 puts on PA8/PA9 keep the AD9288 sampling at 62.5 MHz a channel for
+  // as long as the device is on afterwards - tens of milliamps spent digitising
+  // a front end nobody is looking at, in a game or in this menu.
+  //
+  // Safe to stop here and only here: the acquisition above is what uses them,
+  // the DMA it feeds is already stopped, and no other application touches
+  // capture at all. scope_init() puts them back on its way in, through
+  // update_sample_rate() -> capture_set_horizontal_parameters(), which is the
+  // one sequence that establishes the phase between the encode edge and the
+  // DMA's read of the data bus - so the clocks never restart any other way.
+  capture_disable_clock();
+
   lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, LCD_BLACK_COLOR);
 }
 
@@ -71,42 +100,44 @@ static const app_desc_t g_apps[] =
 {
   { "Oscilloscope", "Digital oscilloscope with signal analysis",
     scope_init_wrapper, scope_task, scope_buttons_handler, scope_cleanup_wrapper,
-    scope_redraw_all, &scope_menu, &scope_help_menu },
+    scope_redraw_all, &scope_menu, &scope_help_menu, false },
   { "3D Graphics", "Rotating 3D cube demo",
     cube3d_init, cube3d_task, cube3d_buttons_handler, cube3d_cleanup,
-    cube3d_redraw, &cube3d_menu, &cube3d_help_menu },
+    cube3d_redraw, &cube3d_menu, &cube3d_help_menu, true },
   { "3D Engine", "Advanced 3D engine with RayCast/RayTrace",
     engine3d_init, engine3d_task, engine3d_buttons_handler, engine3d_cleanup,
-    engine3d_redraw, &engine3d_menu, &engine3d_help_menu },
+    engine3d_redraw, &engine3d_menu, &engine3d_help_menu, false },
   { "Ray Trace Test", "Simple ray tracing demo",
     raytrace_test_init, raytrace_test_task, raytrace_test_buttons_handler,
     raytrace_test_cleanup, raytrace_test_redraw, &raytrace_test_menu,
-    &raytrace_test_help_menu },
+    &raytrace_test_help_menu, false },
   { "Flappy Bird", "Side-scrolling bird game",
     flappy_bird_init, flappy_bird_task, flappy_bird_buttons_handler,
     flappy_bird_cleanup, flappy_bird_redraw, &flappy_bird_menu,
-    &flappy_bird_help_menu },
+    &flappy_bird_help_menu, true },
   { "Snake Game", "Classic snake game",
     snake_game_init, snake_game_task, snake_game_buttons_handler,
     snake_game_cleanup, snake_game_redraw, &snake_game_menu,
-    &snake_game_help_menu },
+    &snake_game_help_menu, true },
   { "2048", "Slide and merge, on a board from 3x3 to 6x6",
     game2048_init, game2048_task, game2048_buttons_handler,
-    game2048_cleanup, game2048_redraw, &game2048_menu, &game2048_help_menu },
+    game2048_cleanup, game2048_redraw, &game2048_menu, &game2048_help_menu,
+    true },
   { "Tetris", "Ten by twenty, with next, hold and a ghost",
     tetris_init, tetris_task, tetris_buttons_handler,
-    tetris_cleanup, tetris_redraw, &tetris_menu, &tetris_help_menu },
+    tetris_cleanup, tetris_redraw, &tetris_menu, &tetris_help_menu, true },
   { "DOOM", "id Software's renderer on a real WAD level",
     doom_port_init, doom_port_task, doom_port_buttons_handler,
-    doom_port_cleanup, doom_port_redraw, &doom_port_menu, &doom_port_help_menu },
+    doom_port_cleanup, doom_port_redraw, &doom_port_menu, &doom_port_help_menu,
+    false },
   { "CoreDump Viewer", "View crash dumps and stack traces",
     coredump_app_init, coredump_app_task, coredump_app_buttons_handler,
     coredump_app_cleanup, coredump_app_redraw, &coredump_menu,
-    &coredump_help_menu },
+    &coredump_help_menu, true },
   { "Flash Viewer", "Explore flash memory structure",
     flash_viewer_init, flash_viewer_task, flash_viewer_buttons_handler,
     flash_viewer_cleanup, flash_viewer_redraw, &flash_viewer_menu,
-    &flash_viewer_help_menu },
+    &flash_viewer_help_menu, true },
 };
 
 static menu_item_t g_app_items[ARRAY_SIZE(g_apps)];
@@ -265,4 +296,17 @@ const char *launcher_app_name(void)
 bool launcher_app_running(void)
 {
   return NULL != g_running;
+}
+
+//-----------------------------------------------------------------------------
+// May the main loop sleep the core when a pass finds nothing to do? The
+// launcher's own menu may - it is drawn on input and does nothing in between -
+// and an application may when it says so (app_desc_t::idle).
+//
+// It is the running APPLICATION that decides, not the top screen: g_running
+// still names the oscilloscope while a menu is open over it, which is what
+// keeps the sweep at full speed there as well.
+bool launcher_app_may_idle(void)
+{
+  return NULL == g_running || g_running->idle;
 }

@@ -36,4 +36,8 @@ const menu_def_t *launcher_app_help(void);
 const char *launcher_app_name(void);
 bool launcher_app_running(void);
 
+// Whether the main loop may sleep the core between passes while this
+// application runs. See the definition for why the oscilloscope may not.
+bool launcher_app_may_idle(void);
+
 #endif // _LAUNCHER_H_

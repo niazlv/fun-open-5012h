@@ -317,12 +317,36 @@ int main(void)
 
   while (1)
   {
+    uint32_t pass_start = timer_us();
+
     timer_task();
     ui_task();
     shift_mode_task();
     battery_task();
     buttons_task();
     config_task();
+
+    // A pass that found nothing to do has nothing to do until the clock moves
+    // either: every task above is driven by a millisecond timer or polls a
+    // button behind a 20 ms debounce. So stop the core until the next
+    // interrupt instead of spinning at 250 MHz between frames - measured, a
+    // game leaves the loop idle for 55 to 99 % of the time it is played, and
+    // this is the only part of the power budget the firmware can give back.
+    //
+    // Two conditions, and the point of both is that nothing which is actually
+    // working ever waits on this:
+    //
+    //   - the application must allow it. The incremental renderers do not:
+    //     for them a pass is a slice of the frame, not the whole of it (see
+    //     app_desc_t::idle behind launcher_app_may_idle).
+    //   - the pass must have taken less than a tick. Anything that spends
+    //     longer than that in one pass - a DOOM frame, a screenful of a game -
+    //     is not idle, and skips the sleep whatever it allows.
+    //
+    // The wake-up is the SysTick alarm at worst, and any earlier interrupt at
+    // best: while the scope runs, its own DMA raises one per buffer.
+    if (launcher_app_may_idle() && timer_us() - pass_start < 1000)
+      timer_idle();
   }
 
   return 0;

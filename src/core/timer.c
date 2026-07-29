@@ -52,9 +52,16 @@
  * zero time loss. The previous SysTick scheme killed the device with a
  * white "Timer overflow" screen after a stall of only ~0.27-0.54 s.
  *
- * No interrupts are used. TIMER0/TIMER7 belong to capture.c and TIMER2 to
- * the lcd.c backlight PWM; TIMER1 is free (TIMER4 is the other 32-bit
- * timer if TIMER1 is ever needed elsewhere).
+ * Timekeeping itself takes no interrupt: the counter is read, never
+ * accumulated in a handler, which is exactly why a stall cannot lose time.
+ * SysTick is enabled all the same, but only as the main loop's alarm clock
+ * (see timer_idle) - nothing reads it and nothing counts it, so a tick that
+ * never arrives costs a millisecond of latency rather than a millisecond of
+ * time.
+ *
+ * TIMER0/TIMER7 belong to capture.c and TIMER2 to the lcd.c backlight PWM;
+ * TIMER1 is free (TIMER4 is the other 32-bit timer if TIMER1 is ever needed
+ * elsewhere).
  */
 #define TIMER_CLOCK    (F_CPU / 2)
 #define US_PER_SEC     1000000ul
@@ -85,8 +92,40 @@ void timer_init(void)
 
   g_timer_prev_cnt = TIMER1->CNT;
 
-  // SysTick is no longer used for timekeeping
-  SysTick->CTRL = 0;
+  // SysTick is not timekeeping - that is TIMER1 above, and the reason it is
+  // TIMER1 is that a SysTick handler which misses a tick loses time for good.
+  // What it is here is an alarm clock for timer_idle(): the main loop sleeps
+  // the core between passes and something has to end the sleep. Nothing reads
+  // this counter, so its accuracy does not matter.
+  //
+  // Lowest priority, because the one interrupt in this firmware that has a
+  // deadline is the capture DMA's, and a wake-up must never sit in front of
+  // it. The handler is empty; being taken at all is the whole job.
+  SysTick->LOAD = (F_CPU / 1000) - 1;   // 1 kHz, off the undivided core clock
+  SysTick->VAL  = 0;
+  NVIC_SetPriority(SysTick_IRQn, (1u << __NVIC_PRIO_BITS) - 1u);
+  SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_TICKINT_Msk |
+      SysTick_CTRL_ENABLE_Msk;
+}
+
+//-----------------------------------------------------------------------------
+// The alarm clock. It overrides the startup file's dummy handler, which is an
+// infinite loop - an enabled interrupt with no handler of its own would hang
+// the device the first time it fired.
+void irq_handler_sys_tick(void)
+{
+}
+
+//-----------------------------------------------------------------------------
+// Sleep the core until the next interrupt: the tick above, or the capture
+// DMA, or anything else the hardware raises. Every clock keeps running -
+// this is plain WFI with SLEEPDEEP clear - so the acquisition, the timers and
+// the backlight PWM are untouched by it.
+//
+// The caller decides WHEN this is safe; see launcher_app_may_idle().
+void timer_idle(void)
+{
+  __WFI();
 }
 
 //-----------------------------------------------------------------------------
