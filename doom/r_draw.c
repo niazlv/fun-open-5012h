@@ -65,6 +65,8 @@ void R_InitDrawFlats(int shift)
 void R_DrawColumn(void)
 {
     int count = dc_yh - dc_yl;
+
+    DOOM_TRACE_FETCH(dc_source, dc_texheight);
     uint8_t *dest;
     const uint8_t *source = dc_source;
     const uint8_t *colormap = dc_colormap;
@@ -84,6 +86,7 @@ void R_DrawColumn(void)
 
         do
         {
+            DOOM_TRACE_READ(&source[(frac >> FRACBITS) & mask]);
             *dest = colormap[source[(frac >> FRACBITS) & mask]];
             dest += SCREENWIDTH;
             frac += fracstep;
@@ -103,6 +106,7 @@ void R_DrawColumn(void)
 
         do
         {
+            DOOM_TRACE_READ(&source[pos]);
             *dest = colormap[source[pos]];
             dest += SCREENWIDTH;
 
@@ -192,6 +196,8 @@ void R_DrawMaskedColumn(const uint8_t *post)
 void R_DrawSpan(void)
 {
     int count = ds_x2 - ds_x1;
+
+    DOOM_TRACE_FETCH(ds_source, 0);
     uint8_t *dest;
     const uint8_t *source = ds_source;
     const uint8_t *colormap = ds_colormap;
@@ -208,6 +214,7 @@ void R_DrawSpan(void)
         int spot = ((yfrac >> flat_vshift) & flat_vmask) +
                    ((xfrac >> flat_ushift) & flat_umask);
 
+        DOOM_TRACE_READ(&source[spot]);
         *dest++ = colormap[source[spot]];
 
         xfrac += xstep;

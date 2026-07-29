@@ -267,6 +267,28 @@ typedef struct
 
 extern r_stats_t r_stats;
 
+// The base of the asset pack, for a harness that measures access patterns
+const uint8_t *doom_assets_blob(void);
+
+/*
+ * Texture reads, counted.
+ *
+ * The two loops below are where the renderer touches the pack once per screen
+ * pixel, and they are the only reads that would have to come over a bus if the
+ * pack ever lived on the SPI part rather than in the address space. Built for
+ * the device this expands to nothing; tests/doom_cache.c defines DOOM_TRACE
+ * and models a cache behind it.
+ */
+#ifdef DOOM_TRACE
+void doom_trace_read(const void *addr);
+void doom_trace_fetch(const void *addr, int bytes);
+#define DOOM_TRACE_READ(p)      doom_trace_read(p)
+#define DOOM_TRACE_FETCH(p, n)  doom_trace_fetch(p, n)
+#else
+#define DOOM_TRACE_READ(p)      ((void)0)
+#define DOOM_TRACE_FETCH(p, n)  ((void)0)
+#endif
+
 /*- Variables ---------------------------------------------------------------*/
 extern doom_mem_t *dm;
 

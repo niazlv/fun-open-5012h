@@ -146,6 +146,15 @@ static const void *require(const char *name)
 }
 
 //-----------------------------------------------------------------------------
+// Where the pack starts. Only a measurement harness wants this - it is how a
+// pointer handed out by doom_asset_find() becomes an offset that a cache
+// model can index.
+const uint8_t *doom_assets_blob(void)
+{
+    return g_blob;
+}
+
+//-----------------------------------------------------------------------------
 const char *doom_assets_error(void)
 {
     return g_error;

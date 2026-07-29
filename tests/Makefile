@@ -45,7 +45,7 @@ HOST_SRCS = \
   $(ROOT)/src/dsp/trend.c \
   $(wildcard $(ROOT)/src/decode/*.c) \
 
-.PHONY: all test host coredump snake flappy g2048 tetris doomhost clean
+.PHONY: all test host coredump snake flappy g2048 tetris doomhost doomcache clean
 
 all: test
 
@@ -117,6 +117,11 @@ $(BUILD)/tetris_test: $(TETRIS_SRCS) $(ROOT)/src/apps/tetris.c gamestub.h | $(BU
 
 # Renders one DOOM frame to a .ppm. Not part of `test`: it needs the asset
 # pack, which is built from a real IWAD and is not in the repository.
+doomcache: $(BUILD)/doom_cache
+$(BUILD)/doom_cache: doom_cache.c $(wildcard $(ROOT)/doom/*.c) | $(BUILD)
+	@echo CC $@
+	@$(CC) $(CFLAGS) -DDOOM_TRACE -I$(ROOT)/doom doom_cache.c $(ROOT)/doom/*.c $(LIBS) -o $@
+
 doomhost: $(BUILD)/doom_host
 $(BUILD)/doom_host: doom_host.c $(wildcard $(ROOT)/doom/*.c) | $(BUILD)
 	@echo CC $@
