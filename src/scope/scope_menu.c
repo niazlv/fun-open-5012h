@@ -70,6 +70,7 @@ static const char *const g_measure_panel_labels[] = { "On", "Off" };
 static const char *const g_measure_slot_labels[] =
 {
   "Off", "Vpp", "Frequency", "Duty", "Vrms", "Vavg", "Type", "THD", "Jitter",
+  "f (spectrum)",
 };
 
 // The slot choice cycles through MEASURE_COUNT entries, so this array MUST
@@ -1172,6 +1173,9 @@ static const menu_item_t g_panel_items[] =
   { .kind = MI_TOGGLE, .label = "Jitter",
     .desc = "Period sigma ~ peak-to-peak",
     .u.toggle = { &config.show_jitter, NULL } },
+  { .kind = MI_TOGGLE, .label = "f (spectrum)",
+    .desc = "Frequency off the FFT peak, beside the counter's",
+    .u.toggle = { &config.show_fft_freq, NULL } },
 };
 
 // The status line: exactly two values in the large font, and the user says
@@ -1281,8 +1285,20 @@ static const char *const g_persist_labels[] =
   "Off", "Infinite", "Decay (CRT)",
 };
 
+// What fills the screen between samples once the timebase is zoomed in past
+// one sample per pixel. See the note on config.draw_mode, and sinc_between()
+// in capture.c for what the second one actually computes.
+static const char *const g_draw_labels[] =
+{
+  "Lines", "sin(x)/x",
+};
+
 static const menu_item_t g_display_items[] =
 {
+  { .kind = MI_CHOICE, .label = "Between samples",
+    .desc = "sin(x)/x: true curve, only below nyquist",
+    .u.choice = { &config.draw_mode, g_draw_labels,
+        ARRAY_SIZE(g_draw_labels), display_processing_changed } },
   { .kind = MI_CHOICE, .label = "Persistence",
     .desc = "Envelope: kept, or fading like a CRT",
     .u.choice = { &config.persist_mode, g_persist_labels,

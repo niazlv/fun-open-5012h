@@ -1414,6 +1414,7 @@ static const struct
   FIELD(show_type, FT_BOOL),
   FIELD(show_thd, FT_BOOL),
   FIELD(show_jitter, FT_BOOL),
+  FIELD(show_fft_freq, FT_BOOL),
   FIELD(measure_line_set, FT_BOOL),
   FIELD_N(measure_line, FT_IARR, MEASURE_LINE_SLOTS),
 
@@ -1436,6 +1437,7 @@ static const struct
 
   FIELD(persist_mode, FT_INT),
   FIELD(average_mode, FT_INT),
+  FIELD(draw_mode, FT_INT),
   FIELD(roll_from, FT_INT),
 
   FIELD(snake_high_score, FT_INT),
@@ -1642,10 +1644,11 @@ void config_reset(void)
   config.decoder_stop           = false;
   config.show_jitter            = false;
   config.decoder_stop_start     = false;
-  config.decoder_reserved[0]    = false;
+  config.show_fft_freq          = false;
 
   config.persist_mode           = 0; // 0 = off, 1 = infinite, 2 = decay
   config.average_mode           = 0;
+  config.draw_mode              = DRAW_LINEAR;
   config.decoder_baud           = 0; // auto-detect
   config.decoder_fit_mode       = 0; // fit the timebase to the rate
   config.decoder_bits_mode      = 0; // bit grid over the trace
@@ -1670,8 +1673,7 @@ void config_reset(void)
   for (int i = 0; i < 32; i++)
     config.key_mapping[i] = 0;
 
-  for (int i = 0; i < ARRAY_SIZE(config.padding); i++)
-    config.padding[i] = 0;
+  // padding[] is spent: its last word is config.draw_mode, defaulted above
 }
 
 //-----------------------------------------------------------------------------

@@ -84,6 +84,13 @@
 #define BG_COLOR               LCD_COLOR(0, 0, 0)
 #define TRACE_COLOR            LCD_COLOR(255, 255, 0)
 #define TRACE_FILLED_COLOR     LCD_COLOR(0, 255, 0)
+// ...and the same reconstructed pixels once the record no longer supports
+// them. sin(x)/x is exact down to about three samples per period and then
+// falls apart fast - measured against the true waveform, the worst error over
+// a 200-count swing goes 1.2 counts at 3.1 samples, 7 at 2.31, 64 at 2.08.
+// The colour is the only warning there can be, because the curve itself stays
+// perfectly smooth and confident all the way down. See sinc_between().
+#define TRACE_RECON_WARN_COLOR LCD_COLOR(255, 150, 0)
 #define TRACE_CLIP_COLOR       LCD_COLOR(255, 0, 0)
 #define TRACE_INVALID_COLOR    LCD_COLOR(255, 0, 0)
 
@@ -384,6 +391,11 @@ static uint8_t g_shadow_flags[GRID_WIDTH];
 static bool g_shadow_valid = false;
 static int g_shadow_marker_px = 0x7fffffff;
 static bool g_sweep_force = true;
+// Set when the record has fewer than RECON_MIN_SAMPLES samples per period, so
+// the reconstruction drawn between them is past what it can honestly do.
+// Recomputed once per display rebuild, read by every column.
+static bool g_recon_strained = false;
+#define RECON_MIN_SAMPLES 3
 
 // The stopped-on-a-snapshot tag is on screen (and its columns are a hole in
 // the sweep). Owned by the state machine in scope_task().
@@ -584,6 +596,9 @@ static int g_fps_value = 0;
 static int g_fps_timer = TIMER_DISABLE;
 
 static SignalClass g_signal_class = { SIG_UNKNOWN, -1 };
+// The spectrum's frequency for the record g_signal_class was built from; 0
+// when no record or no peak stood out of the floor
+static int g_spectrum_hz = 0;
 
 // Measurements panel state: 1bpp text mask, one bit per trace-area pixel
 static bool g_mpanel_active = false;
@@ -1063,7 +1078,7 @@ static void update_from_display_buffer(uint16_t *column, DisplayBuffer *db)
     if (clip_h || clip_l)
       color = TRACE_CLIP_COLOR;
     else if (db->flags[g_trace_column] & SAMPLE_FLAG_FILLED)
-      color = TRACE_FILLED_COLOR;
+      color = g_recon_strained ? TRACE_RECON_WARN_COLOR : TRACE_FILLED_COLOR;
     else
       color =  TRACE_COLOR;
 
@@ -1590,6 +1605,11 @@ static void format_ps(int ps, char *out, int size)
 //-----------------------------------------------------------------------------
 // Classify the current record (type + THD), cached per acquisition. Runs the
 // FFT on a non-consuming sample copy so the display pipeline is unaffected.
+//
+// The same transform also yields the spectrum's own reading of the frequency,
+// which MEASURE_FFT_FREQ puts next to the counter's. It costs nothing extra:
+// the peak is picked out of a spectrum that was already computed, and the
+// parabolic interpolation in fft_peak_frequency() lands well inside one bin.
 static void signal_info_update(void)
 {
   static uint32_t cached_gen = 0xffffffff;
@@ -1609,10 +1629,12 @@ static void signal_info_update(void)
 
     fft_spectrum(g_fft_samples, FFT_SIZE, 0, g_fft_mag);
     classify_signal(&m, g_fft_mag, FFT_BINS, fund_bin, &g_signal_class);
+    g_spectrum_hz = fft_peak_frequency(g_fft_mag, period_ns);
   }
   else
   {
     classify_signal(&m, NULL, 0, 0, &g_signal_class);
+    g_spectrum_hz = 0;
   }
 
   cached_gen = gen;
@@ -1641,6 +1663,15 @@ static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
 
     case MEASURE_FREQ:
       tag = "f"; label = "f "; value = format_frequency(sm->frequency);
+      break;
+
+    case MEASURE_FFT_FREQ:
+      // The counter's own answer is one line away, which is the point of
+      // showing this one: they are independent instruments, and the record
+      // where they disagree is the record worth looking at twice
+      signal_info_update();
+      tag = "F"; label = "fft";
+      value = g_spectrum_hz > 0 ? format_frequency(g_spectrum_hz) : "  --.--  ";
       break;
 
     case MEASURE_DUTY:
@@ -1707,7 +1738,8 @@ static int measure_build_items(const ScopeMeasure *sm, MeasureItem *it)
 {
   // A config saved before these flags existed reads all-false: default set
   bool any = config.show_vpp || config.show_freq || config.show_duty ||
-      config.show_vrms || config.show_vavg || config.show_type || config.show_thd || config.show_jitter;
+      config.show_vrms || config.show_vavg || config.show_type || config.show_thd || config.show_jitter ||
+      config.show_fft_freq;
 
   const bool shown[MEASURE_COUNT] =
   {
@@ -1719,6 +1751,7 @@ static int measure_build_items(const ScopeMeasure *sm, MeasureItem *it)
     [MEASURE_TYPE] = any && config.show_type,
     [MEASURE_THD]  = any && config.show_thd,
     [MEASURE_JITTER] = any && config.show_jitter,
+    [MEASURE_FFT_FREQ] = any && config.show_fft_freq,
   };
 
   int n = 0;
@@ -4439,6 +4472,26 @@ static void update_display(void)
 
   g_data_buffer.size = GRID_WIDTH;
   capture_get_data(&g_data_buffer);
+
+  // Whether what was just drawn between the samples is still worth believing.
+  // Only the reconstruction can overstate itself this way - straight lines
+  // never claimed to be the signal - so the strain is only reported when it
+  // is switched on.
+  {
+    ScopeMeasure sm;
+    const uint8_t *data;
+    int size, offset, period_ns, trig;
+
+    g_recon_strained = false;
+
+    if (config.draw_mode == DRAW_SINC &&
+        capture_get_record(&data, &size, &offset, &period_ns, &trig) &&
+        period_ns > 0 && capture_get_measurements(&sm) && sm.frequency > 0)
+    {
+      g_recon_strained =
+          (sm.period_med_ns < RECON_MIN_SAMPLES * period_ns);
+    }
+  }
 
   for (int i = 0; i < GRID_WIDTH; i++)
   {

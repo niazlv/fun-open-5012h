@@ -54,10 +54,28 @@ enum
   MEASURE_TYPE,
   MEASURE_THD,
   MEASURE_JITTER,     // period sigma / p-p, from the per-period statistics
+  // The SPECTRUM's answer to the same question, next to the counter's. They
+  // are different instruments and they fail differently: the counter resolves
+  // parts per million at low frequencies and goes blind above about three
+  // samples per period (50.000 MHz on a 125 MS/s record reads exactly
+  // 25.000), while the peak is only as fine as a bin but cannot miss an edge
+  // it never had to find. Where the two disagree, the faster signal is why.
+  MEASURE_FFT_FREQ,
   MEASURE_COUNT,
 };
 
 #define MEASURE_LINE_SLOTS 2
+
+// What to draw between samples once the screen has more pixels than the
+// record has samples. Straight lines are the default because they invent
+// nothing beyond the corner at each sample; the reconstruction is exact for
+// a signal below nyquist and a convincing lie for one above it.
+enum
+{
+  DRAW_LINEAR = 0,
+  DRAW_SINC,
+  DRAW_COUNT,
+};
 
 // Health of the settings store, reported by config_get_state(). FRESH on any
 // boot other than the very first one means the previous session's settings
@@ -177,7 +195,11 @@ typedef struct
   // middle. Carved out of decoder_reserved; false in every config saved
   // before it existed, which is the old behaviour.
   bool     decoder_stop_start;
-  bool     decoder_reserved[1];
+  // The spectrum's frequency as a panel/status metric. Carved out of the last
+  // decoder_reserved byte for the same reason show_jitter was: appending it
+  // to the show_* run above would move every field behind it and make the
+  // store throw away every saved config, calibration included.
+  bool     show_fft_freq;
 
   // Reference level, in mV, that the gain (S) calibration aims at: whatever
   // you can measure accurately and apply to the input. Carved out of padding
@@ -279,7 +301,13 @@ typedef struct
   // entry still loads the ordinary way, vouched for by the entry's own crc.
   uint32_t calib_crc;
 
-  uint32_t padding[1];  // Reduced padding to accommodate new fields
+  // How the trace is drawn between samples when the timebase is zoomed in
+  // past one sample per pixel: DRAW_LINEAR joins them with a straight line,
+  // DRAW_SINC reconstructs the band-limited curve that actually passes
+  // through them. Zero-is-default, so a config saved before this existed
+  // keeps the straight lines. The LAST word of padding[] - a field added
+  // after this one has nowhere to go but a new store version.
+  int      draw_mode;
 
   // The calibration block. Contiguous, and last before crc, on purpose:
   // calib_crc covers exactly the bytes from calib_channel_delta up to crc. A
