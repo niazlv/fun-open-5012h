@@ -30,8 +30,12 @@
 #define EMU_PERIPH_SIZE  0x00030000u     /* APB1 + APB2 + AHB1 blocks in use */
 #define EMU_SCS_BASE     0xE000E000u     /* SysTick, NVIC, SCB               */
 #define EMU_SCS_SIZE     0x1000u
-#define EMU_SIG_BASE     0x1FFF7000u     /* device electronic signature page */
-#define EMU_SIG_SIZE     0x1000u
+/* The system region: boot ROM, the OTP block, and the signature page with the
+ * unique id and the flash size in it. Mapped whole rather than just the
+ * signature page - the flash viewer walks this address space, and an unmapped
+ * hole inside it stops the core dead where the real part would just read. */
+#define EMU_SIG_BASE     0x1FFF0000u
+#define EMU_SIG_SIZE     0x8000u
 
 #define EMU_CPU_HZ       250000000ull    /* what main.c's PLL sets up        */
 #define DMA1_CH2_IRQN    58              /* DMA1_Channel2, see gd32f4xx.h    */
@@ -75,6 +79,11 @@ void board_irq_accepted(int irqn);
 bool board_reset_requested(void);
 /* One line describing the acquisition, for hang reports */
 void board_describe(char *buf, size_t size);
+/* The 8 MB serial NOR part on SPI0, allocated on first use and filled with
+ * 0xff. Handed out whole so a run can be started from a file and saved back
+ * to one; the firmware only ever sees it through the SPI protocol. */
+uint8_t *board_spi_flash(void);
+uint32_t board_spi_flash_size(void);
 int board_late_prescaler_latches(void);
 
 /* Battery, in millivolts. Read back through the modeled ADC0. */

@@ -131,8 +131,10 @@ static void scs_write(uc_engine *uc, uint64_t offset, unsigned size,
 }
 
 //-----------------------------------------------------------------------------
-// The device signature page: read-only, and the only field the firmware wants
-// from it is the flash size in KB at 0x1FFF7A22 (flash_viewer.c).
+// The system region: read-only, and the only field the firmware wants from it
+// is the flash size in KB at 0x1FFF7A22 (flash_viewer.c). The boot ROM below
+// it is not modelled and reads as zero - this emulator boots the firmware
+// directly, so nothing ever executes there.
 static uint64_t sig_read(uc_engine *uc, uint64_t offset, unsigned size, void *ud)
 {
   (void)uc; (void)ud;

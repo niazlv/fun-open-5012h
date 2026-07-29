@@ -155,6 +155,8 @@ static Prescaler g_tim7 = { TIMER7_BASE, "TIMER7", 0, 0, false, 0, 0 };
 /*- Prototypes --------------------------------------------------------------*/
 static void gpio_outputs_changed(int port);
 static void dma_sync(uint64_t now_ns);
+static void spif_select(bool selected);
+static uint8_t spif_byte(uint8_t in);
 
 /*- Implementations ---------------------------------------------------------*/
 
@@ -451,6 +453,204 @@ static void gpio_outputs_changed(int port)
 
   if (port == 0 || port == 1 || port == 2)  // A, B, C carry the relays
     afe_poll();
+
+  if (port == 0)                            // PA3 is the flash chip select
+    spif_select(0 == pin_level(0, 3));
+}
+
+/*- SPI flash ---------------------------------------------------------------*/
+
+/*
+ * The serial NOR part on SPI0, chip select on PA3. Modelled because it is the
+ * only storage on the board the firmware image cannot reach, so anything that
+ * comes to live in it - asset packs, saved waveforms - has to be developable
+ * without the hardware in front of you.
+ *
+ * The JEDEC ID answered here is the one read off the real unit on 2026-07-29
+ * (c8 40 17, GigaDevice, 8 MB), not the W25Q64JV in doc/Hardware.md. A model
+ * that answered ef 40 17 would hide exactly the disagreement that matters.
+ *
+ * Timing is not modelled: a program or an erase completes before the command
+ * that started it returns, and the status register never reports itself busy.
+ * The firmware's waits are bounded and tolerate that; what this model is for
+ * is the protocol and the contents.
+ */
+
+#define SPIF_SIZE       (8u << 20)
+#define SPIF_PAGE       256u
+#define SPIF_SECTOR     4096u
+#define SPIF_BLOCK      65536u
+
+enum
+{
+  SPIF_CMD_PAGE_PROGRAM = 0x02,
+  SPIF_CMD_READ_DATA    = 0x03,
+  SPIF_CMD_READ_STATUS  = 0x05,
+  SPIF_CMD_WRITE_ENABLE = 0x06,
+  SPIF_CMD_ERASE_SECTOR = 0x20,
+  SPIF_CMD_ERASE_BLOCK  = 0xd8,
+  SPIF_CMD_ERASE_CHIP   = 0xc7,
+  SPIF_CMD_JEDEC_ID     = 0x9f,
+};
+
+static const uint8_t g_spif_id[3] = { 0xc8, 0x40, 0x17 };
+
+static struct
+{
+  uint8_t *data;
+  bool selected;
+  bool wel;                     /* write enable latch */
+  int phase;                    /* bytes seen since chip select fell */
+  uint8_t cmd;
+  uint32_t addr;
+} g_spif;
+
+//-----------------------------------------------------------------------------
+uint8_t *board_spi_flash(void)
+{
+  if (!g_spif.data)
+  {
+    g_spif.data = malloc(SPIF_SIZE);
+
+    if (g_spif.data)
+      memset(g_spif.data, 0xff, SPIF_SIZE);
+  }
+
+  return g_spif.data;
+}
+
+//-----------------------------------------------------------------------------
+uint32_t board_spi_flash_size(void)
+{
+  return SPIF_SIZE;
+}
+
+//-----------------------------------------------------------------------------
+static void spif_select(bool selected)
+{
+  if (selected == g_spif.selected)
+    return;
+
+  g_spif.selected = selected;
+
+  if (selected)
+  {
+    g_spif.phase = 0;
+    g_spif.cmd = 0;
+    g_spif.addr = 0;
+  }
+  else if (SPIF_CMD_PAGE_PROGRAM == g_spif.cmd)
+  {
+    // The rising edge is what commits a page program, and the latch clears
+    // with it: the next write has to arm it again.
+    g_spif.wel = false;
+  }
+}
+
+//-----------------------------------------------------------------------------
+// One byte in, one byte out, which is what an SPI frame is. The firmware
+// writes DATA and then reads it back, so the answer to byte N is what the
+// read after write N returns.
+static uint8_t spif_byte(uint8_t in)
+{
+  uint8_t *mem = board_spi_flash();
+  uint8_t out = 0xff;
+  int phase;
+
+  if (!g_spif.selected || !mem)
+    return 0xff;
+
+  phase = g_spif.phase++;
+
+  if (0 == phase)
+  {
+    g_spif.cmd = in;
+
+    switch (in)
+    {
+      case SPIF_CMD_WRITE_ENABLE:
+        g_spif.wel = true;
+        break;
+
+      case SPIF_CMD_ERASE_CHIP:
+        if (g_spif.wel)
+        {
+          memset(mem, 0xff, SPIF_SIZE);
+          g_spif.wel = false;
+          emu_log("SPI flash: chip erase");
+        }
+        break;
+
+      default:
+        break;
+    }
+
+    return 0xff;
+  }
+
+  switch (g_spif.cmd)
+  {
+    case SPIF_CMD_JEDEC_ID:
+      out = (phase <= 3) ? g_spif_id[phase - 1] : 0xff;
+      break;
+
+    // Bit 0 is WIP and bit 1 is WEL. Nothing here is ever in progress.
+    case SPIF_CMD_READ_STATUS:
+      out = g_spif.wel ? 0x02 : 0x00;
+      break;
+
+    case SPIF_CMD_READ_DATA:
+    case SPIF_CMD_PAGE_PROGRAM:
+    case SPIF_CMD_ERASE_SECTOR:
+    case SPIF_CMD_ERASE_BLOCK:
+      if (phase <= 3)
+      {
+        g_spif.addr = (g_spif.addr << 8) | in;
+
+        // The erases carry an address and no data, so they happen as soon as
+        // that address is complete
+        if (3 == phase)
+        {
+          g_spif.addr %= SPIF_SIZE;
+
+          if (SPIF_CMD_ERASE_SECTOR == g_spif.cmd && g_spif.wel)
+          {
+            memset(mem + (g_spif.addr & ~(SPIF_SECTOR - 1)), 0xff, SPIF_SECTOR);
+            g_spif.wel = false;
+          }
+          else if (SPIF_CMD_ERASE_BLOCK == g_spif.cmd && g_spif.wel)
+          {
+            memset(mem + (g_spif.addr & ~(SPIF_BLOCK - 1)), 0xff, SPIF_BLOCK);
+            g_spif.wel = false;
+          }
+        }
+
+        break;
+      }
+
+      if (SPIF_CMD_READ_DATA == g_spif.cmd)
+      {
+        out = mem[g_spif.addr];
+        g_spif.addr = (g_spif.addr + 1) % SPIF_SIZE;
+      }
+      else if (SPIF_CMD_PAGE_PROGRAM == g_spif.cmd && g_spif.wel)
+      {
+        // Programming can only clear bits, and it wraps within the 256 byte
+        // page rather than running on into the next one. Both are the kind of
+        // thing a driver gets wrong once.
+        uint32_t page = g_spif.addr & ~(SPIF_PAGE - 1);
+
+        mem[g_spif.addr] &= in;
+        g_spif.addr = page + ((g_spif.addr + 1) % SPIF_PAGE);
+      }
+
+      break;
+
+    default:
+      break;
+  }
+
+  return out;
 }
 
 /*- CRC ---------------------------------------------------------------------*/
@@ -905,6 +1105,15 @@ uint64_t board_mmio_read(uint64_t address, unsigned size)
         word &= ~(ADC0_CTL1_RSTCLB_Msk | ADC0_CTL1_CLB_Msk | ADC0_CTL1_SWRCST_Msk);
       break;
 
+    // The controller is always ready to shift - there is no baud rate here,
+    // and flash.c's bounded polls would otherwise burn their whole limit per
+    // byte. DATA reads back whatever the chip answered to the byte the
+    // firmware last wrote into it (see the write side).
+    case SPI0_BASE:
+      if (off == offsetof(SPI0_Type, STAT))
+        word = SPI0_STAT_TBE_Msk | SPI0_STAT_RBNE_Msk;
+      break;
+
     default:
       break;
   }
@@ -973,6 +1182,17 @@ void board_mmio_write(uint64_t address, unsigned size, uint64_t value)
 
   switch (base)
   {
+    // A write to DATA is a frame: the byte goes to the chip and the chip's
+    // answer is parked in the same register, which is where the firmware's
+    // next read of it will find it.
+    case SPI0_BASE:
+      if (off == offsetof(SPI0_Type, DATA))
+      {
+        pset(addr, spif_byte((uint8_t)word));
+        return;
+      }
+      break;
+
     case FMC_BASE:
       if (off == offsetof(FMC_Type, KEY))
       {

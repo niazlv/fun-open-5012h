@@ -74,6 +74,7 @@ static void usage(void)
     "  --battery MV       pack voltage in millivolts (default 3950)\n"
     "  --charging         report the charger as connected\n"
     "  --flash <file>     persist the whole flash image here across runs\n"
+    "  --spi-flash <file> contents of the 8 MB SPI part, loaded and saved back\n"
     "  --dump-sram <file> write the 128 KB of main SRAM out at exit\n"
     "  --heartbeat MS     report speed and frame timing every MS of host time\n"
     "  --watchdog MS      report a hang if nothing is drawn for MS of\n"
@@ -453,6 +454,7 @@ int main(int argc, char **argv)
   const char *script = NULL;
   const char *shot = NULL;
   const char *flash_file = NULL;
+  const char *spi_flash_file = NULL;
   const char *dump_sram = NULL;
   int scale = 0;              /* 0 = whatever fits the window being drawn */
   bool headless = false;
@@ -506,6 +508,8 @@ int main(int argc, char **argv)
       emu_battery_charging = true;
     else if (0 == strcmp(a, "--flash") && i + 1 < argc)
       flash_file = argv[++i];
+    else if (0 == strcmp(a, "--spi-flash") && i + 1 < argc)
+      spi_flash_file = argv[++i];
     else if (0 == strcmp(a, "--dump-sram") && i + 1 < argc)
       dump_sram = argv[++i];
     else if (0 == strcmp(a, "--heartbeat") && i + 1 < argc)
@@ -583,6 +587,27 @@ int main(int argc, char **argv)
     }
   }
 
+  // The serial NOR part is a separate image: it is not part of the firmware
+  // and the device keeps it across reflashes, so a run that is meant to see
+  // contents has to be handed them.
+  if (spi_flash_file)
+  {
+    FILE *sf = fopen(spi_flash_file, "rb");
+
+    if (sf)
+    {
+      size_t n = fread(board_spi_flash(), 1, board_spi_flash_size(), sf);
+
+      emu_log("SPI flash: loaded %zu bytes from %s", n, spi_flash_file);
+      fclose(sf);
+    }
+    else
+    {
+      emu_log("SPI flash: %s does not exist yet, starting erased",
+          spi_flash_file);
+    }
+  }
+
   cpu_reset();
 
   emu_log("firmware %s (%ld bytes)", fw_path, size);
@@ -636,6 +661,18 @@ int main(int argc, char **argv)
     {
       fwrite(emu_flash + EMU_CFG_OFFSET, 1, EMU_CFG_SIZE, ff);
       fclose(ff);
+    }
+  }
+
+  if (spi_flash_file)
+  {
+    FILE *sf = fopen(spi_flash_file, "wb");
+
+    if (sf)
+    {
+      fwrite(board_spi_flash(), 1, board_spi_flash_size(), sf);
+      fclose(sf);
+      emu_log("SPI flash: wrote %s", spi_flash_file);
     }
   }
 
