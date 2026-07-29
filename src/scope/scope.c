@@ -7573,6 +7573,15 @@ void scope_buttons_handler(int buttons)
     if (repeat || scope_calibration_mode)
       return;
 
+    // Both work on a record: the glitch finder scans one, and a 50% level is
+    // a trigger setting for a sweep that is not running here
+    if (g_roll_active)
+    {
+      toast_show();
+      lcd_puts(GRID_LEFT, STATUS_LINE_Y, "Not while rolling - zoom in first");
+      return;
+    }
+
     if (shift)
       find_glitch();
     else
@@ -7583,15 +7592,6 @@ void scope_buttons_handler(int buttons)
   {
     if (repeat || scope_calibration_mode)
       return;
-
-    // Both work on a record: the glitch finder scans one, and a 50% level is
-    // a trigger setting for a sweep that is not running here
-    if (g_roll_active)
-    {
-      toast_show();
-      lcd_puts(GRID_LEFT, STATUS_LINE_Y, "Not while rolling - zoom in first");
-      return;
-    }
 
     if (shift)
     {

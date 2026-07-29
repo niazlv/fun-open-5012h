@@ -1051,6 +1051,42 @@ void capture_set_horizontal_parameters(int sr_divider, int trigger_offset)
 }
 
 //-----------------------------------------------------------------------------
+// How far the acquisition has got toward the first record captured under the
+// CURRENT timing, both in milliseconds of sweep. Equal once one has landed.
+//
+// Worth showing because a record is 98304 samples however long that takes: at
+// the slow end of the timebase a whole sweep is 51 s, and for all of it the
+// spectrum, the measurements and the decoders are reading the record from
+// BEFORE the timebase moved - with nothing on screen to say so. The trace has
+// the same problem and has always looked obviously stale; a spectrum does
+// not, it just quietly answers the wrong question.
+void capture_record_fill(int *done_ms, int *total_ms)
+{
+  int total = (int)(((int64_t)CAPTURE_BUFFER_SIZE * g_sample_period) / 1000000);
+  int64_t bytes;
+
+  if (total < 1)
+    total = 1;
+
+  *total_ms = total;
+
+  // A stopped record is whatever it is and is not going to improve; a
+  // generation past the re-timing means a sweep has completed since
+  if (g_stopped || g_buffer_generation != g_retime_gen)
+  {
+    *done_ms = total;
+    return;
+  }
+
+  bytes = g_sweep_bytes;
+
+  if (bytes > CAPTURE_BUFFER_SIZE)
+    bytes = CAPTURE_BUFFER_SIZE;
+
+  *done_ms = (int)((bytes * total) / CAPTURE_BUFFER_SIZE);
+}
+
+//-----------------------------------------------------------------------------
 void capture_set_trigger_level(int level)
 {
   g_trigger_level = (level * CALIB_MULTIPLIER) / config.calib_vs_mult[config.vertical_scale] + ZERO_POINT;
@@ -1085,42 +1121,6 @@ void capture_set_trigger_mode(int mode)
 
   if (!g_stopped)
     dma_start();
-}
-
-//-----------------------------------------------------------------------------
-// How far the acquisition has got toward the first record captured under the
-// CURRENT timing, both in milliseconds of sweep. Equal once one has landed.
-//
-// Worth showing because a record is 98304 samples however long that takes: at
-// the slow end of the timebase a whole sweep is 51 s, and for all of it the
-// spectrum, the measurements and the decoders are reading the record from
-// BEFORE the timebase moved - with nothing on screen to say so. The trace has
-// the same problem and has always looked obviously stale; a spectrum does
-// not, it just quietly answers the wrong question.
-void capture_record_fill(int *done_ms, int *total_ms)
-{
-  int total = (int)(((int64_t)CAPTURE_BUFFER_SIZE * g_sample_period) / 1000000);
-  int64_t bytes;
-
-  if (total < 1)
-    total = 1;
-
-  *total_ms = total;
-
-  // A stopped record is whatever it is and is not going to improve; a
-  // generation past the re-timing means a sweep has completed since
-  if (g_stopped || g_buffer_generation != g_retime_gen)
-  {
-    *done_ms = total;
-    return;
-  }
-
-  bytes = g_sweep_bytes;
-
-  if (bytes > CAPTURE_BUFFER_SIZE)
-    bytes = CAPTURE_BUFFER_SIZE;
-
-  *done_ms = (int)((bytes * total) / CAPTURE_BUFFER_SIZE);
 }
 
 //-----------------------------------------------------------------------------

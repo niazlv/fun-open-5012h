@@ -197,8 +197,8 @@ DEFINES += \
   -DGIT_BRANCH=\"$(GIT_BRANCH)\" \
   -DGIT_USER=\"$(GIT_USER)\" \
   -DBUILD_USER=\"$(BUILD_USER)\" \
-  -DFIRMWARE_NAME=\"Open-5012H\" \
-  -DFIRMWARE_VERSION=\"1.0.0\" \
+  -DFIRMWARE_NAME=\"github.com/niazlv/fun-open-5012H\" \
+  -DFIRMWARE_VERSION=\"2.2.5\" \
 
 CFLAGS += $(INCLUDES) $(DEFINES)
 
