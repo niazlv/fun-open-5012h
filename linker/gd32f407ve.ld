@@ -107,6 +107,15 @@ SECTIONS
     *trend.o(.bss*)
     *measure.o(.bss*)
     . = ALIGN(8);
+
+    /* A floor, because how much the instrument happens to declare is not a
+       promise to anyone borrowing it. DOOM needs 8K of column cache and all
+       of the level's flats resident at once - 21K for a --scale 2 pack - and
+       the four modules above came to 88 bytes short of that, so DOOM stopped
+       starting and said "flats too big". Nothing in the scope changed on
+       purpose; its .bss simply drifted below what the borrower needed, and
+       nothing was watching. The ASSERT below still guards the stack. */
+    . = MAX(., __borrowed_start + 29K + 512);
     __borrowed_end = .;
   } > tcm
 
