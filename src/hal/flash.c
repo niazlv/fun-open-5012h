@@ -93,6 +93,32 @@ enum
   STATUS_WEL           = (1 << 1),   // write enable latch
 };
 
+/*
+ * Two clocks, and the reason there are two.
+ *
+ * PSC is the SPI0 prescaler off APB2, which is SYSCLK/2 = 125 MHz at the
+ * overclock: 1 is /4 = 31.25 MHz and 2 is /8 = 15.625 MHz.
+ *
+ * Reads run at 31.25. That was measured, not assumed - it is what took DOOM's
+ * texture streaming from 17 fps to 20-55, and every read since has been
+ * byte-exact, including a 100 KB pack the renderer would show the seams of.
+ *
+ * Writes do not. At 31.25 a page program arrives corrupted, differently every
+ * time and always with bits missing rather than added, which is the signature
+ * of a part sampling MOSI before it has settled. It is specific to the long
+ * unbroken data phase: the three address bytes of a read go out on the same
+ * wire at the same rate and land correctly every time, so this is not a bus
+ * that cannot do 31.25 - it is 256 bytes of it back to back that cannot.
+ *
+ * Found on 2026-07-29 by pushing the same 256 byte pattern three times and
+ * getting three different answers - 3, 44 and 130 bytes correct.
+ *
+ * Costing nothing: a page program is 256 bytes, and the part then spends up to
+ * 3 ms inside itself finishing it. Halving the clock adds 4 us to that.
+ */
+#define SPI_PSC_READ    1u
+#define SPI_PSC_WRITE   2u
+
 // One byte at 15.6 MHz is ~0.5 us, a few hundred core cycles. Anything past
 // this many polls means the peripheral is not shifting at all.
 #define POLL_LIMIT      100000
@@ -153,6 +179,22 @@ static bool spi_xfer(uint8_t out, uint8_t *in)
 }
 
 //-----------------------------------------------------------------------------
+// The prescaler, changed between frames and never during one. SPIEN goes down
+// first: the manual says the control bits are only to be written while the
+// peripheral is disabled, and a prescaler that changes mid-shift is a clock
+// glitch the part would read as a bit.
+static void spi_clock(uint32_t psc)
+{
+  uint32_t ctl = SPI0->CTL0;
+
+  if (psc == ((ctl >> SPI0_CTL0_PSC_Pos) & 7u))
+    return;
+
+  SPI0->CTL0 = ctl & ~SPI0_CTL0_SPIEN_Msk;
+  SPI0->CTL0 = (ctl & ~(7u << SPI0_CTL0_PSC_Pos)) | (psc << SPI0_CTL0_PSC_Pos);
+}
+
+//-----------------------------------------------------------------------------
 // One command, with an optional 24-bit address and an optional data phase in
 // either direction. Chip select frames the whole thing: these parts latch a
 // command on the falling edge of CS and abandon it on the rising one, which is
@@ -164,6 +206,11 @@ static bool flash_command(uint8_t cmd, uint32_t addr, bool has_addr,
 
   if (STATE_DEAD == g_state)
     return false;
+
+  // Only a page program has a data phase this machine drives, and it is the
+  // one thing on this bus that does not survive the full rate. Everything
+  // else - the reads, the erases, the one-byte commands - stays fast.
+  spi_clock((CMD_PAGE_PROGRAM == cmd) ? SPI_PSC_WRITE : SPI_PSC_READ);
 
   HAL_GPIO_CS_clr();
 
@@ -286,7 +333,9 @@ void flash_init(void)
 
   RCU->APB2EN_b.SPI0EN = 1;
 
-  // PCLK/4. APB2 is SYSCLK/2, so 31.25 MHz at the 250 MHz overclock.
+  // PCLK/4 to start with, which is the rate everything but a page program
+  // runs at - see SPI_PSC_READ and the note beside it. APB2 is SYSCLK/2, so
+  // 31.25 MHz at the 250 MHz overclock.
   //
   // This was PCLK/8 while reads went through the plain 03h command, which
   // these parts rate for 50-80 MHz and which did not deserve the risk at a
@@ -294,7 +343,8 @@ void flash_init(void)
   // read (0Bh) instead, rated past 100 MHz, so the limit is the controller
   // rather than the flash - and DOOM streams its textures through here, where
   // the difference is milliseconds a frame.
-  SPI0->CTL0 = SPI0_CTL0_SPIEN_Msk | SPI0_CTL0_MSTMOD_Msk | (1/*PCLK/4*/ << SPI0_CTL0_PSC_Pos) |
+  SPI0->CTL0 = SPI0_CTL0_SPIEN_Msk | SPI0_CTL0_MSTMOD_Msk |
+      (SPI_PSC_READ << SPI0_CTL0_PSC_Pos) |
       SPI0_CTL0_CKPH_Msk | SPI0_CTL0_CKPL_Msk | SPI0_CTL0_SWNSSEN_Msk | SPI0_CTL0_SWNSS_Msk;
 
   delay_cycles(100);
