@@ -19,16 +19,19 @@
 
 #ifndef EMU_NO_SDL
 #include <SDL.h>
+#include "panel.h"
 #endif
 
 /*- Variables ---------------------------------------------------------------*/
 static bool g_headless = true;
+static bool g_bare;
 static int g_scale = 3;
 
 #ifndef EMU_NO_SDL
 static SDL_Window *g_window;
 static SDL_Renderer *g_renderer;
 static SDL_Texture *g_texture;
+static uint32_t g_mouse_btn;    /* what the pointer is currently holding down */
 #endif
 
 /* The panel keys, laid out the way the instrument's front panel is. The bit
@@ -63,10 +66,15 @@ static const KeyMap g_keys[] =
 /*- Implementations ---------------------------------------------------------*/
 
 //-----------------------------------------------------------------------------
-bool video_init(int scale, bool headless, const char *title)
+bool video_init(int scale, bool headless, bool bare, const char *title)
 {
   g_headless = headless;
-  g_scale = scale > 0 ? scale : 3;
+  g_bare = bare;
+
+  // Without a magnification asked for, pick one that fits: the panel is twice
+  // the height of the screen it surrounds, so what suits a bare window is too
+  // tall for one with a body around it.
+  g_scale = scale > 0 ? scale : (bare ? 3 : 2);
 
 #ifdef EMU_NO_SDL
   (void)title;
@@ -84,7 +92,9 @@ bool video_init(int scale, bool headless, const char *title)
   }
 
   g_window = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED,
-      SDL_WINDOWPOS_CENTERED, LCD_W * g_scale, LCD_H * g_scale, 0);
+      SDL_WINDOWPOS_CENTERED,
+      (g_bare ? LCD_W : PANEL_W) * g_scale,
+      (g_bare ? LCD_H : PANEL_H) * g_scale, 0);
 
   if (!g_window)
   {
@@ -146,6 +156,22 @@ bool video_pump(void)
         }
       }
     }
+
+    // Clicking a key on the drawn panel. The release clears whatever the press
+    // took hold of rather than whatever is under the pointer now, so dragging
+    // off a key still lets go of it.
+    if (!g_bare && ev.type == SDL_MOUSEBUTTONDOWN &&
+        ev.button.button == SDL_BUTTON_LEFT)
+    {
+      g_mouse_btn = panel_hit(g_scale, ev.button.x, ev.button.y);
+      buttons |= g_mouse_btn;
+    }
+
+    if (ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT)
+    {
+      buttons &= ~g_mouse_btn;
+      g_mouse_btn = 0;
+    }
   }
 
   board_set_buttons(buttons);
@@ -163,7 +189,23 @@ void video_present(void)
 
   SDL_UpdateTexture(g_texture, NULL, st7789_fb, LCD_W * (int)sizeof(uint16_t));
   SDL_RenderClear(g_renderer);
-  SDL_RenderCopy(g_renderer, g_texture, NULL, NULL);
+
+  if (g_bare)
+  {
+    SDL_RenderCopy(g_renderer, g_texture, NULL, NULL);
+  }
+  else
+  {
+    SDL_Rect screen =
+    {
+      PANEL_SCREEN_X * g_scale, PANEL_SCREEN_Y * g_scale,
+      LCD_W * g_scale, LCD_H * g_scale
+    };
+
+    panel_draw(g_renderer, g_scale, board_get_buttons());
+    SDL_RenderCopy(g_renderer, g_texture, NULL, &screen);
+  }
+
   SDL_RenderPresent(g_renderer);
 #endif
 }

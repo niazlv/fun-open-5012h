@@ -127,7 +127,9 @@ int64_t sig_probe_uv(uint64_t t_ns);
 uint8_t sig_adc_sample(uint64_t t_ns, const AfeState *afe, int converter);
 
 /*- video.c -----------------------------------------------------------------*/
-bool video_init(int scale, bool headless, const char *title);
+/* scale 0 picks one that fits; bare drops the drawn front panel and shows the
+ * screen on its own, the way this used to look */
+bool video_init(int scale, bool headless, bool bare, const char *title);
 bool video_pump(void);                  /* false when the window was closed  */
 void video_present(void);
 void video_shutdown(void);

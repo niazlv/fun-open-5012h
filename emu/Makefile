@@ -118,6 +118,7 @@ SRCS = \
   src/st7789.c \
   src/siggen.c \
   src/video.c \
+  src/panel.c \
 
 OBJS = $(addprefix $(BUILD)/, $(notdir $(SRCS:.c=.o)))
 

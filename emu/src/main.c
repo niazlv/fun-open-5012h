@@ -65,7 +65,8 @@ static void usage(void)
     "\n"
     "  --signal <spec>    what is on the probe (default: sine f=1k vpp=1)\n"
     "  --afe <spec>       the instrument's own imperfections\n"
-    "  --scale N          window magnification (default 3)\n"
+    "  --scale N          window magnification (default: one that fits)\n"
+    "  --bare             the screen on its own, without the front panel\n"
     "  --headless         no window; use with --script\n"
     "  --script <file>    run a key script, then exit\n"
     "  --shot <file.png>  screenshot on exit\n"
@@ -108,6 +109,9 @@ static void usage(void)
     "              wait <ms> | shot <file.png> | signal <spec> | echo <text>\n"
     "  keys: stop up edge mode f1 right acdc auto 50 menu trigup left\n"
     "        trigdn save trig down f2 shift\n"
+    "\n"
+    "the window draws the front panel: the keys can be clicked, and each one\n"
+    "carries the keyboard key that does the same thing\n"
     "\n"
     "window keys: arrows, space=STOP, a=AUTO, m=MODE, e=EDGE, c=AC/DC,\n"
     "             t=TRIG, s=SAVE, 5=50%%, enter=MENU, F1, F2, shift, F12=shot\n");
@@ -448,8 +452,9 @@ int main(int argc, char **argv)
   const char *shot = NULL;
   const char *flash_file = NULL;
   const char *dump_sram = NULL;
-  int scale = 3;
+  int scale = 0;              /* 0 = whatever fits the window being drawn */
   bool headless = false;
+  bool bare = false;
   int run_ms = 0;
   char err[128] = "";
   FILE *f;
@@ -483,6 +488,8 @@ int main(int argc, char **argv)
     }
     else if (0 == strcmp(a, "--scale") && i + 1 < argc)
       scale = atoi(argv[++i]);
+    else if (0 == strcmp(a, "--bare"))
+      bare = true;
     else if (0 == strcmp(a, "--headless"))
       headless = true;
     else if (0 == strcmp(a, "--script") && i + 1 < argc)
@@ -583,7 +590,7 @@ int main(int argc, char **argv)
   g_start_host = host_seconds();
   g_next_heartbeat = g_start_host + g_heartbeat_ms / 1000.0;
 
-  video_init(scale, headless, "fun-open-5012h");
+  video_init(scale, headless, bare, "fun-open-5012h");
 
   if (script)
   {
