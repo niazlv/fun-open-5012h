@@ -1394,6 +1394,405 @@ static void swd_g_switch(SwdGen *g)       // 0xE79E, least significant first
     swd_g_bit(g, (0xE79E >> k) & 1);
 }
 
+// USB 1.x on ONE wire of the pair. NRZI - a zero is a transition, a one is
+// the absence of one - with a zero stuffed in after every six ones, and an
+// EOP that is SE0 for two bit times. SE0 is both wires low, so on whichever
+// wire this is, it is low: the generator draws the wire and not the pair,
+// which is exactly what the instrument sees.
+typedef struct
+{
+  uint8_t *buf; int size; double t; double sps_bit;
+  int level;        // where the line is now
+  int j;            // ...and which level is J on this wire
+  int ones;         // consecutive ones, for the stuffing
+  double jit;       // edge jitter, in samples, either way
+  double pj;        // ...as applied to the previous edge, so the two agree
+  int noise;        // amplitude noise, in ADC counts
+} UsbGen;
+
+// Its own transcription of the two polynomials, so that a decoder agreeing
+// with itself is not what the tests check. What pins them down is external:
+// a SETUP token to address 0 endpoint 0 is 2D 00 10 on the wire and a
+// zero-length DATA0 is C3 00 00, and both are asserted below.
+static uint8_t tst_usb_crc5(uint32_t v, int bits)
+{
+  uint8_t c = 0x1F;
+
+  for (int i = 0; i < bits; i++)
+  {
+    uint8_t x = (uint8_t)(((v >> i) ^ c) & 1);
+
+    c >>= 1;
+
+    if (x)
+      c ^= 0x14;
+  }
+
+  return (uint8_t)(~c & 0x1F);
+}
+
+static uint16_t tst_usb_crc16(const uint8_t *d, int n)
+{
+  uint16_t c = 0xFFFF;
+
+  for (int i = 0; i < n; i++)
+  {
+    c ^= d[i];
+
+    for (int k = 0; k < 8; k++)
+      c = (c & 1) ? (uint16_t)((c >> 1) ^ 0xA001) : (uint16_t)(c >> 1);
+  }
+
+  return (uint16_t)~c;
+}
+
+static void usb_g(UsbGen *g, uint8_t *buf, int size, double period_ns,
+    double rate, int j_high)
+{
+  g->buf = buf;
+  g->size = size;
+  g->sps_bit = 1e9 / rate / period_ns;
+  g->t = 30 * g->sps_bit;
+  g->j = j_high;
+  g->level = j_high;
+  g->ones = 0;
+  g->jit = 0.0;
+  g->pj = 0.0;
+  g->noise = 0;
+
+  memset(buf, j_high ? 200 : 56, (size_t)size);   // the bus at rest, at J
+}
+
+// One held level. The jitter moves the edge at the END of the segment and is
+// carried into the next one's start, so the boundaries stay shared and the
+// nominal bit time never drifts - which is the point: what is being tested is
+// an edge measured a sample late, not a transmitter running at the wrong rate.
+static void usb_g_hold(UsbGen *g, int level, double bits)
+{
+  double j = (g->jit > 0.0)
+      ? ((rand() / (double)RAND_MAX) * 2.0 - 1.0) * g->jit : 0.0;
+  int a = (int)(g->t + g->pj + 0.5);
+  int e = (int)(g->t + g->sps_bit * bits + j + 0.5);
+
+  for (int i = a; i < e && i < g->size; i++)
+  {
+    int v = (level ? 200 : 56) +
+        (g->noise ? (rand() % (2 * g->noise + 1)) - g->noise : 0);
+
+    g->buf[i] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+  }
+
+  g->pj = j;
+  g->level = level;
+  g->t += g->sps_bit * bits;
+}
+
+static void usb_g_bit(UsbGen *g, int b)
+{
+  if (!b)
+    g->level = !g->level;                 // a zero is a transition
+
+  usb_g_hold(g, g->level, 1.0);
+
+  g->ones = b ? (g->ones + 1) : 0;
+
+  if (6 == g->ones)                       // ...and six ones force one
+  {
+    g->level = !g->level;
+    usb_g_hold(g, g->level, 1.0);
+    g->ones = 0;
+  }
+}
+
+static void usb_g_byte(UsbGen *g, uint8_t v)
+{
+  for (int k = 0; k < 8; k++)
+    usb_g_bit(g, (v >> k) & 1);           // least significant bit first
+}
+
+// SYNC: 00000001, which from an idle J draws K J K J K J K K
+static void usb_g_sync(UsbGen *g)
+{
+  g->ones = 0;
+
+  for (int k = 0; k < 7; k++)
+    usb_g_bit(g, 0);
+
+  usb_g_bit(g, 1);
+}
+
+// EOP: two bit times of SE0 - low on either wire - then J, then the gap
+static void usb_g_eop(UsbGen *g, double gap_bits)
+{
+  usb_g_hold(g, 0, 2.0);
+  usb_g_hold(g, g->j, 1.0 + gap_bits);
+}
+
+static void usb_g_token(UsbGen *g, uint8_t pid, int addr, int ep, double gap)
+{
+  uint32_t v = (uint32_t)((addr & 0x7F) | ((ep & 0x0F) << 7));
+  uint32_t f = v | ((uint32_t)tst_usb_crc5(v, 11) << 11);
+
+  usb_g_sync(g);
+  usb_g_byte(g, pid);
+  usb_g_byte(g, (uint8_t)(f & 0xFF));
+  usb_g_byte(g, (uint8_t)((f >> 8) & 0xFF));
+  usb_g_eop(g, gap);
+}
+
+static void usb_g_sof(UsbGen *g, int frame, double gap)
+{
+  uint32_t v = (uint32_t)(frame & 0x7FF);
+  uint32_t f = v | ((uint32_t)tst_usb_crc5(v, 11) << 11);
+
+  usb_g_sync(g);
+  usb_g_byte(g, 0xA5);
+  usb_g_byte(g, (uint8_t)(f & 0xFF));
+  usb_g_byte(g, (uint8_t)((f >> 8) & 0xFF));
+  usb_g_eop(g, gap);
+}
+
+// A data packet with a CRC16 chosen by the caller: usb_g_data passes the
+// right one, and the tests that want a broken packet pass a wrong one
+static void usb_g_data_crc(UsbGen *g, uint8_t pid, const uint8_t *d, int n,
+    uint16_t crc, double gap)
+{
+  usb_g_sync(g);
+  usb_g_byte(g, pid);
+
+  for (int i = 0; i < n; i++)
+    usb_g_byte(g, d[i]);
+
+  usb_g_byte(g, (uint8_t)(crc & 0xFF));
+  usb_g_byte(g, (uint8_t)(crc >> 8));
+  usb_g_eop(g, gap);
+}
+
+static void usb_g_data(UsbGen *g, uint8_t pid, const uint8_t *d, int n,
+    double gap)
+{
+  usb_g_data_crc(g, pid, d, n, tst_usb_crc16(d, n), gap);
+}
+
+static void usb_g_hs(UsbGen *g, uint8_t pid, double gap)
+{
+  usb_g_sync(g);
+  usb_g_byte(g, pid);
+  usb_g_eop(g, gap);
+}
+
+// USB Power Delivery on CC. BMC: a transition at every bit boundary, and a
+// one carries a second one in the middle of the bit. So a zero draws one run
+// of a unit interval and a one draws two of half - and the code says nothing
+// about levels, which is why the generator's starting level is arbitrary and
+// the decoder must not care.
+typedef struct
+{
+  uint8_t *buf; int size; double t; double sps_ui;
+  int level;
+  double jit; double pj; int noise;
+} PdGen;
+
+// Its own transcription of the 4b5b table and the polynomial, so that a
+// decoder agreeing with itself is not what the tests check. The external
+// anchor is CRC32("123456789") = 0xCBF43926, asserted below.
+static const uint8_t tst_pd_4b5b[16] =
+{
+  0x1E, 0x09, 0x14, 0x15, 0x0A, 0x0B, 0x0E, 0x0F,
+  0x12, 0x13, 0x16, 0x17, 0x1A, 0x1B, 0x1C, 0x1D,
+};
+
+#define TST_K_SYNC1 0x18
+#define TST_K_SYNC2 0x11
+#define TST_K_SYNC3 0x06
+#define TST_K_RST1  0x07
+#define TST_K_RST2  0x19
+#define TST_K_EOP   0x0D
+
+static uint32_t tst_pd_crc32(const uint8_t *d, int n)
+{
+  uint32_t c = 0xFFFFFFFFu;
+
+  for (int i = 0; i < n; i++)
+  {
+    c ^= d[i];
+
+    for (int k = 0; k < 8; k++)
+      c = (c & 1u) ? ((c >> 1) ^ 0xEDB88320u) : (c >> 1);
+  }
+
+  return ~c;
+}
+
+static void pd_g(PdGen *g, uint8_t *buf, int size, double period_ns,
+    double rate, int level)
+{
+  g->buf = buf;
+  g->size = size;
+  g->sps_ui = 1e9 / rate / period_ns;
+  g->t = 8 * g->sps_ui;
+  g->level = level;
+  g->jit = 0.0;
+  g->pj = 0.0;
+  g->noise = 0;
+
+  // CC at rest sits at its Rp/Rd divider level and does not swing at all;
+  // 128 is the middle of the range the thresholder will find
+  memset(buf, 128, (size_t)size);
+}
+
+static void pd_g_hold(PdGen *g, int level, double uis)
+{
+  double j = (g->jit > 0.0)
+      ? ((rand() / (double)RAND_MAX) * 2.0 - 1.0) * g->jit : 0.0;
+  int a = (int)(g->t + g->pj + 0.5);
+  int e = (int)(g->t + g->sps_ui * uis + j + 0.5);
+
+  for (int i = a; i < e && i < g->size; i++)
+  {
+    int v = (level ? 190 : 66) +
+        (g->noise ? (rand() % (2 * g->noise + 1)) - g->noise : 0);
+
+    g->buf[i] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+  }
+
+  g->pj = j;
+  g->level = level;
+  g->t += g->sps_ui * uis;
+}
+
+// One BMC bit: the level always flips at the boundary, and a one flips again
+// halfway through
+static void pd_g_bit(PdGen *g, int b)
+{
+  if (b)
+  {
+    pd_g_hold(g, g->level, 0.5);
+    g->level = !g->level;
+    pd_g_hold(g, g->level, 0.5);
+  }
+  else
+  {
+    pd_g_hold(g, g->level, 1.0);
+  }
+
+  g->level = !g->level;
+}
+
+// A five-bit symbol, most significant bit of the table entry first
+static void pd_g_sym(PdGen *g, uint8_t code)
+{
+  for (int k = 4; k >= 0; k--)
+    pd_g_bit(g, (code >> k) & 1);
+}
+
+static void pd_g_byte(PdGen *g, uint8_t v)
+{
+  pd_g_sym(g, tst_pd_4b5b[v & 0x0F]);        // the low nibble goes first
+  pd_g_sym(g, tst_pd_4b5b[(v >> 4) & 0x0F]);
+}
+
+// 64 bits of alternating 0 and 1, which is what the unit interval is measured
+// off and what carries nothing else
+static void pd_g_preamble(PdGen *g)
+{
+  for (int k = 0; k < 32; k++)
+  {
+    pd_g_bit(g, 0);
+    pd_g_bit(g, 1);
+  }
+}
+
+static void pd_g_os(PdGen *g, const uint8_t *k)
+{
+  for (int i = 0; i < 4; i++)
+    pd_g_sym(g, k[i]);
+}
+
+static void pd_g_idle(PdGen *g, double uis)
+{
+  // The transmitter drives the last bit's TRAILING edge before it lets go of
+  // CC, and it has to: without that edge the final bit has no boundary and is
+  // not a bit at all. On a hard reset - which is an ordered set and nothing
+  // else - that edge is the difference between seeing the event and not.
+  pd_g_hold(g, g->level, 0.5);
+
+  int a = (int)(g->t + g->pj + 0.5);
+  int e = (int)(g->t + g->sps_ui * uis + 0.5);
+
+  for (int i = a; i < e && i < g->size; i++)
+    g->buf[i] = 128;                         // ...and then it lets go
+
+  g->pj = 0.0;
+  g->t += g->sps_ui * uis;
+}
+
+// A whole message: preamble, ordered set, header, objects, CRC32, EOP.
+// `crc_over` lets a test send a checksum that is not the right one.
+static void pd_g_msg_crc(PdGen *g, const uint8_t *os, uint16_t hdr,
+    const uint32_t *obj, int ndo, uint32_t crc, double gap)
+{
+  uint8_t body[2 + 7 * 4];
+  int n = 0;
+
+  body[n++] = (uint8_t)(hdr & 0xFF);
+  body[n++] = (uint8_t)(hdr >> 8);
+
+  for (int i = 0; i < ndo; i++)
+  {
+    body[n++] = (uint8_t)(obj[i] & 0xFF);
+    body[n++] = (uint8_t)(obj[i] >> 8);
+    body[n++] = (uint8_t)(obj[i] >> 16);
+    body[n++] = (uint8_t)(obj[i] >> 24);
+  }
+
+  pd_g_preamble(g);
+  pd_g_os(g, os);
+
+  for (int i = 0; i < n; i++)
+    pd_g_byte(g, body[i]);
+
+  for (int i = 0; i < 4; i++)
+    pd_g_byte(g, (uint8_t)(crc >> (8 * i)));
+
+  pd_g_sym(g, TST_K_EOP);
+  pd_g_idle(g, gap);
+}
+
+static void pd_g_msg(PdGen *g, const uint8_t *os, uint16_t hdr,
+    const uint32_t *obj, int ndo, double gap)
+{
+  uint8_t body[2 + 7 * 4];
+  int n = 0;
+
+  body[n++] = (uint8_t)(hdr & 0xFF);
+  body[n++] = (uint8_t)(hdr >> 8);
+
+  for (int i = 0; i < ndo; i++)
+  {
+    body[n++] = (uint8_t)(obj[i] & 0xFF);
+    body[n++] = (uint8_t)(obj[i] >> 8);
+    body[n++] = (uint8_t)(obj[i] >> 16);
+    body[n++] = (uint8_t)(obj[i] >> 24);
+  }
+
+  pd_g_msg_crc(g, os, hdr, obj, ndo, tst_pd_crc32(body, n), gap);
+}
+
+// The header as the specification lays it out
+static uint16_t tst_pd_hdr(int type, int ndo, int id, int rev, int src, int dfp)
+{
+  return (uint16_t)((type & 0x1F) | ((dfp ? 1 : 0) << 5) | ((rev & 3) << 6) |
+      ((src ? 1 : 0) << 8) | ((id & 7) << 9) | ((ndo & 7) << 12));
+}
+
+// A fixed-supply Power Data Object: volts in fifty-millivolt units, amps in
+// ten-milliamp ones
+static uint32_t tst_pd_fixed(int mv, int ma)
+{
+  return ((uint32_t)(mv / 50) << 10) | (uint32_t)(ma / 10);
+}
+
 static double fn_sine(double ph, void *arg)     { (void)arg; return sin(2 * M_PI * ph); }
 static double fn_square(double ph, void *arg)   { double d = *(double *)arg; return ph < d ? 1.0 : -1.0; }
 static double fn_triangle(double ph, void *arg) { (void)arg; return ph < 0.5 ? (4 * ph - 1) : (3 - 4 * ph); }
@@ -7400,6 +7799,695 @@ int main(void)
       check_near("dali is not swd",
           swd_decode(buf, SIZE, 0, 20000, &scratch, &lr) > 0 &&
           !lr.ambiguous, 0, 0);
+    }
+
+    // ================================= USB =================================
+    //
+    // One probe on a differential pair, which is the SPI and SWD predicament
+    // again - and USB answers it better than either does, because NRZI puts
+    // the data in the TRANSITIONS and both wires therefore carry the same
+    // bits. What the missing wire costs is SE0, so the EOP is invisible, so a
+    // data packet's length is not knowable from the waveform at all. Finding
+    // it is the CRC16's job here, and that is what these first check.
+    printf("usb full speed at 125 MS/s, a control transfer:\n");
+    {
+      UsbGen g;
+      char lab[16];
+      int gs, gl;
+      // The eight bytes every enumeration begins with: GET_DESCRIPTOR(Device)
+      static const uint8_t setup[8] =
+          { 0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x40, 0x00 };
+
+      usb_g(&g, buf, SIZE, 8.0, 12e6, 1);   // full speed, J high: this is D+
+      usb_g_token(&g, 0x2D, 0, 0, 4.0);     // SETUP, address 0, endpoint 0
+      usb_g_data(&g, 0xC3, setup, 8, 4.0);  // DATA0
+      usb_g_hs(&g, 0xD2, 20.0);             // ACK
+
+      int n = logic_decode(buf, SIZE, 0, 8, PROTO_AUTO, &scratch, &lr);
+      const UsbAnalysis *a = usb_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_USB, 0);
+      check_near("full speed", lr.rate, 12000000, 0);
+      check_near("three packets", a->packets, 3, 0);
+      check_near("two of them CRC-confirmed", a->crc_ok, 2, 0);
+      check_near("so it is sure", a->sure, 1, 0);
+      check_near("...and not ambiguous", lr.ambiguous, 0, 0);
+      check_near("no errors", lr.errors, 0, 0);
+      check_near("the probe is on D+", a->dplus, 1, 0);
+      check_near("bytes: 3 token, 11 data, 1 handshake", n, 15, 0);
+
+      // These three are known OUTSIDE this file: the SETUP token that opens
+      // every enumeration goes out as 2D 00 10. A wrong CRC5 shows up here
+      // and nowhere else, the generator and the decoder agreeing being no
+      // evidence about either.
+      check_near("SETUP token PID", lr.bytes[0], 0x2D, 0);
+      check_near("...address and endpoint both zero", lr.bytes[1], 0x00, 0);
+      check_near("...and the CRC5 the wire really carries", lr.bytes[2], 0x10, 0);
+
+      check_near("DATA0 PID", lr.bytes[3], 0xC3, 0);
+      check_near("bmRequestType", lr.bytes[4], 0x80, 0);
+      check_near("bRequest GET_DESCRIPTOR", lr.bytes[5], 0x06, 0);
+      check_near("wValue: device descriptor", lr.bytes[7], 0x01, 0);
+      check_near("wLength", lr.bytes[10], 0x40, 0);
+      check_near("eight payload bytes, found by the CRC16",
+          a->pkt[1].ndata, 8, 0);
+      check_near("ACK", lr.bytes[14], 0xD2, 0);
+
+      usb_byte_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("the PID is named", !strcmp(lab, "SETUP"), 1, 0);
+      usb_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("the token reads as one thing",
+          !strcmp(lab, "adr0 ep0"), 1, 0);
+      usb_byte_label(a, 14, lr.bytes[14], lab, sizeof(lab));
+      check_near("and the handshake", !strcmp(lab, "ACK"), 1, 0);
+
+      // Two bytes that are one eleven-bit field and a checksum are shown as
+      // one, the way a CAN identifier and a 1-Wire temperature are
+      usb_group_at(a, 1, &gs, &gl);
+      check_near("the token groups", gs, 1, 0);
+      check_near("...as two", gl, 2, 0);
+      usb_group_at(a, 13, &gs, &gl);
+      check_near("so does the CRC16", gs, 12, 0);
+      check_near("...as two", gl, 2, 0);
+      usb_group_at(a, 5, &gs, &gl);
+      check_near("a payload byte stands alone", gl, 1, 0);
+      usb_group_at(a, 0, &gs, &gl);
+      check_near("...and so does a PID", gl, 1, 0);
+    }
+
+    // The other external anchor, and the one that pins the CRC16's seed and
+    // its inversion: a data packet with no payload at all is C3 00 00.
+    printf("usb: a zero-length DATA0 is C3 00 00:\n");
+    {
+      UsbGen g;
+      char lab[16];
+
+      usb_g(&g, buf, SIZE, 8.0, 12e6, 1);
+      usb_g_token(&g, 0x69, 5, 1, 4.0);        // IN, address 5, endpoint 1
+      usb_g_data(&g, 0xC3, NULL, 0, 20.0);
+
+      usb_decode(buf, SIZE, 0, 8, &scratch, &lr);
+      const UsbAnalysis *a = usb_analysis();
+
+      check_near("IN token", lr.bytes[0], 0x69, 0);
+      check_near("DATA0 PID", lr.bytes[3], 0xC3, 0);
+      check_near("the CRC over nothing is zero", lr.bytes[4], 0x00, 0);
+      check_near("...both bytes of it", lr.bytes[5], 0x00, 0);
+      check_near("and no payload came with it", a->pkt[1].ndata, 0, 0);
+      check_near("five bytes in all", lr.count, 6, 0);
+
+      usb_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("the address and endpoint", !strcmp(lab, "adr5 ep1"), 1, 0);
+    }
+
+    // Low speed is 666 ns to a bit, so it decodes at any timebase the record
+    // is long enough for - and the level that means J is the opposite one,
+    // which is the only thing that tells D+ from D- on a single wire.
+    printf("usb low speed at 31.25 MS/s:\n");
+    {
+      UsbGen g;
+      char lab[16];
+
+      usb_g(&g, buf, SIZE, 32.0, 1.5e6, 0); // low speed, J low: still D+
+      usb_g_sof(&g, 1234, 6.0);
+      usb_g_token(&g, 0x69, 3, 1, 5.0);     // IN, address 3, endpoint 1
+      usb_g_hs(&g, 0x5A, 40.0);             // NAK: the device has nothing
+
+      int n = logic_decode(buf, SIZE, 0, 32, PROTO_AUTO, &scratch, &lr);
+      const UsbAnalysis *a = usb_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_USB, 0);
+      check_near("low speed", lr.rate, 1500000, 0);
+      check_near("...and J low at low speed is still D+", a->dplus, 1, 0);
+      check_near("three packets", a->packets, 3, 0);
+      check_near("a start of frame among them", a->sof, 1, 0);
+      check_near("seven bytes", n, 7, 0);
+      check_near("SOF PID", lr.bytes[0], 0xA5, 0);
+      check_near("IN token", lr.bytes[3], 0x69, 0);
+      check_near("NAK", lr.bytes[6], 0x5A, 0);
+
+      usb_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("the frame number reads out",
+          !strcmp(lab, "frame 1234"), 1, 0);
+    }
+
+    printf("usb: the other wire of the pair carries the same bits:\n");
+    {
+      UsbGen g;
+      static const uint8_t pay[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
+
+      usb_g(&g, buf, SIZE, 8.0, 12e6, 0);   // full speed with J LOW: that is D-
+      usb_g_token(&g, 0xE1, 12, 2, 4.0);    // OUT
+      usb_g_data(&g, 0x4B, pay, 4, 20.0);   // DATA1
+
+      usb_decode(buf, SIZE, 0, 8, &scratch, &lr);
+      const UsbAnalysis *a = usb_analysis();
+
+      check_near("the probe is on D-", a->dplus, 0, 0);
+      check_near("OUT token", lr.bytes[0], 0xE1, 0);
+      check_near("address 12", a->pkt[0].addr, 12, 0);
+      check_near("endpoint 2", a->pkt[0].ep, 2, 0);
+      check_near("DATA1 PID", lr.bytes[3], 0x4B, 0);
+      check_near("the payload is byte for byte the same",
+          memcmp(lr.bytes + 4, pay, 4), 0, 0);
+      check_near("both CRCs agree", a->crc_ok, 2, 0);
+    }
+
+    // On this wire the EOP has NO edge to it: SE0 is low and J is low, so the
+    // line simply stays down from the last data bit into the next packet's
+    // sync. Nothing marks the end of the packet at all - which is the case
+    // the CRC16 search exists for, and the one a decoder written around an
+    // EOP cannot read.
+
+    printf("usb: a payload of ones, which is what stuffing is for:\n");
+    {
+      UsbGen g;
+      // 0xFF 0xFF 0xFF is twenty-four ones in a row and costs four stuff
+      // bits, so this packet's bytes are NOT eight bit times of wire each
+      static const uint8_t ones[6] = { 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0x81 };
+
+      usb_g(&g, buf, SIZE, 8.0, 12e6, 1);
+      usb_g_token(&g, 0x2D, 1, 0, 4.0);
+      usb_g_data(&g, 0xC3, ones, 6, 20.0);
+
+      usb_decode(buf, SIZE, 0, 8, &scratch, &lr);
+      const UsbAnalysis *a = usb_analysis();
+
+      check_near("six payload bytes", a->pkt[1].ndata, 6, 0);
+      check_near("every one of them back",
+          memcmp(lr.bytes + 4, ones, 6), 0, 0);
+      check_near("the CRC agrees", a->crc_ok, 2, 0);
+      // The stuff bits are wire and not data, so the packet's bytes do not
+      // divide its span evenly. That is why there is no bit grid for USB.
+      check_near("the packet is longer on the wire than 9 bytes",
+          lr.end[11] - lr.pos[3] > 9 * 8 * 10, 1, 0);
+    }
+
+    printf("usb: six zero bits in a payload draw a sync and are not one:\n");
+    {
+      UsbGen g;
+      // A zero is a transition, so a payload byte of 0x00 puts eight one-bit
+      // runs on the wire - the exact shape a SYNC is found by, with a hold
+      // either side of it. Only knowing where the packet ENDED tells them
+      // apart, which is why the search for the next packet resumes behind
+      // this one rather than scanning through it.
+      static const uint8_t trap[6] = { 0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF };
+
+      usb_g(&g, buf, SIZE, 8.0, 12e6, 1);
+      usb_g_token(&g, 0x2D, 2, 0, 4.0);
+      usb_g_data(&g, 0xC3, trap, 6, 4.0);
+      usb_g_hs(&g, 0xD2, 20.0);
+
+      usb_decode(buf, SIZE, 0, 8, &scratch, &lr);
+      const UsbAnalysis *a = usb_analysis();
+
+      check_near("three packets, not five", a->packets, 3, 0);
+      check_near("the payload is whole",
+          memcmp(lr.bytes + 4, trap, 6), 0, 0);
+      check_near("and the ACK behind it is still found", lr.bytes[12], 0xD2, 0);
+    }
+
+    printf("usb: a data packet whose CRC does not agree:\n");
+    {
+      UsbGen g;
+      static const uint8_t pay[4] = { 1, 2, 3, 4 };
+
+      usb_g(&g, buf, SIZE, 8.0, 12e6, 1);
+      usb_g_token(&g, 0x2D, 7, 0, 4.0);
+      usb_g_data_crc(&g, 0xC3, pay, 4, 0x1234, 20.0);
+
+      usb_decode(buf, SIZE, 0, 8, &scratch, &lr);
+      const UsbAnalysis *a = usb_analysis();
+
+      check_near("the token still checks out", a->pkt[0].crc_ok, 1, 0);
+      check_near("the data packet does not", a->pkt[1].crc_ok, 0, 0);
+      // Reported anyway, the way SWD reports a transaction whose data parity
+      // failed: hiding it would hide the one fault worth seeing
+      check_near("...and is reported anyway", a->pkt[1].ndata, 4, 0);
+      check_near("with the bytes that were on the wire", lr.bytes[4], 1, 0);
+      check_near("...to the last of them", lr.bytes[7], 4, 0);
+      check_near("one error counted", lr.errors, 1, 0);
+      // One good CRC is still one good CRC, so the record is USB
+      check_near("the record is still USB", a->sure, 1, 0);
+    }
+
+    // The claim the whole full-speed case rests on: at 10.4 samples to a bit
+    // there is about half a bit of slack in every run length, so an edge
+    // measured a sample or two out of place still rounds to the right number
+    // of bit times. Worth a test rather than an argument.
+    printf("usb full speed with jitter on every edge and noise on the line:\n");
+    {
+      UsbGen g;
+      static const uint8_t pay[8] =
+          { 0x12, 0xFF, 0x00, 0xA5, 0x5A, 0xFF, 0xFF, 0x7E };
+
+      srand(20260729);
+
+      usb_g(&g, buf, SIZE, 8.0, 12e6, 1);
+      g.jit = 1.5;                          // +-1.5 samples on every edge...
+      g.noise = 14;                         // ...and +-14 counts on the level
+      usb_g_token(&g, 0x2D, 21, 3, 4.0);
+      usb_g_data(&g, 0xC3, pay, 8, 4.0);
+      usb_g_hs(&g, 0xD2, 20.0);
+
+      usb_decode(buf, SIZE, 0, 8, &scratch, &lr);
+      const UsbAnalysis *a = usb_analysis();
+
+      check_near("three packets even so", a->packets, 3, 0);
+      check_near("both CRCs still agree", a->crc_ok, 2, 0);
+      check_near("address 21", a->pkt[0].addr, 21, 0);
+      check_near("endpoint 3", a->pkt[0].ep, 3, 0);
+      check_near("the payload is byte for byte the same",
+          memcmp(lr.bytes + 4, pay, 8), 0, 0);
+      check_near("and no errors were invented", lr.errors, 0, 0);
+    }
+
+    // The tightest legal spacing, on the wire where it hurts: at full speed
+    // on D+ the idle is HIGH, so between two packets there is no long hold
+    // anywhere - three bit times of J and the next sync begins. The reader
+    // therefore runs straight out of one packet and into the next, and the
+    // only thing that says where the first one stopped is its CRC16.
+    printf("usb: back-to-back packets with the minimum gap:\n");
+    {
+      UsbGen g;
+      static const uint8_t pay[3] = { 0x01, 0x02, 0x03 };
+
+      usb_g(&g, buf, SIZE, 8.0, 12e6, 1);
+      usb_g_token(&g, 0x2D, 4, 0, 2.0);     // two bit times: the floor
+      usb_g_data(&g, 0xC3, pay, 3, 2.0);
+      usb_g_hs(&g, 0xD2, 2.0);
+      usb_g_token(&g, 0x69, 4, 0, 20.0);    // IN, and room to breathe after it
+
+      usb_decode(buf, SIZE, 0, 8, &scratch, &lr);
+      const UsbAnalysis *a = usb_analysis();
+
+      check_near("all four packets", a->packets, 4, 0);
+      check_near("three CRCs", a->crc_ok, 3, 0);
+      check_near("SETUP", lr.bytes[0], 0x2D, 0);
+      check_near("DATA0", lr.bytes[3], 0xC3, 0);
+      check_near("...whose payload stopped where the CRC16 said",
+          a->pkt[1].ndata, 3, 0);
+      check_near("ACK", lr.bytes[9], 0xD2, 0);
+      check_near("and the IN behind it", lr.bytes[10], 0x69, 0);
+    }
+
+    printf("usb: the record ends inside a packet:\n");
+    {
+      UsbGen g;
+      static const uint8_t pay[16] =
+          { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+
+      usb_g(&g, buf, SIZE, 8.0, 12e6, 1);
+      usb_g_token(&g, 0x2D, 9, 0, 4.0);
+      g.t = SIZE - 40 * g.sps_bit;          // ...and room for part of one more
+      usb_g_data(&g, 0xC3, pay, 16, 4.0);
+
+      usb_decode(buf, SIZE, 0, 8, &scratch, &lr);
+      const UsbAnalysis *a = usb_analysis();
+
+      check_near("two packets", a->packets, 2, 0);
+      check_near("the token checks out", a->pkt[0].crc_ok, 1, 0);
+      check_near("the data packet is cut", a->pkt[1].cut, 1, 0);
+      // ...and carries no CRC, because the bytes that would be one never
+      // arrived. Calling the last two of what DID arrive a checksum would be
+      // inventing a field out of a window that closed early.
+      check_near("...so no CRC is claimed for it", a->pkt[1].has_crc, 0, 0);
+      check_near("what arrived is still reported", a->pkt[1].ndata > 0, 1, 0);
+      check_near("starting at the first payload byte", lr.bytes[4], 1, 0);
+      // One good CRC is one good CRC: the record is USB whatever the window did
+      check_near("the record is still USB", a->sure, 1, 0);
+    }
+
+    printf("usb full speed needs the fastest timebase:\n");
+    {
+      UsbGen g;
+      static const uint8_t setup[8] =
+          { 0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x40, 0x00 };
+
+      usb_g(&g, buf, SIZE, 8.0, 12e6, 1);
+      usb_g_token(&g, 0x2D, 0, 0, 4.0);
+      usb_g_data(&g, 0xC3, setup, 8, 20.0);
+      check_near("at 125 MS/s it reads: 10.4 samples to a bit",
+          usb_decode(buf, SIZE, 0, 8, &scratch, &lr) > 0, 1, 0);
+
+      // The same traffic sampled four times slower is 2.6 samples to a bit,
+      // and there is no reading of it - so none is offered. A decoder that
+      // answered here would be inventing the difference between one bit time
+      // and two out of the edge quantisation.
+      usb_g(&g, buf, SIZE, 32.0, 12e6, 1);
+      usb_g_token(&g, 0x2D, 0, 0, 4.0);
+      usb_g_data(&g, 0xC3, setup, 8, 20.0);
+      check_near("at 31.25 MS/s it does not",
+          usb_decode(buf, SIZE, 0, 32, &scratch, &lr), 0, 0);
+    }
+
+    printf("usb rejects the rest:\n");
+    {
+      double half = 0.5;
+
+      synth_uart(buf, SIZE, 1000.0, 9600.0, "MILKV-UART-TEST", 20000.0);
+      check_near("uart is not usb",
+          usb_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      check_near("sine is not usb",
+          usb_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      // The adversarial one: a 6 MHz square at 8 ns is one full-speed bit
+      // time to a run, every run, for the whole record. Every six of them
+      // are a sync pattern's six - and none of them is a sync, because a
+      // sync has the line HOLDING either side of it and this never holds.
+      synth(buf, SIZE, 0, fn_square, &half, 6e6, 8.0, 90.0, ZERO_POINT);
+      check_near("a 6 MHz square is not usb",
+          usb_decode(buf, SIZE, 0, 8, &scratch, &lr), 0, 0);
+
+      // ...and the same at low speed's bit time
+      synth(buf, SIZE, 0, fn_square, &half, 750e3, 32.0, 90.0, ZERO_POINT);
+      check_near("a 750 kHz square is not usb either",
+          usb_decode(buf, SIZE, 0, 32, &scratch, &lr), 0, 0);
+    }
+
+    // ============================== USB-PD =================================
+    //
+    // After USB this one is a relief: CC is single-ended by design, so there
+    // is no pair to half-see and the end of a message is an EOP symbol on the
+    // same wire rather than a line state one probe cannot reach.
+    static const uint8_t TST_SOP[4] =
+        { TST_K_SYNC1, TST_K_SYNC1, TST_K_SYNC1, TST_K_SYNC2 };
+    static const uint8_t TST_SOPP[4] =
+        { TST_K_SYNC1, TST_K_SYNC1, TST_K_SYNC3, TST_K_SYNC3 };
+    static const uint8_t TST_HRST[4] =
+        { TST_K_RST1, TST_K_RST1, TST_K_RST1, TST_K_RST2 };
+
+    printf("usb-pd: the polynomial, against its published check value:\n");
+    {
+      // Everything below leans on the generator's CRC32 being right, and the
+      // generator and the decoder agreeing proves nothing about either. This
+      // does: 0xCBF43926 over "123456789" is the value this polynomial is
+      // defined by, and it is the same one the decoder computes.
+      check_near("crc32(\"123456789\")",
+          (double)tst_pd_crc32((const uint8_t *)"123456789", 9),
+          (double)0xCBF43926u, 0);
+    }
+
+    // The message anyone points a probe at CC to read - and the one that
+    // motivated this decoder walking the samples itself. Five supplies is
+    // about 550 level runs, and the shared split stops at 512.
+    printf("usb-pd: a charger advertising five supplies, at 64 ns:\n");
+    {
+      PdGen g;
+      char lab[16];
+      int gs, gl;
+      uint32_t pdo[5] =
+      {
+        tst_pd_fixed(5000, 3000), tst_pd_fixed(9000, 3000),
+        tst_pd_fixed(12000, 3000), tst_pd_fixed(15000, 3000),
+        tst_pd_fixed(20000, 5000),
+      };
+
+      pd_g(&g, buf, SIZE, 64.0, 300e3, 1);
+      pd_g_msg(&g, TST_SOP, tst_pd_hdr(1, 5, 0, 2, 1, 1), pdo, 5, 40.0);
+
+      int n = logic_decode(buf, SIZE, 0, 64, PROTO_AUTO, &scratch, &lr);
+      const PdAnalysis *a = pd_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_PD, 0);
+      check_near("300 kbit", lr.rate, 300000, 2000);
+      check_near("one message", a->msgs, 1, 0);
+      check_near("its CRC32 agrees", a->crc_ok, 1, 0);
+      check_near("so it is sure", a->sure, 1, 0);
+      check_near("...and not ambiguous", lr.ambiguous, 0, 0);
+      check_near("no errors", lr.errors, 0, 0);
+      check_near("bytes: header, five objects, CRC32", n, 26, 0);
+      check_near("five objects", a->obj_count, 5, 0);
+
+      // THE point of the streaming walk: this message does not fit the run
+      // split every other decoder here reads, and decodes anyway
+      int mid = 0;
+      check_near("the shared split ran out of runs on this record",
+          logic_runs(buf, SIZE, 0, &scratch, &mid), LOGIC_MAX_RUNS, 0);
+
+      pd_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("the message is named", !strcmp(lab, "Src_Cap"), 1, 0);
+      pd_byte_label(a, 5, lr.bytes[5], lab, sizeof(lab));
+      check_near("the first supply is the mandatory one",
+          !strcmp(lab, "5.0V 3.0A"), 1, 0);
+      pd_byte_label(a, 21, lr.bytes[21], lab, sizeof(lab));
+      check_near("...and the last is what the charger is sold on",
+          !strcmp(lab, "20.0V 5.0A"), 1, 0);
+
+      check_near("the capabilities obey their own ordering rules",
+          a->caps_ordered, 1, 0);
+      check_near("no request in this record to check against them",
+          a->req_check, -1, 0);
+
+      // Four bytes are one object and are shown as one
+      pd_group_at(a, 19, &gs, &gl);
+      check_near("an object groups", gs, 18, 0);
+      check_near("...as four", gl, 4, 0);
+      pd_group_at(a, 0, &gs, &gl);
+      check_near("the header groups as two", gl, 2, 0);
+      pd_group_at(a, 24, &gs, &gl);
+      check_near("and the CRC32 as four", gs, 22, 0);
+    }
+
+    // The whole question and the whole answer in one record, which is what
+    // "did they agree" actually needs
+    printf("usb-pd: a negotiation - caps, request, and both acknowledged:\n");
+    {
+      PdGen g;
+      char lab[16];
+      uint32_t pdo[4] =
+      {
+        tst_pd_fixed(5000, 3000), tst_pd_fixed(9000, 3000),
+        tst_pd_fixed(15000, 3000), tst_pd_fixed(20000, 5000),
+      };
+      // Object 4 at 5.0 A: exactly what that supply offers
+      uint32_t rdo[1] = { (4u << 28) | (500u << 10) | 500u };
+
+      pd_g(&g, buf, SIZE, 128.0, 300e3, 1);
+      pd_g_msg(&g, TST_SOP, tst_pd_hdr(1, 4, 0, 2, 1, 1), pdo, 4, 10.0);
+      pd_g_msg(&g, TST_SOP, tst_pd_hdr(1, 0, 0, 2, 0, 0), NULL, 0, 10.0);
+      pd_g_msg(&g, TST_SOP, tst_pd_hdr(2, 1, 1, 2, 0, 0), rdo, 1, 10.0);
+      pd_g_msg(&g, TST_SOP, tst_pd_hdr(1, 0, 1, 2, 1, 1), NULL, 0, 20.0);
+
+      pd_decode(buf, SIZE, 0, 128, &scratch, &lr);
+      const PdAnalysis *a = pd_analysis();
+
+      check_near("four messages", a->msgs, 4, 0);
+      check_near("every CRC32 agrees", a->crc_ok, 4, 0);
+      check_near("two of them were acknowledged", a->acked, 2, 0);
+      check_near("the capabilities were seen", a->caps_seen, 1, 0);
+      check_near("...and are in order", a->caps_ordered, 1, 0);
+      check_near("the request names object 4", a->req_pos, 4, 0);
+      check_near("...and it agrees with what was offered", a->req_check, 1, 0);
+      check_near("which is 20 V", a->req_mv, 20000, 0);
+      check_near("at 5 A", a->req_ma, 5000, 0);
+      check_near("so the header says so",
+          NULL != strstr(lr.info, "20.0V5.0A"), 1, 0);
+
+      pd_byte_label(a, a->msg[1].first + 1, 0, lab, sizeof(lab));
+      check_near("the acknowledgement is named",
+          !strcmp(lab, "GoodCRC"), 1, 0);
+      pd_byte_label(a, a->msg[2].first + 1, 0, lab, sizeof(lab));
+      check_near("and the request", !strcmp(lab, "Request"), 1, 0);
+      pd_byte_label(a, a->msg[2].first + 5, 0, lab, sizeof(lab));
+      check_near("...which asked for #4 at 5 A",
+          !strcmp(lab, "#4 5.0A"), 1, 0);
+    }
+
+    printf("usb-pd: a request for more than the supply offers:\n");
+    {
+      PdGen g;
+      uint32_t pdo[2] =
+          { tst_pd_fixed(5000, 3000), tst_pd_fixed(20000, 3000) };
+      uint32_t rdo[1] = { (2u << 28) | (500u << 10) | 500u };  // 5 A of a 3 A
+
+      pd_g(&g, buf, SIZE, 128.0, 300e3, 1);
+      pd_g_msg(&g, TST_SOP, tst_pd_hdr(1, 2, 0, 2, 1, 1), pdo, 2, 10.0);
+      pd_g_msg(&g, TST_SOP, tst_pd_hdr(2, 1, 1, 2, 0, 0), rdo, 1, 20.0);
+
+      pd_decode(buf, SIZE, 0, 128, &scratch, &lr);
+      const PdAnalysis *a = pd_analysis();
+
+      check_near("both messages check out", a->crc_ok, 2, 0);
+      // Every checksum agreed and the traffic still does not add up. That is
+      // the distinction worth drawing: the CRC says the bits arrived, and
+      // this says the two ends were asking for different things.
+      check_near("...and they still disagree", a->req_check, 0, 0);
+      check_near("the header says so", NULL != strstr(lr.info, "req!"), 1, 0);
+    }
+
+    printf("usb-pd: capabilities that break their own ordering rule:\n");
+    {
+      PdGen g;
+      // Not starting at 5 V, which every sink is entitled to
+      uint32_t pdo[2] =
+          { tst_pd_fixed(9000, 3000), tst_pd_fixed(20000, 5000) };
+
+      pd_g(&g, buf, SIZE, 128.0, 300e3, 1);
+      pd_g_msg(&g, TST_SOP, tst_pd_hdr(1, 2, 0, 2, 1, 1), pdo, 2, 20.0);
+
+      pd_decode(buf, SIZE, 0, 128, &scratch, &lr);
+      const PdAnalysis *a = pd_analysis();
+
+      check_near("the CRC32 still agrees", a->crc_ok, 1, 0);
+      check_near("...and the ordering rule does not", a->caps_ordered, 0, 0);
+    }
+
+    // BMC puts the data in the transitions, so which level a run sits at
+    // means nothing at all - an inverting probe must change no byte
+    printf("usb-pd: the line inverted reads the same bytes:\n");
+    {
+      PdGen g;
+      uint8_t up[32];
+      int n_up;
+      uint32_t pdo[2] =
+          { tst_pd_fixed(5000, 3000), tst_pd_fixed(20000, 5000) };
+
+      pd_g(&g, buf, SIZE, 64.0, 300e3, 1);
+      pd_g_msg(&g, TST_SOP, tst_pd_hdr(1, 2, 0, 2, 1, 1), pdo, 2, 20.0);
+      n_up = pd_decode(buf, SIZE, 0, 64, &scratch, &lr);
+      memcpy(up, lr.bytes, (size_t)n_up);
+
+      pd_g(&g, buf, SIZE, 64.0, 300e3, 0);          // started the other way up
+      pd_g_msg(&g, TST_SOP, tst_pd_hdr(1, 2, 0, 2, 1, 1), pdo, 2, 20.0);
+
+      check_near("the same byte count", pd_decode(buf, SIZE, 0, 64, &scratch,
+          &lr), n_up, 0);
+      check_near("and the same bytes", memcmp(lr.bytes, up, (size_t)n_up),
+          0, 0);
+      check_near("...still confirmed", pd_analysis()->crc_ok, 1, 0);
+    }
+
+    printf("usb-pd: a message addressed to the cable, not the partner:\n");
+    {
+      PdGen g;
+      char lab[16];
+      uint32_t vdo[1] = { 0xFF008001u };
+
+      pd_g(&g, buf, SIZE, 128.0, 300e3, 1);
+      pd_g_msg(&g, TST_SOPP, tst_pd_hdr(15, 1, 0, 2, 0, 1), vdo, 1, 20.0);
+
+      pd_decode(buf, SIZE, 0, 128, &scratch, &lr);
+      const PdAnalysis *a = pd_analysis();
+
+      check_near("the ordered set says SOP'", a->msg[0].sop, PD_SOP_P, 0);
+      pd_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      // The tick is not decoration: the same message type to the cable and to
+      // the port partner are different conversations, and the header does not
+      // say which one this is
+      check_near("...and the name carries the tick",
+          !strcmp(lab, "'Vendor_Def"), 1, 0);
+    }
+
+    printf("usb-pd: a hard reset, which has no message behind it:\n");
+    {
+      PdGen g;
+      uint32_t pdo[2] =
+          { tst_pd_fixed(5000, 3000), tst_pd_fixed(20000, 5000) };
+
+      pd_g(&g, buf, SIZE, 128.0, 300e3, 1);
+      pd_g_preamble(&g);
+      pd_g_os(&g, TST_HRST);
+      pd_g_idle(&g, 30.0);
+      pd_g_msg(&g, TST_SOP, tst_pd_hdr(1, 2, 0, 2, 1, 1), pdo, 2, 20.0);
+
+      pd_decode(buf, SIZE, 0, 128, &scratch, &lr);
+      const PdAnalysis *a = pd_analysis();
+
+      check_near("the reset is counted", a->resets, 1, 0);
+      // ...and produces no bytes, because there are none: an ordered set and
+      // then silence is the whole of what a hard reset is on the wire
+      check_near("the capabilities behind it still decode", a->msgs, 1, 0);
+      check_near("...and check out", a->crc_ok, 1, 0);
+      check_near("the header says a reset went past",
+          NULL != strstr(lr.info, "rst"), 1, 0);
+    }
+
+    printf("usb-pd: a message whose CRC32 does not agree:\n");
+    {
+      PdGen g;
+      uint32_t pdo[2] =
+          { tst_pd_fixed(5000, 3000), tst_pd_fixed(20000, 5000) };
+
+      pd_g(&g, buf, SIZE, 128.0, 300e3, 1);
+      pd_g_msg_crc(&g, TST_SOP, tst_pd_hdr(1, 2, 0, 2, 1, 1), pdo, 2,
+          0xDEADBEEFu, 20.0);
+
+      check_near("it is still reported",
+          pd_decode(buf, SIZE, 0, 128, &scratch, &lr) > 0, 1, 0);
+
+      const PdAnalysis *a = pd_analysis();
+
+      check_near("one message", a->msgs, 1, 0);
+      check_near("...whose CRC32 does not agree", a->crc_ok, 0, 0);
+      check_near("counted as an error", lr.errors, 1, 0);
+      // Nothing in this record is confirmed, so auto mode must not take it -
+      // an ordered set is twenty prescribed bits and that is a filter, not a
+      // proof
+      check_near("and it is not sure", a->sure, 0, 0);
+      check_near("...so auto passes over it", logic_decode(buf, SIZE, 0, 128,
+          PROTO_AUTO, &scratch, &lr) > 0 && lr.proto == PROTO_PD, 0, 0);
+    }
+
+    printf("usb-pd: jitter on every edge and noise on the line:\n");
+    {
+      PdGen g;
+      uint32_t pdo[3] =
+      {
+        tst_pd_fixed(5000, 3000), tst_pd_fixed(9000, 3000),
+        tst_pd_fixed(20000, 5000),
+      };
+
+      srand(20260730);
+
+      pd_g(&g, buf, SIZE, 128.0, 300e3, 1);
+      g.jit = 2.0;                                  // +-2 samples of 26
+      g.noise = 20;
+      pd_g_msg(&g, TST_SOP, tst_pd_hdr(1, 3, 0, 2, 1, 1), pdo, 3, 20.0);
+
+      pd_decode(buf, SIZE, 0, 128, &scratch, &lr);
+      const PdAnalysis *a = pd_analysis();
+
+      check_near("the message still comes back", a->msgs, 1, 0);
+      check_near("...confirmed", a->crc_ok, 1, 0);
+      check_near("three objects", a->obj_count, 3, 0);
+      check_near("and the last one is right", (double)a->obj[2],
+          (double)tst_pd_fixed(20000, 5000), 0);
+
+      char lab[16];
+
+      pd_byte_label(a, 13, lr.bytes[13], lab, sizeof(lab));
+      check_near("...and reads out as what it is",
+          !strcmp(lab, "20.0V 5.0A"), 1, 0);
+    }
+
+    printf("usb-pd rejects the rest:\n");
+    {
+      double half = 0.5;
+
+      synth_uart(buf, SIZE, 1000.0, 9600.0, "MILKV-UART-TEST", 20000.0);
+      check_near("uart is not pd",
+          pd_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      check_near("sine is not pd",
+          pd_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      // The adversarial one: a 300 kHz square at 64 ns puts HALF a unit
+      // interval in every run, for the whole record. The unit time is right,
+      // the run lengths are right, and it is not BMC - because BMC alternates
+      // half-runs with whole ones and this never holds one for a whole bit.
+      synth(buf, SIZE, 0, fn_square, &half, 300e3, 64.0, 90.0, ZERO_POINT);
+      check_near("a 300 kHz square is not pd",
+          pd_decode(buf, SIZE, 0, 64, &scratch, &lr), 0, 0);
+
+      // ...and at the other unit time, where the rate gate turns it away
+      // before the record is walked at all
+      synth(buf, SIZE, 0, fn_square, &half, 150e3, 64.0, 90.0, ZERO_POINT);
+      check_near("a 150 kHz square is not pd either",
+          pd_decode(buf, SIZE, 0, 64, &scratch, &lr), 0, 0);
     }
 
     // ----- structured decoders must all reject a sine -----

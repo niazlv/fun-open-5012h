@@ -58,6 +58,8 @@ const char *logic_proto_name(proto_t proto)
     case PROTO_KNX:     return "KNX";
     case PROTO_SWO:     return "ITM";
     case PROTO_SWD:     return "SWD";
+    case PROTO_USB:     return "USB";
+    case PROTO_PD:      return "USB-PD";
     case PROTO_SIRC:    return "SIRC";
     case PROTO_PPM:     return "PPM";
     case PROTO_RAW:     return "RAW";
@@ -285,6 +287,24 @@ int logic_decode(const uint8_t *data, int size, int offset, int period_ns,
     // at nearly the same rate. Nothing else on the list works in the range
     // of bit times DShot uses, so first costs nobody anything.
     { PROTO_DSHOT,   dshot_decode },
+    // Third, and it costs the ones behind it nothing: USB runs at 1.5 or 12
+    // Mbit and at no other rate, so on any record too coarse for both this
+    // decoder is two comparisons and gone. Where it does run, a packet is
+    // reported only once a CRC5 or a CRC16 has agreed with it - the SYNC
+    // shape and the PID's complement narrow the field, and the CRC is what
+    // decides - so like CAN and DShot it cannot take a record that is not its
+    // own. It has to come ahead of the shape-matchers for the reason SWO
+    // does: 12 Mbit on the wire is single-digit samples per run, which is
+    // territory the strip and infrared readers will happily make bits out of.
+    { PROTO_USB,     usb_decode },
+    // Beside USB and for the same reason: a message is reported only once its
+    // CRC32 has agreed with it, so it can take nobody else's record. Cheaper
+    // to try than any of them, too - Power Delivery runs at 300 kbit and at
+    // no other rate, so a record whose unit time is outside that band leaves
+    // after one comparison. It is the only decoder here that walks the
+    // samples itself rather than the shared run split; see pd_decode.c for
+    // why the split cannot hold the one message worth reading.
+    { PROTO_PD,      pd_decode },
     { PROTO_NEC,     nec_decode },
     // Sony, and the Samsung and RCA remotes with it. It has to come ahead of
     // RC5 and not behind it, because the confusion between them runs one way

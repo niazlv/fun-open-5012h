@@ -142,6 +142,8 @@ SRCS += \
   ../src/decode/knx_decode.c \
   ../src/decode/swo_decode.c \
   ../src/decode/swd_decode.c \
+  ../src/decode/usb_decode.c \
+  ../src/decode/pd_decode.c \
   ../src/decode/sirc_decode.c \
   ../src/decode/ppm_decode.c \
 
@@ -216,6 +218,8 @@ SIZE_OPTIMIZED = \
   $(BUILD)/bk_disasm.o \
   $(BUILD)/bk_load.o \
   $(BUILD)/bk_port.o \
+  $(BUILD)/pd_decode.o \
+  $(BUILD)/usb_decode.o \
 
 $(SIZE_OPTIMIZED): CFLAGS += -Os
 

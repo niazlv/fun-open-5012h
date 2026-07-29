@@ -64,12 +64,18 @@ typedef enum
   // SPI, the protocol checks itself, so a transaction that reads clean is
   // confirmed rather than merely plausible.
   PROTO_SWD,
+  // USB 1.x, low and full speed, off ONE wire of the differential pair.
+  // NRZI, bit stuffing, and a packet that carries its own CRC.
+  PROTO_USB,
   // Sony SIRC: the OTHER pulse-coded infrared family. A 4:1 leader, then 12,
   // 15 or 20 bits LSB first - so the command arrives before the address.
   PROTO_SIRC,
   // CPPM: every channel of an RC link on one wire. The value is the time from
   // one separator pulse to the next, and a long sync gap closes the frame.
   PROTO_PPM,
+  // USB Power Delivery on the CC wire. BMC at 300 kbit, 4b5b symbols, and a
+  // CRC32 over every message - what a USB-C charger and its load agreed on.
+  PROTO_PD,
   PROTO_COUNT,
 } proto_t;
 
@@ -705,6 +711,79 @@ typedef struct
   SwdTx    tx[SWD_MAX_TX];
 } SwdAnalysis;
 
+// USB 1.x off one wire of the pair. What a packet IS decides its whole shape,
+// and the PID is the only thing that says which - a token is three bytes, a
+// handshake is one, and a data packet is however many the CRC16 says.
+typedef enum
+{
+  USB_P_NONE = 0,
+  USB_P_TOKEN,      // OUT/IN/SETUP/PING: address, endpoint and a CRC5
+  USB_P_SOF,        // the same shape, carrying a frame number instead
+  USB_P_DATA,       // DATA0/DATA1/DATA2/MDATA: payload and a CRC16
+  USB_P_HANDSHAKE,  // ACK/NAK/STALL/NYET: the PID and nothing else
+  USB_P_SPLIT,      // a hub's split transaction: three bytes and a CRC5
+  USB_P_SPECIAL,    // PRE/ERR: the PID alone, and what follows is not this one
+} usb_pkt_t;
+
+typedef enum
+{
+  USB_R_NONE = 0,
+  USB_R_PID,
+  USB_R_TOKEN,      // the two bytes holding address, endpoint and the CRC5
+  USB_R_FRAME,      // ...or a SOF's frame number and its CRC5
+  USB_R_SPLIT,      // ...or the three a SPLIT takes
+  USB_R_DATA,
+  USB_R_CRC16,
+} usb_role_t;
+
+// A full-speed record at the top of the timebase spans 196 us, which is about
+// twenty packets of dense traffic - and sixty-four result bytes run out first
+// on anything but pure handshakes. Twelve covers what fits.
+#define USB_MAX_PKTS  12
+
+typedef struct
+{
+  uint8_t  pid;      // the whole byte off the wire; the low nibble is the PID
+  uint8_t  kind;     // usb_pkt_t
+  uint8_t  addr;     // token: the device address, 0..127
+  uint8_t  ep;       // token: the endpoint, 0..15
+  uint8_t  ndata;    // data: payload bytes IN THIS RECORD
+  uint8_t  first;    // its first byte in LogicResult.bytes
+  uint8_t  count;
+  bool     crc_ok;
+  bool     has_crc;  // a handshake has none, and neither has a packet cut short
+  // The record ran out inside the packet. What came back is the part that
+  // fit, and there is no CRC behind it to confirm even that much.
+  bool     cut;
+  uint16_t frame;    // SOF frame number, 0..2047
+  uint16_t crc;      // as received: the CRC5 in the low five bits, or the CRC16
+} UsbPacket;
+
+typedef struct
+{
+  int      rate;       // bit/s on the wire: 1500000 or 12000000, and nothing else
+  bool     low_speed;
+  // Which wire the probe is on, as far as one wire can say: SYNC gives the K
+  // level outright, J is its complement, and J together with the speed decides
+  // D+ from D-. An inference about the CABLE, not a reading of the waveform -
+  // an inverting probe would turn it round and the decode would not care.
+  bool     dplus;
+  int      packets;
+  int      crc_ok;
+  // SYNC patterns whose PID check nibble disagreed. NOT reported as packets: a
+  // record that opens in the middle of one produces exactly one of these, six
+  // zero bits in a payload produce another, and a record full of them is a
+  // record that is not USB.
+  int      pid_err;
+  int      stuff_err;  // seven ones in a row inside a packet: impossible by
+                       // construction, so the reading came apart there
+  int      sof;        // start-of-frame packets: a host is running the bus
+  bool     sure;       // at least one packet confirmed by its own CRC
+  UsbPacket pkt[USB_MAX_PKTS];
+  uint8_t  role[LOGIC_MAX_BYTES];
+  uint8_t  pidx[LOGIC_MAX_BYTES];
+} UsbAnalysis;
+
 // Sony SIRC. Read as a message and not as bits: the command, the device it
 // was addressed to, and - on the twenty-bit frame - the extended byte behind
 // them. The bits go out LSB first with the COMMAND at the bottom, so a frame
@@ -759,6 +838,90 @@ typedef struct
   PpmFrame frame[PPM_MAX_FRAMES];
 } PpmAnalysis;
 
+// USB Power Delivery on CC. Which ordered set opened a message decides who it
+// is addressed to - the port partner, or one of the plugs in the cable - and
+// that is a preamble on the wire and not a field inside the message.
+typedef enum
+{
+  PD_SOP = 0,       // the port partner
+  PD_SOP_P,         // SOP': the cable plug nearer this end
+  PD_SOP_PP,        // SOP'': the far plug
+  PD_HARD_RESET,    // no message follows these two: the ordered set IS the
+  PD_CABLE_RESET,   // event, and there is nothing else on the wire to read
+  PD_SOP_P_DBG,
+  PD_SOP_PP_DBG,
+  PD_SOP_COUNT,
+} pd_sop_t;
+
+typedef enum
+{
+  PD_R_NONE = 0,
+  PD_R_HDR,      // the two message-header bytes
+  PD_R_EXT,      // the extended header, on an extended message
+  PD_R_DATA,     // a data object, or a chunk of an extended message's payload
+  PD_R_CRC,      // the four bytes of CRC32
+} pd_role_t;
+
+// A record at 500 us/div spans 6.3 ms, which is a message and its GoodCRC and
+// then some. Six covers what the eighty result bytes can hold anyway: a
+// Source_Capabilities with five objects is already 26 of them.
+#define PD_MAX_MSGS   6
+// Seven data objects is the specification's limit for one message; fourteen
+// holds two full ones, which is as many as the byte budget reaches
+#define PD_MAX_OBJS   14
+
+typedef struct
+{
+  uint8_t  sop;       // pd_sop_t
+  uint8_t  type;      // the message type out of the header
+  uint8_t  ndo;       // data objects; 0 makes it a control message
+  uint8_t  id;        // MessageID, 0..7 - what a GoodCRC has to echo back
+  uint8_t  rev;       // specification revision: 0 = 1.0, 1 = 2.0, 2 = 3.0
+  uint8_t  first;     // its first byte in LogicResult.bytes
+  uint8_t  count;
+  uint8_t  obj0;      // where its objects start in PdAnalysis.obj
+  bool     ext;       // extended: chunked, and NOT reassembled here
+  bool     src;       // the sender held the source role
+  bool     dfp;       // ...and the DFP one
+  bool     crc_ok;
+  bool     cut;       // the record ended inside it
+  // A GoodCRC carrying this message's MessageID came back right behind it.
+  // The one piece of protocol-level agreement a single record can establish
+  // by itself, and the one worth knowing: it says the far end heard this.
+  bool     acked;
+  uint32_t crc;       // as received
+} PdMessage;
+
+typedef struct
+{
+  int      rate;      // bit/s, measured off the record; nominal 300k +-10%
+  // Which way round the five bits of a symbol came off the wire. Not assumed:
+  // both readings are tried and the CRC32 says which was right.
+  bool     lsb_first;
+  int      msgs;
+  int      crc_ok;
+  int      acked;     // messages whose GoodCRC came back with the right id
+  int      resets;    // Hard Reset / Cable Reset ordered sets
+  int      sym_err;   // five-bit groups that are in neither table
+  bool     sure;      // at least one message confirmed by its own CRC32
+  // The agreement checks a single record CAN make, and only those. See
+  // pd_decode.c for why the interesting one - a Request against the
+  // capabilities it answers - is the one that may not fit in the window.
+  bool     caps_seen;
+  bool     caps_ordered;   // first object 5 V fixed, fixed objects ascending
+  int8_t   req_pos;        // which object a Request asked for, or -1
+  // -1 = no capabilities in this record to check it against, 0 = the request
+  // does not fit what was advertised, 1 = it does
+  int8_t   req_check;
+  int      req_mv;         // ...and what that object actually offers
+  int      req_ma;
+  int      obj_count;
+  uint32_t obj[PD_MAX_OBJS];
+  PdMessage msg[PD_MAX_MSGS];
+  uint8_t  role[LOGIC_MAX_BYTES];
+  uint8_t  midx[LOGIC_MAX_BYTES];
+} PdAnalysis;
+
 typedef union
 {
   OwAnalysis     ow;
@@ -777,8 +940,10 @@ typedef union
   WsAnalysis     ws;
   SwoAnalysis    swo;
   SwdAnalysis    swd;
+  UsbAnalysis    usb;
   SircAnalysis   sirc;
   PpmAnalysis    ppm;
+  PdAnalysis     pd;
 } LogicAnalysis;
 
 extern LogicAnalysis g_logic_analysis;
@@ -1091,6 +1256,24 @@ void swd_field_label(const SwdAnalysis *a, int idx, uint8_t v,
     char *buf, int size);
 void swd_group_at(const SwdAnalysis *a, int idx, int *start, int *len);
 
+// USB 1.x - low speed and full speed - off ONE wire of the differential pair.
+// The bus runs at 1.5 or 12 Mbit and at no other rate, so there is nothing to
+// guess: both are tried, and a packet either comes out or does not.
+//
+// Full speed is 10.4 samples to a bit at the instrument's top rate, which is
+// enough because nothing here counts a fixed grid - the reader re-anchors on
+// every edge, and NRZI puts an edge at least once every seven bit times by
+// construction. Below about four samples to a bit the decoder answers 0
+// rather than guess, which at full speed means the fastest timebases only.
+int usb_decode(const uint8_t *data, int size, int offset, int period_ns,
+    LogicScratch *scratch, LogicResult *out);
+const UsbAnalysis *usb_analysis(void);
+void usb_byte_label(const UsbAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void usb_field_label(const UsbAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void usb_group_at(const UsbAnalysis *a, int idx, int *start, int *len);
+
 // Sony SIRC, and the Samsung and RCA remotes that share its shape. Found from
 // a leader whose mark is FOUR times its space - which is what tells it from
 // RC6's three, the one other infrared leader in this range - and confirmed by
@@ -1117,6 +1300,24 @@ void ppm_byte_label(const PpmAnalysis *a, int idx, uint8_t v,
     char *buf, int size);
 void ppm_field_label(const PpmAnalysis *a, int idx, uint8_t v,
     char *buf, int size);
+
+// USB Power Delivery on the CC wire: BMC at 300 kbit, 4b5b symbols, a CRC32
+// over every message, and what the charger and its load agreed on.
+//
+// The one decoder here that does NOT read the shared run split. It cannot: a
+// Source_Capabilities with five objects is about 550 level runs and
+// LOGIC_MAX_RUNS is 512, so the scratch would truncate the very message worth
+// reading. It walks the samples itself in one forward pass instead, which
+// costs nothing extra - the run split it would have used was two passes of
+// its own - and has no length limit at all.
+int pd_decode(const uint8_t *data, int size, int offset, int period_ns,
+    LogicScratch *scratch, LogicResult *out);
+const PdAnalysis *pd_analysis(void);
+void pd_byte_label(const PdAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void pd_field_label(const PdAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void pd_group_at(const PdAnalysis *a, int idx, int *start, int *len);
 
 // Dispatcher: forced = PROTO_AUTO tries every decoder and keeps the best
 // fit (most bytes, then fewest errors); a specific proto runs only that one

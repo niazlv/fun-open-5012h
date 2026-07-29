@@ -648,6 +648,8 @@ static union
   WsAnalysis   ws;     // ...what colour each pixel of a strip was told to be
   SwoAnalysis  swo;    // ...what a running MCU printed out of its trace pin
   SwdAnalysis  swd;    // ...which registers a debugger was reading
+  UsbAnalysis  usb;    // ...which packets went past on one wire of a pair
+  PdAnalysis   pd;     // ...and what a charger and its load agreed on
   SircAnalysis sirc;   // ...which key on a Sony remote went down
   PpmAnalysis  ppm;    // ...and every channel of an RC link at once
 } g_pana;
@@ -1996,6 +1998,8 @@ static void decode_group_at(int idx, int *start, int *len)
       case PROTO_WS2812:  ws2812_group_at(&g_pana.ws, idx, start, len); break;
       case PROTO_SWO:     swo_group_at(&g_pana.swo, idx, start, len); break;
       case PROTO_SWD:     swd_group_at(&g_pana.swd, idx, start, len); break;
+      case PROTO_USB:     usb_group_at(&g_pana.usb, idx, start, len); break;
+      case PROTO_PD:      pd_group_at(&g_pana.pd, idx, start, len); break;
       case PROTO_SIRC:    sirc_group_at(&g_pana.sirc, idx, start, len); break;
       // PPM is deliberately absent: its channels each stand alone, and a
       // frame of eight of them is not one value written across eight bytes
@@ -2194,6 +2198,25 @@ static void dband_meaning_text(char *buf, int size, int idx, uint8_t v)
       swd_byte_label(&g_pana.swd, idx, v, buf, size);
       break;
 
+    case PROTO_USB:
+      // Which packet this is - SETUP, DATA0, ACK - and, on the byte that
+      // completes it, the address and endpoint it named or the CRC16 that
+      // found its end. A payload byte gets nothing here and falls through to
+      // being shown as a character, the way a serial line's does.
+      usb_byte_label(&g_pana.usb, idx, v, buf, size);
+
+      if (0 == buf[0])
+        dband_ascii_text(buf, size, v);
+      break;
+
+    case PROTO_PD:
+      // Which message, and then the answer: what the charger offered on this
+      // object, what the sink asked for, and whether the CRC32 agreed. Held
+      // back to the byte that COMPLETES each field - a data object is four
+      // bytes and one number, and the number is written once across them.
+      pd_byte_label(&g_pana.pd, idx, v, buf, size);
+      break;
+
     case PROTO_SIRC:
       // Which key on which device, written once across the two bytes the
       // frame took - or the three, where an extended byte came with it
@@ -2267,6 +2290,14 @@ static void dband_field_text(char *buf, int size, int idx, uint8_t v)
 
     case PROTO_SWD:
       swd_field_label(&g_pana.swd, idx, v, buf, size);
+      break;
+
+    case PROTO_USB:
+      usb_field_label(&g_pana.usb, idx, v, buf, size);
+      break;
+
+    case PROTO_PD:
+      pd_field_label(&g_pana.pd, idx, v, buf, size);
       break;
 
     case PROTO_SIRC:
@@ -2413,6 +2444,27 @@ static int decode_bit_slots(int *data0, bool *msb_first)
     // parity already said it was not.
     case PROTO_SWD:
       return 8;
+
+    // USB deliberately has none, and it is the one protocol here where a bit
+    // grid would be a lie rather than an approximation. Its bytes are eight
+    // DATA bits, but a byte containing six consecutive ones also carries a
+    // stuff bit - wire that holds no data - so that byte spans nine bit times
+    // and its neighbour spans eight. Dividing each span into eight equal
+    // cells would put the lines a whole bit out inside exactly the bytes
+    // worth checking, and lines drawn for checking a decode must land on the
+    // boundary they name or not be drawn.
+    case PROTO_USB:
+      return 0;
+
+    // Power Delivery is turned down for a DIFFERENT reason, and the
+    // difference is worth writing down in case anyone extends this. Its byte
+    // really is ten unit intervals of wire, every one of them the same width,
+    // so the LINES would land exactly on the signal's own bit boundaries -
+    // they would be right. What would be wrong is the numbers in the cells:
+    // those ten wire bits are two 4b5b symbols, so cell k is not data bit k
+    // and never was, and the grid exists to write the numbers.
+    case PROTO_PD:
+      return 0;
 
     default:
       return 0;
@@ -5415,6 +5467,10 @@ static void decode_update(void)
       g_pana.swo = *swo_analysis();
     else if (res.proto == PROTO_SWD)
       g_pana.swd = *swd_analysis();
+    else if (res.proto == PROTO_USB)
+      g_pana.usb = *usb_analysis();
+    else if (res.proto == PROTO_PD)
+      g_pana.pd = *pd_analysis();
     else if (res.proto == PROTO_SIRC)
       g_pana.sirc = *sirc_analysis();
     else if (res.proto == PROTO_PPM)

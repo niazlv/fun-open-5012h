@@ -83,7 +83,7 @@ static const char *const g_decoder_proto_labels[] =
 {
   "Auto", "UART", "1-Wire", "WS2812", "NEC IR", "Raw", "Servo PWM", "CAN",
   "DHT11/22", "SENT", "MIDI", "LIN", "EV1527", "DShot", "SPI! no clk", "Manchester", "RC5/RC6 IR", "DALI", "KNX TP1",
-  "SWO / ITM", "SWD (SWDIO)", "Sony SIRC", "CPPM",
+  "SWO / ITM", "SWD (SWDIO)", "USB LS/FS", "Sony SIRC", "CPPM", "USB PD (CC)",
 };
 
 _Static_assert(ARRAY_SIZE(g_decoder_proto_labels) == PROTO_COUNT,
