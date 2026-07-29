@@ -374,6 +374,18 @@ class Blob:
 
         return off
 
+    def split(self, names):
+        """Two blobs from one: the named sections into the second, the rest
+        into the first. The renderer reads texture columns one at a time and
+        flats whole, so those two lumps can live somewhere that is not memory -
+        which is the only way the pack fits alongside the firmware."""
+        a, b = Blob(), Blob()
+
+        for name, off, size in self.sections:
+            (b if name in names else a).add(name, self.body[off:off + size])
+
+        return a, b
+
     def build(self):
         header_len = 16
         dir_len = len(self.sections) * (self.NAME_LEN + 8)
@@ -499,6 +511,9 @@ def main():
     ap.add_argument("--height", type=int, default=200)
     ap.add_argument("--fov", type=float, default=90.0)
     ap.add_argument("--header", default=None, help="also write a C header with the sizes")
+    ap.add_argument("--split", action="store_true",
+        help="write the texture columns and flats to a second pack, for the "
+             "SPI part: the firmware links only what has to be addressable")
     args = ap.parse_args()
 
     wad = Wad(args.wad)
@@ -776,12 +791,27 @@ def main():
 
     blob.add("LEVELINFO", info)
 
-    data = blob.build()
-
     out_dir = os.path.dirname(os.path.abspath(args.output))
 
     if out_dir and not os.path.isdir(out_dir):
         os.makedirs(out_dir)
+
+    if args.split:
+        # TEXDATA is fetched a column at a time and FLATS is loaded whole at
+        # map load; everything else is read at random on every pixel and every
+        # step of the BSP walk, so it has to stay addressable.
+        core, tex = blob.split({"TEXDATA", "FLATS"})
+        data = core.build()
+        tex_data = tex.build()
+        tex_path = os.path.splitext(args.output)[0] + "_tex.bin"
+
+        with open(tex_path, "wb") as f:
+            f.write(tex_data)
+
+        print("\n%s: %d bytes (%.1f KB) - goes on the SPI part" % (
+            tex_path, len(tex_data), len(tex_data) / 1024.0))
+    else:
+        data = blob.build()
 
     with open(args.output, "wb") as f:
         f.write(data)

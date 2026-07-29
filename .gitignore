@@ -10,7 +10,10 @@ tests/build
 .project
 # Built from a real IWAD by tools/wadpack.py - carries the WAD artwork,
 # so it stays out of the repository
+# The asset packs: both halves carry id Software artwork, and --split writes
+# the second one beside the first
 doom/doom_assets.bin
+doom/doom_assets_tex.bin
 
 # iCloud Drive keeps both sides of a conflict and appends a space and a
 # number to the loser: "measure 2.c", "hoststub 2/". The copy is stale the

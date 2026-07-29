@@ -270,8 +270,8 @@ static void R_DrawSky(visplane_t *pl)
             unsigned angle = (viewangle + dt_xtoviewangle[x]) >> 22;
 
             dc_x = x;
-            dc_source = texturedata +
-                texturecols[tex->firstcol + ((angle >> shift) & tex->widthmask)];
+            dc_source = w_column(
+                texturecols[tex->firstcol + ((angle >> shift) & tex->widthmask)]);
 
             R_DrawColumn();
         }

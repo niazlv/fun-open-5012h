@@ -191,6 +191,7 @@ SRCS += \
 # Vendored: the DOOM engine, under its own COPYING
 SRCS += \
   ../doom/w_assets.c \
+  ../doom/w_stream.c \
   ../doom/r_main.c \
   ../doom/r_bsp.c \
   ../doom/r_segs.c \
@@ -233,7 +234,11 @@ OBJS = $(addprefix $(BUILD)/, $(notdir %/$(subst .c,.o, $(SRCS))))
 # opt-in: `make DOOM=1` links the real pack, anything else links an empty
 # stand-in and the application says how to build one. Nothing else about DOOM
 # changes; the engine is a few KB of code and stays in either way.
-DOOM ?= 0
+# The pack used to be opt-in because it was 208 KB of the 384 the firmware
+# had. It is not opt-in any more: wadpack.py --split leaves the texture columns
+# and the flats in a second file that lives on the SPI part, and what is left
+# to link is 110 KB - which fits, with room over.
+DOOM ?= 1
 
 ifeq ($(DOOM),1)
   DOOM_ASSETS = ../doom/doom_assets.bin

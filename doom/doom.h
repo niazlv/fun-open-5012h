@@ -319,9 +319,37 @@ extern int numvertexes, numsegs, numsubsectors, numnodes;
 extern int numlines, numsides, numsectors, numthings;
 
 extern const texture_t *textures;
-extern const uint32_t *texturecols;     // offsets into texturedata
-extern const uint8_t *texturedata;
+extern const uint32_t *texturecols;     // offsets into the texture columns
 extern const uint8_t *flatdata;
+
+/*
+ * Texture columns, when they are not in the address space.
+ *
+ * The pack lives on the SPI part, which has no memory-mapped mode on this MCU,
+ * so a column has to be fetched before it can be drawn. w_stream.c holds the
+ * cache; the renderer only ever asks for a column by the offset texturecols
+ * already gives it, and gets back somewhere it may read SLOT_SIZE bytes.
+ *
+ * On the host the same path runs with a reader that copies out of a loaded
+ * file, so the cache is exercised by tests/doom_host.c rather than only on the
+ * device.
+ */
+typedef bool (*w_stream_read_t)(void *ctx, uint32_t offset, uint8_t *dst,
+    uint32_t size);
+
+void w_stream_init(w_stream_read_t read, void *ctx, uint8_t *cache,
+    uint32_t tex_base, uint32_t tex_size);
+
+// Binds the streamed half of the pack: its directory, how to read it, where
+// the column cache lives and where the flats may be held.
+bool doom_assets_stream(const void *dir, w_stream_read_t read, void *ctx,
+    uint8_t *cache, uint8_t *flats, uint32_t flats_size);
+const uint8_t *w_column(uint32_t offset);
+uint32_t w_stream_fetches(void);
+void w_stream_reset_stats(void);
+
+// 64 slots of 128 bytes. Named here because the caller supplies the memory.
+#define W_STREAM_CACHE_SIZE     (64 * 128)
 extern int numtextures, numflats;
 extern int flatshift;                   // flats are 64 >> flatshift wide
 extern int skytexture;
@@ -351,7 +379,10 @@ extern visplane_t *ceilingplane;
 
 /*- Prototypes --------------------------------------------------------------*/
 // w_assets.c
-bool doom_assets_init(const void *blob);
+// `cache` is W_STREAM_CACHE_SIZE bytes, and only needed when the pack still
+// has its texture columns in it - a split pack binds them through
+// doom_assets_stream() instead and may pass NULL.
+bool doom_assets_init(const void *blob, uint8_t *cache);
 const char *doom_assets_error(void);
 const void *doom_asset_find(const char *name, int *size);
 bool doom_level_load(void);

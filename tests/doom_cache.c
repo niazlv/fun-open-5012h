@@ -66,6 +66,7 @@ static uint8_t g_seen[PACK_MAX / 64];
 static uint32_t g_compulsory;
 static uint32_t g_compulsory_line = 64;
 
+static uint8_t g_hostcache[W_STREAM_CACHE_SIZE];
 static const uint8_t *g_blob;
 static uint64_t g_reads;
 
@@ -237,7 +238,7 @@ int main(int argc, char **argv)
 
     dm = calloc(1, sizeof(doom_mem_t));
 
-    if (!doom_assets_init(blob) || !doom_level_load())
+    if (!doom_assets_init(blob, g_hostcache) || !doom_level_load())
     {
         fprintf(stderr, "asset pack or level rejected\n");
         return 1;

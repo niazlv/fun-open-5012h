@@ -71,10 +71,25 @@ static void write_ppm(const char *path)
     fclose(f);
 }
 
+// The stand-in for the SPI part: the same call the device makes, answered out
+// of a file that has been read into memory.
+static uint8_t *g_tex;
+static uint8_t g_cache[W_STREAM_CACHE_SIZE];
+static uint8_t g_flats[32 * 1024];
+
+static bool host_read(void *ctx, uint32_t offset, uint8_t *dst, uint32_t size)
+{
+    (void)ctx;
+    memcpy(dst, g_tex + offset, size);
+
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     long size;
     void *blob;
+    const char *tex_path = getenv("DOOM_TEX");
     fixed_t x = 0, y = 0, z;
     angle_t angle = 0;
     const sector_t *sec;
@@ -92,10 +107,31 @@ int main(int argc, char **argv)
     printf("doom_mem_t: %zu bytes (%.1f KB of the 128 KB block)\n",
            sizeof(doom_mem_t), sizeof(doom_mem_t) / 1024.0);
 
-    if (!doom_assets_init(blob))
+    if (!doom_assets_init(blob, g_cache))
     {
-        fprintf(stderr, "asset pack rejected\n");
+        fprintf(stderr, "asset pack rejected: %s\n", doom_assets_error());
         return 1;
+    }
+
+    // A pack built with --split leaves its texture columns and flats in a
+    // second file, because on the device they live on the SPI part and are
+    // fetched over a bus. Reading them out of memory here runs the same cache
+    // the device runs, which is the point: a render from the split pack that
+    // matches a render from the whole one says the streaming path is right.
+    if (tex_path)
+    {
+        long tex_size;
+
+        g_tex = load_file(tex_path, &tex_size);
+
+        if (!doom_assets_stream(g_tex, host_read, NULL, g_cache, g_flats,
+                sizeof(g_flats)))
+        {
+            fprintf(stderr, "streamed pack rejected: %s\n", doom_assets_error());
+            return 1;
+        }
+
+        printf("streaming textures from %s\n", tex_path);
     }
 
     if (!doom_level_load())

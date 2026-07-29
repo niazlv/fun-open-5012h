@@ -32,6 +32,8 @@
 #include "utils.h"
 #include "ui.h"
 #include "capture.h"
+#include "spifs.h"
+#include "tcm_borrow.h"
 #include "menu_widget.h"
 #include "doom_port.h"
 #include "doom/doom.h"
@@ -51,6 +53,8 @@
 
 // The block DOOM may use: main SRAM up to the spare region, which holds the
 // logic decoder scratch and the coredump ring and must not be touched
+#define DOOM_TEX_NAME       "doom.tex"
+
 #define DOOM_RAM_BASE       0x20000000u
 #define DOOM_RAM_SIZE       (CAPTURE_SPARE_RAM - DOOM_RAM_BASE)
 
@@ -63,6 +67,9 @@ _Static_assert(sizeof(doom_mem_t) <= DOOM_RAM_SIZE,
 
 /*- Variables ---------------------------------------------------------------*/
 extern const uint8_t doom_assets[];
+
+// Why the streamed half did not bind, for the screen that says so
+static const char *g_stream_error;
 
 static bool g_ready;
 static bool g_paused;
@@ -327,6 +334,63 @@ static void draw_frame(void)
 }
 
 //-----------------------------------------------------------------------------
+// The texture columns and the flats, off the SPI part.
+//
+// They are the half of the pack that will not fit in the image, and the chip
+// is not in the address space, so they arrive over a bus: the columns one at a
+// time through the cache in w_stream.c, the flats loaded whole because
+// R_DrawSpan indexes them rather than walking them.
+//
+// Both live in the memory the oscilloscope lends an application - 30 KB of
+// TCM that is dead while this screen is up. The frame buffer and the
+// visplanes have already taken all of main SRAM.
+static bool spifs_reader(void *ctx, uint32_t offset, uint8_t *dst,
+    uint32_t size)
+{
+    return spifs_read((const spifs_file_t *)ctx, offset, dst, size);
+}
+
+static bool bind_streamed_pack(void)
+{
+    static uint8_t dir[256];
+    const spifs_file_t *file;
+    uint8_t *cache = (uint8_t *)tcm_borrow_base();
+
+    // A pack with its textures linked in binds them itself, and then there is
+    // nothing on the chip to look for
+    if (NULL != flatdata)
+        return true;
+
+    spifs_scan();
+
+    file = spifs_find(DOOM_TEX_NAME);
+
+    if (NULL == file)
+    {
+        g_stream_error = "no " DOOM_TEX_NAME " on the SPI flash";
+        return false;
+    }
+
+    // The header and directory only, which is all doom_assets_stream needs to
+    // find the two lumps in it
+    if (!spifs_read(file, 0, dir, sizeof(dir)))
+    {
+        g_stream_error = "SPI read failed";
+        return false;
+    }
+
+    if (!doom_assets_stream(dir, spifs_reader, (void *)file, cache,
+            cache + W_STREAM_CACHE_SIZE,
+            tcm_borrow_size() - W_STREAM_CACHE_SIZE))
+    {
+        g_stream_error = doom_assets_error();
+        return false;
+    }
+
+    return true;
+}
+
+//-----------------------------------------------------------------------------
 void doom_port_init(void)
 {
     // The frame buffer lives in the capture ring, so acquisition has to stop
@@ -335,7 +399,8 @@ void doom_port_init(void)
 
     dm = (doom_mem_t *)DOOM_RAM_BASE;
 
-    g_ready = doom_assets_init(doom_assets) && doom_level_load();
+    g_ready = doom_assets_init(doom_assets, NULL) && bind_streamed_pack() &&
+        doom_level_load();
 
     lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, LCD_BLACK_COLOR);
 

@@ -78,7 +78,7 @@ static inline void set_column(int texnum, int col, fixed_t texturemid, fixed_t i
 {
     const texture_t *t = &textures[texnum];
 
-    dc_source = texturedata + texturecols[t->firstcol + ((col >> t->shift) & t->widthmask)];
+    dc_source = w_column(texturecols[t->firstcol + ((col >> t->shift) & t->widthmask)]);
     dc_texturemid = texturemid >> t->shift;
     dc_iscale = iscale >> t->shift;
     dc_texheight = t->sheight;
@@ -636,9 +636,8 @@ void R_RenderMaskedSegRange(drawseg_t *ds, int x1, int x2)
             dc_iscale = (0xffffffffu / (unsigned)scale) >> tex->shift;
             sprtopscreen = centeryfrac - FixedMul(dc_texturemid, spryscale);
 
-            R_DrawMaskedColumn(texturedata +
-                texturecols[tex->firstcol +
-                    ((maskedtexturecol[dc_x] >> tex->shift) & tex->widthmask)]);
+            R_DrawMaskedColumn(w_column(texturecols[tex->firstcol +
+                ((maskedtexturecol[dc_x] >> tex->shift) & tex->widthmask)]));
 
             maskedtexturecol[dc_x] = MAXSHORT;
             r_stats.maskedcols++;

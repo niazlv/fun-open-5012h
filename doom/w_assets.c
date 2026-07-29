@@ -46,6 +46,9 @@ typedef struct
     int32_t focallength;
 } level_info_t;
 
+/*- Local prototypes --------------------------------------------------------*/
+static bool blob_read(void *ctx, uint32_t offset, uint8_t *dst, uint32_t size);
+
 /*- Variables ---------------------------------------------------------------*/
 doom_mem_t *dm;
 
@@ -76,7 +79,6 @@ int numlines, numsides, numsectors, numthings;
 
 const texture_t *textures;
 const uint32_t *texturecols;
-const uint8_t *texturedata;
 const uint8_t *flatdata;
 int numtextures, numflats;
 int flatshift;
@@ -161,7 +163,7 @@ const char *doom_assets_error(void)
 }
 
 //-----------------------------------------------------------------------------
-bool doom_assets_init(const void *blob)
+bool doom_assets_init(const void *blob, uint8_t *cache)
 {
     const blob_header_t *hdr = (const blob_header_t *)blob;
 
@@ -219,11 +221,38 @@ bool doom_assets_init(const void *blob)
 
     textures    = require("TEXDIR");
     texturecols = require("TEXCOLS");
-    texturedata = require("TEXDATA");
-    flatdata    = require("FLATS");
 
-    if (!textures || !texturecols || !texturedata || !flatdata)
+    if (!textures || !texturecols)
         return false;
+
+    // TEXDATA and FLATS are not required here: in a pack built with --split
+    // they are in the other file, and the caller binds them through
+    // doom_assets_stream(). A whole pack still works though - if they are in
+    // this blob, bind them straight away against a reader that copies out of
+    // it, so there is exactly one path through the renderer either way.
+    {
+        const blob_entry_t *e;
+        const void *tex = doom_asset_find("TEXDATA", NULL);
+
+        flatdata = doom_asset_find("FLATS", NULL);
+
+        // Only when the caller supplied somewhere to cache into: on the
+        // device the pack is always split, and 8 KB of .bss for a path that
+        // never runs there is 8 KB the instrument could have had.
+        if (tex && flatdata && cache)
+        {
+            for (int i = 0; i < g_dir_count; i++)
+            {
+                e = &g_dir[i];
+
+                if (0 == strncmp(e->name, "TEXDATA", NAME_LEN))
+                {
+                    w_stream_init(blob_read, NULL, cache, e->offset, e->size);
+                    break;
+                }
+            }
+        }
+    }
 
     // TEXDIR leads with the count, the entries follow
     numtextures = *(const uint32_t *)textures;
@@ -232,6 +261,84 @@ bool doom_assets_init(const void *blob)
     numflats = g_info->numflats;
     flatshift = g_info->flatshift;
     skytexture = g_info->skytexture;
+
+    return true;
+}
+
+//-----------------------------------------------------------------------------
+// Reader for a pack that is already in memory. The cache in front of it is
+// pure overhead here, and deliberately so: one path is easier to be sure of
+// than two, and 8 KB of it costs nothing on a host or in a build where the
+// whole pack is linked in.
+//-----------------------------------------------------------------------------
+static bool blob_read(void *ctx, uint32_t offset, uint8_t *dst, uint32_t size)
+{
+    (void)ctx;
+
+    if (NULL == g_blob)
+        return false;
+
+    memcpy(dst, g_blob + offset, size);
+
+    return true;
+}
+
+//-----------------------------------------------------------------------------
+// The half of the pack that lives somewhere unaddressable.
+//
+// The texture columns stay there and are fetched one at a time; the flats do
+// not, because R_DrawSpan indexes a flat by a jumping offset rather than
+// walking it, so a partly resident flat is not a thing that can be drawn. All
+// of them together are 21 KB in a --scale 2 pack, which is small enough to
+// simply hold.
+//
+// `blob` is the streamed pack's own header and directory, which the caller has
+// already read into memory - it is 100 bytes and asking the bus for it twice
+// would be sillier than passing it in.
+bool doom_assets_stream(const void *dir, w_stream_read_t read, void *ctx,
+    uint8_t *cache, uint8_t *flats, uint32_t flats_size)
+{
+    const blob_header_t *hdr = (const blob_header_t *)dir;
+    const blob_entry_t *ents;
+    const blob_entry_t *tex = NULL, *flat = NULL;
+
+    if (NULL == dir || BLOB_MAGIC != hdr->magic || 1 != hdr->version)
+    {
+        g_error = "stream pack";
+        return false;
+    }
+
+    ents = (const blob_entry_t *)((const uint8_t *)dir + hdr->dir_offset);
+
+    for (unsigned i = 0; i < hdr->count; i++)
+    {
+        if (0 == strncmp(ents[i].name, "TEXDATA", NAME_LEN))
+            tex = &ents[i];
+        else if (0 == strncmp(ents[i].name, "FLATS", NAME_LEN))
+            flat = &ents[i];
+    }
+
+    if (NULL == tex || NULL == flat)
+    {
+        g_error = "stream lumps";
+        return false;
+    }
+
+    if (flat->size > flats_size)
+    {
+        g_error = "flats too big";
+        return false;
+    }
+
+    if (!read(ctx, flat->offset, flats, flat->size))
+    {
+        g_error = "flats read";
+        return false;
+    }
+
+    flatdata = flats;
+
+    w_stream_init(read, ctx, cache, tex->offset, tex->size);
 
     return true;
 }
