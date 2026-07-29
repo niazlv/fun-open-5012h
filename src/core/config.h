@@ -230,7 +230,17 @@ typedef struct
   // yet" - the same zero-is-default rule the rest of this struct follows.
   int      snake_high_score;
 
-  uint32_t padding[5];  // Reduced padding to accommodate new fields
+  // Flappy Bird's, on the same terms
+  int      flappy_high_score;
+
+  // 2048's, shared by every board size: one number, because the games are the
+  // same game and the size is a setting rather than a mode
+  int      g2048_high_score;
+
+  // Tetris's, on the same terms
+  int      tetris_high_score;
+
+  uint32_t padding[2];  // Reduced padding to accommodate new fields
 
   int      calib_channel_delta;
   int      calib_dac_zero;

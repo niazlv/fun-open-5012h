@@ -24,6 +24,8 @@
 #include "raytrace_test.h"
 #include "flappy_bird.h"
 #include "snake_game.h"
+#include "game2048.h"
+#include "tetris.h"
 #include "doom_port.h"
 #include "debug_coredump.h"
 #include "flash_viewer.h"
@@ -88,6 +90,12 @@ static const app_desc_t g_apps[] =
     snake_game_init, snake_game_task, snake_game_buttons_handler,
     snake_game_cleanup, snake_game_redraw, &snake_game_menu,
     &snake_game_help_menu },
+  { "2048", "Slide and merge, on a board from 3x3 to 6x6",
+    game2048_init, game2048_task, game2048_buttons_handler,
+    game2048_cleanup, game2048_redraw, &game2048_menu, &game2048_help_menu },
+  { "Tetris", "Ten by twenty, with next, hold and a ghost",
+    tetris_init, tetris_task, tetris_buttons_handler,
+    tetris_cleanup, tetris_redraw, &tetris_menu, &tetris_help_menu },
   { "DOOM", "id Software's renderer on a real WAD level",
     doom_port_init, doom_port_task, doom_port_buttons_handler,
     doom_port_cleanup, doom_port_redraw, &doom_port_menu, &doom_port_help_menu },

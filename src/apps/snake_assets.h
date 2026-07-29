@@ -4,11 +4,8 @@
  *
  * Snake artwork and levels
  *
- * Both are text art: one character per pixel for a sprite, one character per
- * cell for a level. A 16x16 icon costs the same 272 bytes of flash an indexed
- * bitmap would, and it stays editable in the source without a converter - the
- * device has no filesystem to load assets from, so anything not compiled in
- * does not exist.
+ * The sprite format and its palette are in game_gfx.h, shared with every other
+ * game. What is here is only what is Snake's: five icons and eight maps.
  */
 
 #ifndef _SNAKE_ASSETS_H_
@@ -17,22 +14,15 @@
 /*- Includes ----------------------------------------------------------------*/
 #include <stdint.h>
 #include <stdbool.h>
+#include "game_gfx.h"
 
 /*- Definitions -------------------------------------------------------------*/
-// The cell size divides the panel exactly: 20 x 13 cells of 16 px is 320 x 208,
-// which is the display minus the 32 px status bar
-#define SNAKE_CELL      16
+// The cell size divides the panel exactly: 20 x 13 cells of GFX_TILE is
+// 320 x 208, which is the display minus the 32 px status bar
 #define SNAKE_GRID_W    20
 #define SNAKE_GRID_H    13
 
 /*- Types -------------------------------------------------------------------*/
-// Sprite pixels. '.' is transparent, every other character is a palette entry
-// resolved by snake_pixel_color().
-typedef struct
-{
-    char rows[SNAKE_CELL][SNAKE_CELL + 1];
-} sprite_t;
-
 // A level is its map plus the two numbers that only mean anything next to it.
 // Map characters:
 //   ' '            empty
@@ -57,10 +47,5 @@ extern const sprite_t snake_spr_skull;   // game over panel
 
 extern const snake_level_t snake_levels[];
 extern const int snake_level_count;
-
-/*- Prototypes --------------------------------------------------------------*/
-// Resolves one text-art pixel. Returns false for transparent characters, so a
-// sprite composites over whatever is already in the tile.
-bool snake_pixel_color(char c, uint16_t *color);
 
 #endif // _SNAKE_ASSETS_H_

@@ -133,9 +133,36 @@ SRCS += \
   ../src/apps/engine3d.c \
   ../src/apps/raytrace_test.c \
   ../src/apps/flappy_bird.c \
+  ../src/apps/game_gfx.c \
+  ../src/apps/game2048.c \
+  ../src/apps/tetris.c \
   ../src/apps/snake_game.c \
   ../src/apps/snake_assets.c \
   ../src/apps/doom_port.c \
+
+# Size, not speed, for the 2D games and the toolkit they share.
+#
+# What those spend their time on is the panel: it is bit-banged, ~200 ns a
+# pixel, and no amount of unrolling in the pixel arithmetic queued up behind it
+# can shorten that. -O3 unrolls their 256-iteration tile loops into kilobytes
+# and buys back time that was never on the critical path - measured, it is 10 KB
+# of an image that is already 83% full.
+#
+# The 3D applications are deliberately not on this list. Those are the ones that
+# really are compute bound, and -Os would cost them frame rate: cube3d, engine3d
+# and raytrace_test together would give back another 7.5 KB, and it is a trade
+# rather than a free win.
+#
+# A target-specific variable, appended after the -O3 in CFLAGS, so the last -O
+# on the command line is the one that counts.
+SIZE_OPTIMIZED = \
+  $(BUILD)/game_gfx.o \
+  $(BUILD)/snake_game.o \
+  $(BUILD)/flappy_bird.o \
+  $(BUILD)/game2048.o \
+  $(BUILD)/tetris.o \
+
+$(SIZE_OPTIMIZED): CFLAGS += -Os
 
 SRCS += \
   ../src/debug/debug_coredump.c \

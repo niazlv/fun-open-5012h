@@ -4,39 +4,12 @@
  *
  * Snake artwork and levels
  *
- * See snake_assets.h for the two formats. Everything here is const, so it
- * lives in flash and costs no RAM: five 16x16 sprites and eight maps come to
- * under 4 KB.
+ * Everything here is const, so it lives in flash and costs no RAM. The sprite
+ * format and its palette are in game_gfx.c, shared with the other games.
  */
 
 /*- Includes ----------------------------------------------------------------*/
-#include "lcd.h"
 #include "snake_assets.h"
-
-/*- Implementations ---------------------------------------------------------*/
-
-//-----------------------------------------------------------------------------
-// The palette is shared by every sprite, so a character means the same colour
-// wherever it appears and a sprite can be read as a picture in the source
-bool snake_pixel_color(char c, uint16_t *color)
-{
-    switch (c)
-    {
-        case 'R': *color = LCD_COLOR(231,  71,  29); return true;  // fruit red
-        case 'r': *color = LCD_COLOR(168,  32,  16); return true;  // its shadow
-        case 'O': *color = LCD_COLOR(245, 140,  30); return true;  // orange
-        case 'o': *color = LCD_COLOR(190,  92,  10); return true;
-        case 'Y': *color = LCD_COLOR(255, 214,  66); return true;  // gold
-        case 'y': *color = LCD_COLOR(206, 148,  16); return true;
-        case 'g': *color = LCD_COLOR( 76, 175,  50); return true;  // leaf
-        case 'G': *color = LCD_COLOR( 40, 110,  30); return true;
-        case 'k': *color = LCD_COLOR(110,  70,  30); return true;  // stem
-        case 'h': *color = LCD_COLOR(255, 238, 150); return true;  // seed
-        case 'w': *color = LCD_COLOR(255, 255, 255); return true;  // highlight
-        case 'b': *color = LCD_COLOR( 30,  32,  40); return true;
-        default:  return false;                                    // '.', space
-    }
-}
 
 /*- Constants ---------------------------------------------------------------*/
 

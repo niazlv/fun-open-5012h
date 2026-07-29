@@ -45,12 +45,12 @@ HOST_SRCS = \
   $(ROOT)/src/dsp/trend.c \
   $(wildcard $(ROOT)/src/decode/*.c) \
 
-.PHONY: all test host coredump snake doomhost clean
+.PHONY: all test host coredump snake flappy g2048 tetris doomhost clean
 
 all: test
 
 # The ones that run without an asset pack
-test: host coredump snake
+test: host coredump snake flappy g2048 tetris
 
 host: $(BUILD)/host_test
 	@./$(BUILD)/host_test
@@ -68,15 +68,52 @@ $(BUILD)/host_test: $(HOST_SRCS) | $(BUILD)
 # test instead of corrupting a display.
 SNAKE_SRCS = \
   snake_test.c \
+  $(ROOT)/src/apps/game_gfx.c \
   $(ROOT)/src/apps/snake_assets.c \
   $(ROOT)/src/ui/fonts.c \
 
 snake: $(BUILD)/snake_test
 	@./$(BUILD)/snake_test
 
-$(BUILD)/snake_test: $(SNAKE_SRCS) $(ROOT)/src/apps/snake_game.c | $(BUILD)
+$(BUILD)/snake_test: $(SNAKE_SRCS) $(ROOT)/src/apps/snake_game.c gamestub.h | $(BUILD)
 	@echo CC $@
 	@$(CC) $(CFLAGS) -I$(ROOT)/src/apps -I$(ROOT)/tests/hoststub $(SNAKE_SRCS) $(LIBS) -o $@
+
+FLAPPY_SRCS = \
+  flappy_test.c \
+  $(ROOT)/src/apps/game_gfx.c \
+  $(ROOT)/src/ui/fonts.c \
+
+flappy: $(BUILD)/flappy_test
+	@./$(BUILD)/flappy_test
+
+$(BUILD)/flappy_test: $(FLAPPY_SRCS) $(ROOT)/src/apps/flappy_bird.c gamestub.h | $(BUILD)
+	@echo CC $@
+	@$(CC) $(CFLAGS) -I$(ROOT)/src/apps -I$(ROOT)/tests/hoststub $(FLAPPY_SRCS) $(LIBS) -o $@
+
+G2048_SRCS = \
+  g2048_test.c \
+  $(ROOT)/src/apps/game_gfx.c \
+  $(ROOT)/src/ui/fonts.c \
+
+g2048: $(BUILD)/g2048_test
+	@./$(BUILD)/g2048_test
+
+$(BUILD)/g2048_test: $(G2048_SRCS) $(ROOT)/src/apps/game2048.c gamestub.h | $(BUILD)
+	@echo CC $@
+	@$(CC) $(CFLAGS) -I$(ROOT)/src/apps -I$(ROOT)/tests/hoststub $(G2048_SRCS) $(LIBS) -o $@
+
+TETRIS_SRCS = \
+  tetris_test.c \
+  $(ROOT)/src/apps/game_gfx.c \
+  $(ROOT)/src/ui/fonts.c \
+
+tetris: $(BUILD)/tetris_test
+	@./$(BUILD)/tetris_test
+
+$(BUILD)/tetris_test: $(TETRIS_SRCS) $(ROOT)/src/apps/tetris.c gamestub.h | $(BUILD)
+	@echo CC $@
+	@$(CC) $(CFLAGS) -I$(ROOT)/src/apps -I$(ROOT)/tests/hoststub $(TETRIS_SRCS) $(LIBS) -o $@
 
 # Renders one DOOM frame to a .ppm. Not part of `test`: it needs the asset
 # pack, which is built from a real IWAD and is not in the repository.

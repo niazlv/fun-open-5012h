@@ -33,11 +33,12 @@
 #include "config.h"
 #include "ui.h"
 #include "menu_widget.h"
+#include "game_gfx.h"
 #include "snake_assets.h"
 #include "snake_game.h"
 
 /*- Definitions -------------------------------------------------------------*/
-#define CELL                SNAKE_CELL
+#define CELL                GFX_TILE
 #define GRID_W              SNAKE_GRID_W
 #define GRID_H              SNAKE_GRID_H
 
@@ -75,13 +76,6 @@
 
 #define CLASSIC_STEP_MS     150
 #define MIN_STEP_MS         60
-
-// Direction bits, doubling as the "which sides of this cell continue" mask
-// that the cell renderer is built around
-#define M_UP                (1 << 0)
-#define M_DOWN              (1 << 1)
-#define M_LEFT              (1 << 2)
-#define M_RIGHT             (1 << 3)
 
 /*- Colors ------------------------------------------------------------------*/
 #define C_FIELD_A           LCD_COLOR(170, 215,  81)
@@ -139,12 +133,6 @@ enum
 };
 
 /*- Variables ---------------------------------------------------------------*/
-// The staging buffer one cell is composed in, and the coverage mask the shape
-// helpers build before it is painted. 768 bytes of TCM, against the 5.6 KB the
-// old point_t segment array took - the packed body below gives that back.
-static uint16_t g_tile[CELL * CELL];
-static uint8_t  g_shape[CELL * CELL];
-
 static uint8_t  g_cell[GRID_H][GRID_W];
 static uint16_t g_body[MAX_SNAKE];      // (y << 8) | x, index 0 is the head
 static int      g_len;
@@ -203,207 +191,23 @@ static void spawn_fruit(void);
 /*- Implementations ---------------------------------------------------------*/
 
 //-----------------------------------------------------------------------------
-// The tile compositor
-//
-// Everything inside the playfield is drawn by filling g_tile and blitting it.
-// The buffer is exactly one cell, so a partially drawn cell can never reach the
-// panel and there is no tearing to arbitrate.
-//-----------------------------------------------------------------------------
-
-//-----------------------------------------------------------------------------
-static inline void tile_set(int x, int y, uint16_t color)
-{
-    if (x >= 0 && x < CELL && y >= 0 && y < CELL)
-        g_tile[y * CELL + x] = color;
-}
-
-//-----------------------------------------------------------------------------
-static void tile_fill(uint16_t color)
-{
-    for (int i = 0; i < CELL * CELL; i++)
-        g_tile[i] = color;
-}
-
-//-----------------------------------------------------------------------------
-static void tile_rect(int x, int y, int w, int h, uint16_t color)
-{
-    for (int j = y; j < y + h; j++)
-    {
-        for (int i = x; i < x + w; i++)
-            tile_set(i, j, color);
-    }
-}
-
-//-----------------------------------------------------------------------------
-static void tile_blit(int px, int py)
-{
-    lcd_draw_buf(px, py, CELL, CELL, g_tile);
-}
-
-//-----------------------------------------------------------------------------
 static void tile_checker(int cx, int cy)
 {
-    tile_fill(((cx + cy) & 1) ? C_FIELD_A : C_FIELD_B);
-}
-
-//-----------------------------------------------------------------------------
-static void tile_sprite(const sprite_t *sprite)
-{
-    for (int y = 0; y < CELL; y++)
-    {
-        for (int x = 0; x < CELL; x++)
-        {
-            uint16_t color;
-
-            if (snake_pixel_color(sprite->rows[y][x], &color))
-                g_tile[y * CELL + x] = color;
-        }
-    }
-}
-
-//-----------------------------------------------------------------------------
-// Shapes
-//
-// A body cell is a core square inset by `margin`, with an arm out to each edge
-// the shape continues through. Corners are rounded only where both of their
-// sides are free, which is what makes a straight run read as a tube, an elbow
-// read as an elbow, and two adjacent cells join without a seam.
-//-----------------------------------------------------------------------------
-
-//-----------------------------------------------------------------------------
-// Pixel centres against a circle of radius r centred at (r, r), in halves so
-// the whole test stays in integers
-static bool inside_corner(int x, int y, int r)
-{
-    int dx = 2 * x + 1 - 2 * r;
-    int dy = 2 * y + 1 - 2 * r;
-
-    return dx * dx + dy * dy <= 4 * r * r;
-}
-
-//-----------------------------------------------------------------------------
-static void shape_build(int mask, int margin, int radius)
-{
-    int lo = margin;
-    int hi = CELL - 1 - margin;
-    int n = hi - lo;
-
-    memset(g_shape, 0, sizeof(g_shape));
-
-    for (int y = lo; y <= hi; y++)
-    {
-        for (int x = lo; x <= hi; x++)
-        {
-            int lx = x - lo;
-            int ly = y - lo;
-
-            if (!(mask & M_UP) && !(mask & M_LEFT) &&
-                lx < radius && ly < radius && !inside_corner(lx, ly, radius))
-                continue;
-
-            if (!(mask & M_UP) && !(mask & M_RIGHT) &&
-                n - lx < radius && ly < radius &&
-                !inside_corner(n - lx, ly, radius))
-                continue;
-
-            if (!(mask & M_DOWN) && !(mask & M_LEFT) &&
-                lx < radius && n - ly < radius &&
-                !inside_corner(lx, n - ly, radius))
-                continue;
-
-            if (!(mask & M_DOWN) && !(mask & M_RIGHT) &&
-                n - lx < radius && n - ly < radius &&
-                !inside_corner(n - lx, n - ly, radius))
-                continue;
-
-            g_shape[y * CELL + x] = 1;
-        }
-    }
-
-    // Arms out to the edges the shape continues through. With margin 0 the core
-    // already reaches every edge and these are empty.
-    for (int i = 0; i < margin; i++)
-    {
-        for (int j = lo; j <= hi; j++)
-        {
-            if (mask & M_UP)    g_shape[i * CELL + j] = 1;
-            if (mask & M_DOWN)  g_shape[(CELL - 1 - i) * CELL + j] = 1;
-            if (mask & M_LEFT)  g_shape[j * CELL + i] = 1;
-            if (mask & M_RIGHT) g_shape[j * CELL + CELL - 1 - i] = 1;
-        }
-    }
-}
-
-//-----------------------------------------------------------------------------
-// The tail, tapering from a full-width joint at the connected edge to a two
-// pixel tip at the other one
-static void shape_tail(int mask)
-{
-    memset(g_shape, 0, sizeof(g_shape));
-
-    for (int i = 0; i < CELL; i++)
-    {
-        // Square law rather than linear: the tail keeps most of the body's
-        // width and only draws in near the tip, which reads as a tail. A
-        // straight taper across the whole cell reads as an arrowhead.
-        int half = 7 - (i * i * 5) / ((CELL - 1) * (CELL - 1));
-
-        for (int j = 8 - half; j <= 7 + half; j++)
-        {
-            int x, y;
-
-            switch (mask)
-            {
-                case M_LEFT:  x = i;            y = j;            break;
-                case M_RIGHT: x = CELL - 1 - i; y = j;            break;
-                case M_UP:    x = j;            y = i;            break;
-                default:      x = j;            y = CELL - 1 - i; break;
-            }
-
-            g_shape[y * CELL + x] = 1;
-        }
-    }
-}
-
-//-----------------------------------------------------------------------------
-// Paints the mask, lighting the pixels whose neighbour above is empty and
-// shading the ones whose neighbour below is empty. That single rule gives every
-// shape a rim light without any of them having to know their own outline.
-//
-// A row at the very edge of the cell is only ever filled where the shape
-// continues into the next cell, so treating off-tile as filled is what keeps
-// the seam between two cells unlit.
-static void shape_paint(uint16_t body, uint16_t top, uint16_t bottom)
-{
-    for (int y = 0; y < CELL; y++)
-    {
-        for (int x = 0; x < CELL; x++)
-        {
-            if (!g_shape[y * CELL + x])
-                continue;
-
-            if (y > 0 && !g_shape[(y - 1) * CELL + x])
-                g_tile[y * CELL + x] = top;
-            else if (y < CELL - 1 && !g_shape[(y + 1) * CELL + x])
-                g_tile[y * CELL + x] = bottom;
-            else
-                g_tile[y * CELL + x] = body;
-        }
-    }
+    gfx_fill(((cx + cy) & 1) ? C_FIELD_A : C_FIELD_B);
 }
 
 //-----------------------------------------------------------------------------
 static void tile_eye(int x, int y, int px, int py, uint16_t body)
 {
-    tile_rect(x, y, 4, 4, C_EYE);
+    gfx_rect(x, y, 4, 4, C_EYE);
 
     // Knocking the corners off is what makes a 4 px eye read as round
-    tile_set(x,     y,     body);
-    tile_set(x + 3, y,     body);
-    tile_set(x,     y + 3, body);
-    tile_set(x + 3, y + 3, body);
+    gfx_set(x,     y,     body);
+    gfx_set(x + 3, y,     body);
+    gfx_set(x,     y + 3, body);
+    gfx_set(x + 3, y + 3, body);
 
-    tile_rect(x + px, y + py, 2, 2, C_PUPIL);
+    gfx_rect(x + px, y + py, 2, 2, C_PUPIL);
 }
 
 //-----------------------------------------------------------------------------
@@ -472,10 +276,10 @@ static int link_mask(int ax, int ay, int bx, int by)
         if (dy < -1) dy += GRID_H;
     }
 
-    if (0 == dy && 1 == dx)  return M_RIGHT;
-    if (0 == dy && -1 == dx) return M_LEFT;
-    if (0 == dx && 1 == dy)  return M_DOWN;
-    if (0 == dx && -1 == dy) return M_UP;
+    if (0 == dy && 1 == dx)  return GFX_RIGHT;
+    if (0 == dy && -1 == dx) return GFX_LEFT;
+    if (0 == dx && 1 == dy)  return GFX_DOWN;
+    if (0 == dx && -1 == dy) return GFX_UP;
 
     return 0;
 }
@@ -485,17 +289,17 @@ static int wall_mask(int cx, int cy)
 {
     int mask = 0;
 
-    if (cy > 0 && CELL_WALL == g_cell[cy - 1][cx])          mask |= M_UP;
-    if (cy < GRID_H - 1 && CELL_WALL == g_cell[cy + 1][cx]) mask |= M_DOWN;
-    if (cx > 0 && CELL_WALL == g_cell[cy][cx - 1])          mask |= M_LEFT;
-    if (cx < GRID_W - 1 && CELL_WALL == g_cell[cy][cx + 1]) mask |= M_RIGHT;
+    if (cy > 0 && CELL_WALL == g_cell[cy - 1][cx])          mask |= GFX_UP;
+    if (cy < GRID_H - 1 && CELL_WALL == g_cell[cy + 1][cx]) mask |= GFX_DOWN;
+    if (cx > 0 && CELL_WALL == g_cell[cy][cx - 1])          mask |= GFX_LEFT;
+    if (cx < GRID_W - 1 && CELL_WALL == g_cell[cy][cx + 1]) mask |= GFX_RIGHT;
 
     // A block on the edge of the panel is drawn square, so the wall reads as
     // continuing past the screen instead of stopping just short of it
-    if (0 == cy) mask |= M_UP;
-    if (GRID_H - 1 == cy) mask |= M_DOWN;
-    if (0 == cx) mask |= M_LEFT;
-    if (GRID_W - 1 == cx) mask |= M_RIGHT;
+    if (0 == cy) mask |= GFX_UP;
+    if (GRID_H - 1 == cy) mask |= GFX_DOWN;
+    if (0 == cx) mask |= GFX_LEFT;
+    if (GRID_W - 1 == cx) mask |= GFX_RIGHT;
 
     return mask;
 }
@@ -515,17 +319,17 @@ static void paint_cell(int cx, int cy)
     switch (g_cell[cy][cx])
     {
         case CELL_WALL:
-            shape_build(wall_mask(cx, cy), 0, 4);
-            shape_paint(C_WALL, C_WALL_TOP, C_WALL_BOT);
+            gfx_shape_box(wall_mask(cx, cy), 0, 4);
+            gfx_shape_paint(C_WALL, C_WALL_TOP, C_WALL_BOT);
             break;
 
         case CELL_FRUIT:
-            tile_sprite(g_fruit_spr);
+            gfx_sprite(g_fruit_spr);
             break;
 
         case CELL_BONUS:
             if (g_bonus_shown)
-                tile_sprite(&snake_spr_gold);
+                gfx_sprite(&snake_spr_gold);
             break;
 
         case CELL_SNAKE:
@@ -544,19 +348,19 @@ static void paint_cell(int cx, int cy)
 
             if (g_len > 1 && i == g_len - 1)
             {
-                shape_tail(link_mask(cx, cy, body_x(i - 1), body_y(i - 1)));
-                shape_paint(body, top, bot);
+                gfx_shape_taper(link_mask(cx, cy, body_x(i - 1), body_y(i - 1)));
+                gfx_shape_paint(body, top, bot);
             }
             else if (0 == i)
             {
-                shape_build(mask, 1, 6);
-                shape_paint(body, top, bot);
+                gfx_shape_box(mask, 1, 6);
+                gfx_shape_paint(body, top, bot);
                 tile_eyes(g_dir, body);
             }
             else
             {
-                shape_build(mask, 1, 5);
-                shape_paint(body, top, bot);
+                gfx_shape_box(mask, 1, 5);
+                gfx_shape_paint(body, top, bot);
             }
             break;
         }
@@ -565,7 +369,7 @@ static void paint_cell(int cx, int cy)
             break;
     }
 
-    tile_blit(cx * CELL, FIELD_Y + cy * CELL);
+    gfx_blit(cx * CELL, FIELD_Y + cy * CELL);
 }
 
 //-----------------------------------------------------------------------------
@@ -601,90 +405,8 @@ static void repaint_region(int x, int y, int w, int h)
 }
 
 //-----------------------------------------------------------------------------
-// Text
-//-----------------------------------------------------------------------------
-
-//-----------------------------------------------------------------------------
-static void put_text(int x, int y, const char *str, const Font *font,
-    uint16_t fg, uint16_t bg)
-{
-    lcd_set_font(font);
-    lcd_set_color(bg, fg);
-    lcd_puts(x, y, str);
-}
-
-//-----------------------------------------------------------------------------
-static void put_text_centered(int cx, int y, const char *str, const Font *font,
-    uint16_t fg, uint16_t bg)
-{
-    put_text(cx - (int)strlen(str) * font->width / 2, y, str, font, fg, bg);
-}
-
-//-----------------------------------------------------------------------------
-// The panel headings, drawn by scaling the 8x16 font. A row of the glyph is
-// expanded into a line buffer and blitted `scale` times - 8x16 is the largest
-// font in the firmware, and a title has to be bigger than a menu label.
-#define TEXT_MAX_SCALE      3
-
-static void draw_glyph_scaled(int x, int y, char ch, int scale,
-    uint16_t fg, uint16_t bg)
-{
-    const Font *font = FONT_LARGE;
-    uint16_t line[8 * TEXT_MAX_SCALE];
-    const uint8_t *bitmap;
-
-    if (ch < FONT_FIRST_CHAR || ch > FONT_LAST_CHAR)
-        ch = '?';
-
-    bitmap = font->data + (ch - FONT_FIRST_CHAR) * font->pitch;
-
-    for (int gy = 0; gy < font->height; gy++)
-    {
-        for (int gx = 0; gx < font->width; gx++)
-        {
-            int i = gy * font->width + gx;
-            uint16_t c = ((bitmap[i / 8] >> (i % 8)) & 1) ? fg : bg;
-
-            for (int s = 0; s < scale; s++)
-                line[gx * scale + s] = c;
-        }
-
-        for (int s = 0; s < scale; s++)
-            lcd_draw_buf(x, y + gy * scale + s, font->width * scale, 1, line);
-    }
-}
-
-//-----------------------------------------------------------------------------
-static int text_scaled_width(const char *str, int scale)
-{
-    return (int)strlen(str) * (FONT_LARGE)->width * scale;
-}
-
-//-----------------------------------------------------------------------------
-static void draw_text_scaled(int x, int y, const char *str, int scale,
-    uint16_t fg, uint16_t bg)
-{
-    if (scale > TEXT_MAX_SCALE)
-        scale = TEXT_MAX_SCALE;
-
-    while (*str)
-    {
-        draw_glyph_scaled(x, y, *str++, scale, fg, bg);
-        x += (FONT_LARGE)->width * scale;
-    }
-}
-
-//-----------------------------------------------------------------------------
 // The status bar
 //-----------------------------------------------------------------------------
-
-//-----------------------------------------------------------------------------
-static void draw_sprite_at(int px, int py, const sprite_t *sprite, uint16_t bg)
-{
-    tile_fill(bg);
-    tile_sprite(sprite);
-    tile_blit(px, py);
-}
 
 //-----------------------------------------------------------------------------
 static const snake_level_t *current_level(void)
@@ -726,33 +448,33 @@ static void draw_hud(void)
     lcd_fill_rect(0, 0, LCD_WIDTH, HUD_H, C_HUD);
     lcd_fill_rect(0, HUD_H - 2, LCD_WIDTH, 2, C_HUD_EDGE);
 
-    draw_sprite_at(6, 8, &snake_spr_apple, C_HUD);
+    gfx_draw_sprite(6, 8, &snake_spr_apple, C_HUD);
 
     snprintf(buf, sizeof(buf), "%d", g_score);
-    put_text(28, 8, buf, FONT_LARGE, C_TEXT, C_HUD);
+    gfx_text(28, 8, buf, FONT_LARGE, C_TEXT, C_HUD);
 
     if (MODE_CLASSIC == g_mode)
     {
         snprintf(buf, sizeof(buf), "CLASSIC - %s",
             g_wrap ? "WRAP" : "WALLS");
-        put_text(112, 4, buf, FONT_SMALL, C_TEXT_DIM, C_HUD);
+        gfx_text(112, 4, buf, FONT_SMALL, C_TEXT_DIM, C_HUD);
 
         snprintf(buf, sizeof(buf), "LENGTH %d", g_len);
-        put_text(112, 16, buf, FONT_SMALL, C_TEXT_DIM, C_HUD);
+        gfx_text(112, 16, buf, FONT_SMALL, C_TEXT_DIM, C_HUD);
     }
     else
     {
         snprintf(buf, sizeof(buf), "LEVEL %d - %s",
             g_level + 1, current_level()->name);
-        put_text(112, 4, buf, FONT_SMALL, C_TEXT_DIM, C_HUD);
+        gfx_text(112, 4, buf, FONT_SMALL, C_TEXT_DIM, C_HUD);
 
         snprintf(buf, sizeof(buf), "FRUIT %d/%d  LENGTH %d",
             g_eaten, level_target(), g_len);
-        put_text(112, 16, buf, FONT_SMALL, C_TEXT_DIM, C_HUD);
+        gfx_text(112, 16, buf, FONT_SMALL, C_TEXT_DIM, C_HUD);
     }
 
     snprintf(buf, sizeof(buf), "BEST %d", g_best);
-    put_text(LCD_WIDTH - 4 - (int)strlen(buf) * (FONT_SMALL)->width, 10, buf,
+    gfx_text(LCD_WIDTH - 4 - (int)strlen(buf) * (FONT_SMALL)->width, 10, buf,
         FONT_SMALL, C_GOLD, C_HUD);
 }
 
@@ -768,10 +490,7 @@ static void panel_open(int w, int h)
     g_panel_x = (LCD_WIDTH - w) / 2;
     g_panel_y = FIELD_Y + (FIELD_H - h) / 2;
 
-    lcd_fill_rect(g_panel_x + 4, g_panel_y + 4, w, h, C_SHADOW);
-    lcd_fill_rect(g_panel_x, g_panel_y, w, h, C_PANEL);
-    lcd_draw_rect(g_panel_x, g_panel_y, w, h, C_PANEL_EDGE);
-    lcd_draw_rect(g_panel_x + 1, g_panel_y + 1, w - 2, h - 2, C_PANEL_EDGE);
+    gfx_panel(g_panel_x, g_panel_y, w, h, C_PANEL, C_PANEL_EDGE, C_SHADOW);
 }
 
 //-----------------------------------------------------------------------------
@@ -795,38 +514,38 @@ static void draw_title_snake(int px, int py)
     // that says two cells are joined does not make them touch on its own.
     static const struct { int8_t cx, cy, mask; } piece[] =
     {
-        { 0, 0, M_RIGHT },              // tail
-        { 1, 0, M_LEFT | M_RIGHT },
-        { 2, 0, M_LEFT | M_RIGHT },
-        { 3, 0, M_LEFT | M_DOWN },      // the turn
-        { 3, 1, M_UP },                 // head, looking down at the apple
+        { 0, 0, GFX_RIGHT },              // tail
+        { 1, 0, GFX_LEFT | GFX_RIGHT },
+        { 2, 0, GFX_LEFT | GFX_RIGHT },
+        { 3, 0, GFX_LEFT | GFX_DOWN },      // the turn
+        { 3, 1, GFX_UP },                 // head, looking down at the apple
     };
 
     for (int i = 0; i < ARRAY_SIZE(piece); i++)
     {
-        tile_fill(C_PANEL);
+        gfx_fill(C_PANEL);
 
         if (0 == i)
         {
-            shape_tail(piece[i].mask);
-            shape_paint(C_SNAKE, C_SNAKE_TOP, C_SNAKE_BOT);
+            gfx_shape_taper(piece[i].mask);
+            gfx_shape_paint(C_SNAKE, C_SNAKE_TOP, C_SNAKE_BOT);
         }
         else if (ARRAY_SIZE(piece) - 1 == i)
         {
-            shape_build(piece[i].mask, 1, 6);
-            shape_paint(C_SNAKE, C_SNAKE_TOP, C_SNAKE_BOT);
+            gfx_shape_box(piece[i].mask, 1, 6);
+            gfx_shape_paint(C_SNAKE, C_SNAKE_TOP, C_SNAKE_BOT);
             tile_eyes(DIR_DOWN, C_SNAKE);
         }
         else
         {
-            shape_build(piece[i].mask, 1, 5);
-            shape_paint(C_SNAKE, C_SNAKE_TOP, C_SNAKE_BOT);
+            gfx_shape_box(piece[i].mask, 1, 5);
+            gfx_shape_paint(C_SNAKE, C_SNAKE_TOP, C_SNAKE_BOT);
         }
 
-        tile_blit(px + piece[i].cx * CELL, py + piece[i].cy * CELL);
+        gfx_blit(px + piece[i].cx * CELL, py + piece[i].cy * CELL);
     }
 
-    draw_sprite_at(px + 3 * CELL, py + 2 * CELL + 2, &snake_spr_apple, C_PANEL);
+    gfx_draw_sprite(px + 3 * CELL, py + 2 * CELL + 2, &snake_spr_apple, C_PANEL);
 }
 
 //-----------------------------------------------------------------------------
@@ -838,27 +557,27 @@ static void draw_title_panel(void)
     x = g_panel_x;
     y = g_panel_y;
 
-    draw_text_scaled(x + (276 - text_scaled_width("SNAKE", 3)) / 2, y + 14,
+    gfx_text_scaled(x + (276 - gfx_text_scaled_width("SNAKE", 3)) / 2, y + 14,
         "SNAKE", 3, C_TEXT, C_PANEL);
 
-    put_text_centered(x + 138, y + 66,
+    gfx_text_centered(x + 138, y + 66,
         (MODE_CLASSIC == g_mode) ? "CLASSIC - ENDLESS FIELD"
                                  : "CAMPAIGN - 8 LEVELS",
         FONT_SMALL, C_GOLD, C_PANEL);
 
     draw_title_snake(x + 24, y + 88);
 
-    put_text(x + 132, y + 92, "MODE   start", FONT_SMALL, C_TEXT, C_PANEL);
-    put_text(x + 132, y + 106, "arrows steer", FONT_SMALL, C_TEXT_DIM, C_PANEL);
-    put_text(x + 132, y + 120, "MENU   settings", FONT_SMALL, C_TEXT_DIM, C_PANEL);
-    put_text(x + 132, y + 134, "SHIFT+MENU exit", FONT_SMALL, C_TEXT_DIM, C_PANEL);
+    gfx_text(x + 132, y + 92, "MODE   start", FONT_SMALL, C_TEXT, C_PANEL);
+    gfx_text(x + 132, y + 106, "arrows steer", FONT_SMALL, C_TEXT_DIM, C_PANEL);
+    gfx_text(x + 132, y + 120, "MENU   settings", FONT_SMALL, C_TEXT_DIM, C_PANEL);
+    gfx_text(x + 132, y + 134, "SHIFT+MENU exit", FONT_SMALL, C_TEXT_DIM, C_PANEL);
 
     if (g_best > 0)
     {
         char buf[32];
 
         snprintf(buf, sizeof(buf), "BEST %d", g_best);
-        put_text_centered(x + 138, y + 150, buf, FONT_SMALL, C_GOLD, C_PANEL);
+        gfx_text_centered(x + 138, y + 150, buf, FONT_SMALL, C_GOLD, C_PANEL);
     }
 }
 
@@ -870,10 +589,10 @@ static void draw_ready_panel(void)
     panel_open(96, 96);
 
     snprintf(buf, sizeof(buf), "%d", g_anim_step);
-    draw_text_scaled(g_panel_x + (96 - text_scaled_width(buf, 3)) / 2,
+    gfx_text_scaled(g_panel_x + (96 - gfx_text_scaled_width(buf, 3)) / 2,
         g_panel_y + 12, buf, 3, C_GOLD, C_PANEL);
 
-    put_text_centered(g_panel_x + 48, g_panel_y + 70, "GET READY", FONT_SMALL,
+    gfx_text_centered(g_panel_x + 48, g_panel_y + 70, "GET READY", FONT_SMALL,
         C_TEXT, C_PANEL);
 }
 
@@ -882,12 +601,12 @@ static void draw_pause_panel(void)
 {
     panel_open(220, 96);
 
-    draw_text_scaled(g_panel_x + (220 - text_scaled_width("PAUSED", 2)) / 2,
+    gfx_text_scaled(g_panel_x + (220 - gfx_text_scaled_width("PAUSED", 2)) / 2,
         g_panel_y + 18, "PAUSED", 2, C_TEXT, C_PANEL);
 
-    put_text_centered(g_panel_x + 110, g_panel_y + 58, "MODE  resume",
+    gfx_text_centered(g_panel_x + 110, g_panel_y + 58, "MODE  resume",
         FONT_SMALL, C_TEXT, C_PANEL);
-    put_text_centered(g_panel_x + 110, g_panel_y + 72, "MENU  settings",
+    gfx_text_centered(g_panel_x + 110, g_panel_y + 72, "MENU  settings",
         FONT_SMALL, C_TEXT_DIM, C_PANEL);
 }
 
@@ -901,33 +620,33 @@ static void draw_over_panel(void)
     x = g_panel_x;
     y = g_panel_y;
 
-    draw_sprite_at(x + 22, y + 20, &snake_spr_skull, C_PANEL);
-    draw_text_scaled(x + 52, y + 14, "GAME OVER", 2, C_TEXT, C_PANEL);
+    gfx_draw_sprite(x + 22, y + 20, &snake_spr_skull, C_PANEL);
+    gfx_text_scaled(x + 52, y + 14, "GAME OVER", 2, C_TEXT, C_PANEL);
 
     snprintf(buf, sizeof(buf), "SCORE %d   LENGTH %d", g_score, g_len);
-    put_text_centered(x + 134, y + 54, buf, FONT_SMALL, C_TEXT, C_PANEL);
+    gfx_text_centered(x + 134, y + 54, buf, FONT_SMALL, C_TEXT, C_PANEL);
 
     if (g_new_best)
-        put_text_centered(x + 134, y + 70, "NEW BEST SCORE", FONT_SMALL,
+        gfx_text_centered(x + 134, y + 70, "NEW BEST SCORE", FONT_SMALL,
             C_GOLD, C_PANEL);
     else
     {
         snprintf(buf, sizeof(buf), "BEST %d", g_best);
-        put_text_centered(x + 134, y + 70, buf, FONT_SMALL, C_GOLD, C_PANEL);
+        gfx_text_centered(x + 134, y + 70, buf, FONT_SMALL, C_GOLD, C_PANEL);
     }
 
     if (MODE_LEVELS == g_mode)
     {
         snprintf(buf, sizeof(buf), "MODE  retry level %d", g_level + 1);
-        put_text_centered(x + 134, y + 96, buf, FONT_SMALL, C_TEXT, C_PANEL);
-        put_text_centered(x + 134, y + 110, "SHIFT+MODE  new run", FONT_SMALL,
+        gfx_text_centered(x + 134, y + 96, buf, FONT_SMALL, C_TEXT, C_PANEL);
+        gfx_text_centered(x + 134, y + 110, "SHIFT+MODE  new run", FONT_SMALL,
             C_TEXT_DIM, C_PANEL);
     }
     else
     {
-        put_text_centered(x + 134, y + 96, "MODE  play again", FONT_SMALL,
+        gfx_text_centered(x + 134, y + 96, "MODE  play again", FONT_SMALL,
             C_TEXT, C_PANEL);
-        put_text_centered(x + 134, y + 110, "SHIFT+MENU  exit", FONT_SMALL,
+        gfx_text_centered(x + 134, y + 110, "SHIFT+MENU  exit", FONT_SMALL,
             C_TEXT_DIM, C_PANEL);
     }
 }
@@ -941,10 +660,10 @@ static void draw_clear_panel(void)
     panel_open(252, 112);
 
     snprintf(buf, sizeof(buf), "LEVEL %d", g_level + 1);
-    draw_text_scaled(g_panel_x + (252 - text_scaled_width(buf, 2)) / 2,
+    gfx_text_scaled(g_panel_x + (252 - gfx_text_scaled_width(buf, 2)) / 2,
         g_panel_y + 14, buf, 2, C_TEXT, C_PANEL);
 
-    put_text_centered(g_panel_x + 126, g_panel_y + 50, "CLEARED", FONT_SMALL,
+    gfx_text_centered(g_panel_x + 126, g_panel_y + 50, "CLEARED", FONT_SMALL,
         C_GOLD, C_PANEL);
 
     if (0 == next)
@@ -952,9 +671,9 @@ static void draw_clear_panel(void)
     else
         snprintf(buf, sizeof(buf), "NEXT: %s", snake_levels[next].name);
 
-    put_text_centered(g_panel_x + 126, g_panel_y + 72, buf, FONT_SMALL,
+    gfx_text_centered(g_panel_x + 126, g_panel_y + 72, buf, FONT_SMALL,
         C_TEXT, C_PANEL);
-    put_text_centered(g_panel_x + 126, g_panel_y + 90, "MODE  continue",
+    gfx_text_centered(g_panel_x + 126, g_panel_y + 90, "MODE  continue",
         FONT_SMALL, C_TEXT_DIM, C_PANEL);
 }
 
