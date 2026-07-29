@@ -22,13 +22,16 @@
 #include <stdint.h>
 #include <SDL.h>
 
-/* The whole body, in panel units */
-#define PANEL_W   360
-#define PANEL_H   482
+/* The whole thing, bumper included, in panel units. The proportions are the
+ * instrument's: the screen is a little under four fifths of the body's width
+ * and a bit over a third of its height, which is why the keys sit as low as
+ * they do. */
+#define PANEL_W   438
+#define PANEL_H   690
 
 /* Where the LCD sits in it */
-#define PANEL_SCREEN_X  20
-#define PANEL_SCREEN_Y  20
+#define PANEL_SCREEN_X  59
+#define PANEL_SCREEN_Y  76
 
 /* Draws the body and the keys. `pressed` is the button mask as the board sees
  * it, so a key lights up whether it was reached by mouse or by keyboard. */

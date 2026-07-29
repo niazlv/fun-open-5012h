@@ -76,11 +76,7 @@ bool video_init(int scale, bool headless, bool bare, const char *title)
 {
   g_headless = headless;
   g_bare = bare;
-
-  // Without a magnification asked for, pick one that fits: the panel is twice
-  // the height of the screen it surrounds, so what suits a bare window is too
-  // tall for one with a body around it.
-  g_scale = scale > 0 ? scale : (bare ? 3 : 2);
+  g_scale = scale > 0 ? scale : 3;
 
 #ifdef EMU_NO_SDL
   (void)title;
@@ -95,6 +91,21 @@ bool video_init(int scale, bool headless, bool bare, const char *title)
     emu_log("SDL_Init: %s - falling back to headless", SDL_GetError());
     g_headless = true;
     return true;
+  }
+
+  // Without a magnification asked for, take the largest that leaves the whole
+  // instrument on the display. The body is more than twice the height of the
+  // screen in it - the number that suits a bare window is far too big here.
+  if (scale <= 0)
+  {
+    SDL_Rect usable;
+    int want = g_bare ? LCD_H : PANEL_H;
+
+    if (SDL_GetDisplayUsableBounds(0, &usable) == 0)
+    {
+      while (g_scale > 1 && want * g_scale > usable.h - 80)
+        g_scale--;
+    }
   }
 
   g_window = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED,

@@ -78,32 +78,35 @@ static const uint8_t g_font[][5] =
   { 0x61,0x51,0x49,0x45,0x43 }, /* Z     */
 };
 
-/* The panel, in panel units. The two columns and the cursor cross sit in the
- * band under the screen; the grey keys fill the two rows below that. */
+/* The keys, in panel units, arranged the way they are on the case: two
+ * columns of yellow ones down the sides with the cursor cross between them,
+ * then the grey ones in two rows underneath. They are small and far apart -
+ * most of the lower half of the instrument is bare plastic, and the panel
+ * looks wrong without that space. */
 static const PanelKey g_panel[] =
 {
-  {  16, 284, 64, 30, 1u <<  9, "MENU",  "ESC",     0, true  },
-  {  16, 320, 64, 30, 1u << 13, "SAVE",  "S",       0, true  },
-  {  16, 356, 64, 30, 1u << 14, "TRIG",  "T",       0, true  },
+  {  46, 356, 62, 28, 1u <<  9, "MENU",  "ESC",     0, true  },
+  {  46, 416, 62, 28, 1u << 13, "SAVE",  "S",       0, true  },
+  {  46, 476, 62, 28, 1u << 14, "TRIG",  "T",       0, true  },
 
-  { 280, 284, 64, 30, 1u <<  3, "MODE",  "ENTER M", 0, true  },
-  { 280, 320, 64, 30, 1u <<  7, "AUTO",  "A",     0,   true  },
-  { 280, 356, 64, 30, 1u <<  0, "STOP",  "SPACE", 0,   true  },
+  { 330, 356, 62, 28, 1u <<  3, "MODE",  "ENTER M", 0, true  },
+  { 330, 416, 62, 28, 1u <<  7, "AUTO",  "A",       0, true  },
+  { 330, 476, 62, 28, 1u <<  0, "STOP",  "SPACE",   0, true  },
 
-  { 162, 286, 36, 28, 1u <<  1, NULL,    NULL,    'U', false },
-  { 120, 320, 38, 28, 1u << 11, NULL,    NULL,    'L', false },
-  { 202, 320, 38, 28, 1u <<  5, NULL,    NULL,    'R', false },
-  { 162, 354, 36, 28, 1u << 15, NULL,    NULL,    'D', false },
+  { 186, 352, 66, 26, 1u <<  1, NULL,    NULL,    'U', false },
+  { 145, 390, 26, 66, 1u << 11, NULL,    NULL,    'L', false },
+  { 267, 390, 26, 66, 1u <<  5, NULL,    NULL,    'R', false },
+  { 186, 468, 66, 26, 1u << 15, NULL,    NULL,    'D', false },
 
-  {  11, 396, 74, 32, 1u << 10, NULL,    "PGUP",  'U', false },
-  {  99, 396, 74, 32, 1u <<  8, "50%",   "5",     0,   false },
-  { 187, 396, 74, 32, 1u <<  6, "AC/DC", "C",     0,   false },
-  { 275, 396, 74, 32, 1u << 17, "1X10X", "SHIFT", 0,   false },
+  {  46, 548, 62, 30, 1u << 10, NULL,    "PGUP",  'U', false },
+  { 141, 548, 62, 30, 1u <<  8, "50%",   "5",     0,   false },
+  { 236, 548, 62, 30, 1u <<  6, "AC/DC", "C",     0,   false },
+  { 330, 548, 62, 30, 1u << 17, "1X10X", "SHIFT", 0,   false },
 
-  {  11, 434, 74, 32, 1u << 12, NULL,    "PGDN",  'D', false },
-  {  99, 434, 74, 32, 1u <<  2, "EDGE",  "E",     0,   false },
-  { 187, 434, 74, 32, 1u <<  4, "F1",    "F1",    0,   false },
-  { 275, 434, 74, 32, 1u << 16, "F2",    "F2",    0,   false },
+  {  46, 610, 62, 30, 1u << 12, NULL,    "PGDN",  'D', false },
+  { 141, 610, 62, 30, 1u <<  2, "EDGE",  "E",     0,   false },
+  { 236, 610, 62, 30, 1u <<  4, "F1",    "F1",    0,   false },
+  { 330, 610, 62, 30, 1u << 16, "F2",    "F2",    0,   false },
 };
 
 /*- Implementations ---------------------------------------------------------*/
@@ -136,6 +139,55 @@ static void fill(SDL_Renderer *r, int x, int y, int w, int h, uint32_t rgb)
 
   set_colour(r, rgb);
   SDL_RenderFillRect(r, &rect);
+}
+
+//-----------------------------------------------------------------------------
+// Nothing on this instrument has a square corner. Drawn a row at a time, with
+// the corners inset by however far the radius has left to go.
+static void round_rect(SDL_Renderer *r, int x, int y, int w, int h, int rad,
+    uint32_t rgb)
+{
+  if (rad * 2 > w) rad = w / 2;
+  if (rad * 2 > h) rad = h / 2;
+
+  set_colour(r, rgb);
+
+  for (int row = 0; row < h; row++)
+  {
+    int inset = 0;
+
+    if (row < rad || row >= h - rad)
+    {
+      int dy = (row < rad) ? (rad - row - 1) : (row - (h - rad));
+      int dx = (int)(SDL_sqrtf((float)(rad * rad - (dy + 1) * (dy + 1))) + 0.5f);
+
+      inset = rad - dx;
+    }
+
+    {
+      SDL_Rect span = { x + inset, y + row, w - 2 * inset, 1 };
+      SDL_RenderFillRect(r, &span);
+    }
+  }
+}
+
+//-----------------------------------------------------------------------------
+// The four cursor keys are petals rather than rectangles - pointed at both
+// ends, widest in the middle. An ellipse is close enough at this size, and it
+// is what makes the cross read as this instrument's cross.
+static void petal(SDL_Renderer *r, int x, int y, int w, int h, uint32_t rgb)
+{
+  set_colour(r, rgb);
+
+  for (int row = 0; row < h; row++)
+  {
+    float t = (2.0f * (row + 0.5f) / (float)h) - 1.0f;
+    int half = (int)(w * 0.5f * SDL_sqrtf(1.0f - t * t) + 0.5f);
+    SDL_Rect span = { x + w / 2 - half, y + row, 2 * half, 1 };
+
+    if (half > 0)
+      SDL_RenderFillRect(r, &span);
+  }
 }
 
 //-----------------------------------------------------------------------------
@@ -198,16 +250,26 @@ static void triangle(SDL_Renderer *r, int cx, int cy, int size, char dir,
 //-----------------------------------------------------------------------------
 void panel_draw(SDL_Renderer *r, int scale, uint32_t pressed)
 {
-  const int glyph_px = scale > 2 ? scale - 1 : 1;
-  const int hint_px  = scale > 3 ? scale - 2 : 1;
+  const int glyph_px = scale;
+  const int hint_px  = scale > 1 ? scale - 1 : 1;
 
-  // The case: a dark body inside the yellow bumper the instrument is wrapped
-  // in, with the screen sunk into a black bezel
-  fill(r, 0, 0, PANEL_W * scale, PANEL_H * scale, 0xE8C317);
-  fill(r, 4 * scale, 4 * scale, (PANEL_W - 8) * scale, (PANEL_H - 8) * scale,
-      0x2A2E33);
-  fill(r, (PANEL_SCREEN_X - 6) * scale, (PANEL_SCREEN_Y - 6) * scale,
-      (LCD_W + 12) * scale, (LCD_H + 12) * scale, 0x101214);
+  // The case, outside in: the rubber bumper the instrument is wrapped in, the
+  // dark body inside it, the recess the display sits in, and the black bezel
+  // around the glass itself.
+  set_colour(r, 0x1B1D1F);
+  SDL_RenderClear(r);
+
+  round_rect(r, 0, 0, PANEL_W * scale, PANEL_H * scale, 26 * scale, 0xEFC71B);
+  round_rect(r, 14 * scale, 14 * scale, (PANEL_W - 28) * scale,
+      (PANEL_H - 28) * scale, 16 * scale, 0x33383D);
+  round_rect(r, 34 * scale, 52 * scale, (PANEL_W - 68) * scale, 292 * scale,
+      6 * scale, 0x24282C);
+  fill(r, (PANEL_SCREEN_X - 5) * scale, (PANEL_SCREEN_Y - 5) * scale,
+      (LCD_W + 10) * scale, (LCD_H + 10) * scale, 0x0B0C0D);
+
+  // The bandwidth marking, where the case carries it
+  text(r, (PANEL_W - 66) * scale, 30 * scale, "100MHZ",
+      scale > 2 ? scale - 1 : 1, 0xD6DADE);
 
   for (int i = 0; i < KEY_COUNT; i++)
   {
@@ -215,26 +277,37 @@ void panel_draw(SDL_Renderer *r, int scale, uint32_t pressed)
     bool down = (pressed & k->btn) != 0;
     int x = k->x * scale, y = k->y * scale;
     int w = k->w * scale, h = k->h * scale;
+    int sink = down ? scale : 0;
     uint32_t face, ink;
 
     if (k->amber)
     {
-      face = down ? 0xFFDD44 : 0xD8A81B;
-      ink  = 0x201A05;
+      face = down ? 0xFFE258 : 0xE3B41F;
+      ink  = 0x1E1806;
     }
     else
     {
-      face = down ? 0xF2F4F6 : 0xB9BEC4;
-      ink  = 0x1A1D20;
+      face = down ? 0xFAFBFC : 0xC6CBD1;
+      ink  = 0x17191C;
     }
 
-    // A hint of relief: the shadow under the key, then the key on top of it
-    fill(r, x, y + scale, w, h, 0x15181B);
-    fill(r, x, y + (down ? scale : 0), w, h - (down ? scale : 0), face);
+    // The key stands a little proud of the case: its shadow, then its face
+    if (k->arrow && !k->hint)
+    {
+      petal(r, x, y + 2 * scale, w, h, 0x1A1D20);
+      petal(r, x, y + sink, w, h, face);
+    }
+    else
+    {
+      int rad = (k->w > k->h ? k->h : k->w) / 3 * scale;
+
+      round_rect(r, x, y + 2 * scale, w, h, rad, 0x1A1D20);
+      round_rect(r, x, y + sink, w, h, rad, face);
+    }
 
     if (k->arrow)
     {
-      int cy = y + h / 2 + (down ? scale : 0);
+      int cy = y + h / 2 + sink;
       int size = (k->hint ? 5 : 7) * scale;
 
       triangle(r, x + w / 2, cy, size, k->arrow, ink);
@@ -243,7 +316,7 @@ void panel_draw(SDL_Renderer *r, int scale, uint32_t pressed)
     if (k->label)
     {
       int tw = text_width(k->label, glyph_px);
-      int ty = y + h / 2 - 4 * glyph_px + (down ? scale : 0);
+      int ty = y + h / 2 - 4 * glyph_px + sink;
 
       if (k->hint)
         ty -= 3 * glyph_px;
@@ -255,10 +328,10 @@ void panel_draw(SDL_Renderer *r, int scale, uint32_t pressed)
     if (k->hint)
     {
       int hw = text_width(k->hint, hint_px);
-      int hy = y + h - 4 * hint_px - 3 * scale + (down ? scale : 0);
+      int hy = y + h - 4 * hint_px - 3 * scale + sink;
 
       text(r, x + (w - hw) / 2, hy, k->hint, hint_px,
-          k->amber ? 0x6B5A18 : 0x63696F);
+          k->amber ? 0x6E5B17 : 0x666C72);
     }
   }
 }
