@@ -381,6 +381,7 @@ static const ui_screen_t key_remap_screen =
   .draw   = key_remap_draw,
   .input  = key_remap_input,
   .opaque = true,
+  .modal  = true,
 };
 
 //-----------------------------------------------------------------------------

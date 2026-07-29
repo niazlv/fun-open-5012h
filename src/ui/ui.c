@@ -117,6 +117,12 @@ int ui_depth(void)
 }
 
 //-----------------------------------------------------------------------------
+bool ui_modal_active(void)
+{
+  return g_depth && g_stack[g_depth - 1].scr->modal;
+}
+
+//-----------------------------------------------------------------------------
 bool ui_handle_input(int buttons)
 {
   if (0 == g_depth)

@@ -253,9 +253,21 @@ void error(char *text)
 }
 
 //-----------------------------------------------------------------------------
+// The voltage goes on the screen with it. Without it this halt is unarguable
+// and undiagnosable from the front panel: the one thing worth knowing is
+// whether the pack really was flat or the gauge only thought so, and the
+// device is not going to be running afterwards to be asked.
 void battery_low_handler(void)
 {
-  error("BATTERY LOW");
+  // On the stack, not static: TCM is down to its last hundreds of bytes, and
+  // error() never returns, so this frame outlives every use of the buffer
+  char text[32];
+  int mv = battery_voltage();
+
+  snprintf(text, sizeof(text), "BATTERY LOW  %d.%02d V", mv / 1000,
+      (mv % 1000) / 10);
+
+  error(text);
 }
 
 //-----------------------------------------------------------------------------
@@ -330,7 +342,7 @@ int main(void)
     timer_task();
     ui_task();
     shift_mode_task();
-    battery_task();
+    battery_task(!ui_modal_active());
     buttons_task();
     config_task();
     lcd_backlight_task(launcher_app_may_dim());

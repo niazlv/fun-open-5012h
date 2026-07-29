@@ -21,6 +21,7 @@
 #include "buttons.h"
 #include "config.h"
 #include "flash.h"
+#include "battery.h"
 #include "common.h"
 #include "utils.h"
 #include "scope.h"
@@ -249,7 +250,7 @@ enum
 #ifdef GIT_USER
   SI_BUILT_BY,
 #endif
-  SI_LOOP, SI_PANEL, SI_STORE, SI_CALIB, SI_SPI, SI_SPI_HEAD,
+  SI_LOOP, SI_PANEL, SI_BATTERY, SI_STORE, SI_CALIB, SI_SPI, SI_SPI_HEAD,
   SI_COUNT,
 };
 
@@ -340,6 +341,13 @@ static const char *system_info_line(int index)
     // bld/pnt=texts built and bands repainted, len=length of the current text
     case SI_PANEL:
       scope_get_panel_state(buf, size);
+      break;
+
+    // Charge, cell voltage and what the charger pin says. The icon in the
+    // corner is 16 pixels wide and cannot be read to better than 6 %; this is
+    // the same reading in figures, and Advanced > Battery breaks it down.
+    case SI_BATTERY:
+      battery_get_state(buf, size);
       break;
 
     // Settings store health. "saved" with a rising entry number is a store
@@ -493,6 +501,45 @@ static info_page_t g_page_calibration =
   .title = "Calibration",
   .line_fn = calibration_line,
 };
+
+//-----------------------------------------------------------------------------
+// The gauge in figures: the charge the icon is showing, the voltage it came
+// from, the filtering between the two, and what the reading is worth. Rendered
+// by battery.c, which owns every one of those numbers - this file only asks
+// how many lines there are, the same way the calibration page does.
+static const char *battery_page_line(int index)
+{
+  if (!battery_get_line(index, g_info_line, sizeof(g_info_line)))
+    return "";
+
+  return g_info_line;
+}
+
+static int battery_page_lines(void)
+{
+  char buf[80];
+  int n = 0;
+
+  while (battery_get_line(n, buf, sizeof(buf)))
+    n++;
+
+  return n;
+}
+
+static info_page_t g_page_battery =
+{
+  .title = "Battery",
+  .line_fn = battery_page_line,
+};
+
+static void action_battery(const void *arg)
+{
+  (void)arg;
+
+  g_page_battery.count = battery_page_lines();
+
+  menu_action_info(&g_page_battery);
+}
 
 static void action_calibration(const void *arg)
 {
@@ -650,6 +697,8 @@ static const menu_item_t g_advanced_items[] =
     .u.action = { menu_action_info, &g_page_device_info } },
   { .kind = MI_ACTION, .label = "System Info",
     .u.action = { menu_action_info, &g_page_system_info } },
+  { .kind = MI_ACTION, .label = "Battery",
+    .u.action = { action_battery, NULL } },
   { .kind = MI_ACTION, .label = "Calibration",
     .u.action = { action_calibration, NULL } },
   { .kind = MI_ACTION, .label = "Config (RAM)",

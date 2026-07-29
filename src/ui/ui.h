@@ -29,6 +29,13 @@ typedef struct
   void (*tick)(void *ctx);               // periodic work, top screen only
   bool (*input)(void *ctx, int buttons); // return true if consumed
   bool opaque;                           // covers the whole display
+
+  // ...and owns it: a modal the user opened, not an application. Device status
+  // painted at fixed coordinates - the battery icon in the top right corner -
+  // stays off the screen while one of these is up, instead of landing in the
+  // middle of a dialog's border. Everything it missed is drawn when the modal
+  // closes, so nothing has to be repainted on its behalf.
+  bool modal;
 } ui_screen_t;
 
 /*- Prototypes --------------------------------------------------------------*/
@@ -41,5 +48,8 @@ void ui_pop_to_root(void);
 void ui_request_redraw(void);
 const ui_screen_t *ui_top_screen(void);
 int ui_depth(void);
+
+// Whether a modal owns the display right now. See ui_screen_t::modal.
+bool ui_modal_active(void);
 
 #endif // _UI_H_

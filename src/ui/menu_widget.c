@@ -120,12 +120,16 @@ static const ui_screen_t menu_screen_popup =
   .opaque = false,
 };
 
+// The popup above leaves the top right corner of the screen alone, so it is
+// not marked modal and the battery icon keeps updating under it. This one
+// covers the display end to end.
 static const ui_screen_t menu_screen_fs =
 {
   .leave  = menu_leave,
   .draw   = menu_draw,
   .input  = menu_input,
   .opaque = true,
+  .modal  = true,
 };
 
 /*- Implementations ---------------------------------------------------------*/
@@ -778,6 +782,7 @@ static const ui_screen_t info_screen =
   .draw   = info_draw,
   .input  = info_input,
   .opaque = true,
+  .modal  = true,
 };
 
 //-----------------------------------------------------------------------------
