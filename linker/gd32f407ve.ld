@@ -82,6 +82,34 @@ SECTIONS
   /* End of flash data (including .data section stored in flash) */
   __etext = LOADADDR(.data) + SIZEOF(.data);
 
+  /* The instrument's own state, gathered into one range so an application can
+     borrow it.
+
+     Nothing overlaps at link time - this is still just .bss - but the four
+     modules named here belong to the oscilloscope, and the oscilloscope is an
+     application of the launcher like any other: leaving it runs
+     scope_cleanup_wrapper, coming back runs scope_init() from scratch. While
+     some other application is on screen, every byte in this range is dead.
+
+     That makes it lendable, and safely: .bss starts zeroed at boot, so zeroing
+     this range before scope_init() reproduces the boot state exactly. There is
+     no list of "which variables survive" to get wrong - the answer is none of
+     them, enforced by a memset.
+
+     Order matters. ld assigns an input section to the first output section
+     that matches it, so this has to come before the general .bss rule below or
+     the objects land there instead. */
+  .tcm_borrowed (NOLOAD) : ALIGN(8)
+  {
+    __borrowed_start = .;
+    *scope.o(.bss*)
+    *fft.o(.bss*)
+    *trend.o(.bss*)
+    *measure.o(.bss*)
+    . = ALIGN(8);
+    __borrowed_end = .;
+  } > tcm
+
   .bss : ALIGN(4)
   {
     _bss = .;

@@ -30,6 +30,7 @@
 #include "debug_coredump.h"
 #include "flash_viewer.h"
 #include "spi_tool.h"
+#include "tcm_borrow.h"
 
 /*- Types -------------------------------------------------------------------*/
 typedef struct
@@ -68,6 +69,12 @@ static const app_desc_t *g_running = NULL;
 //-----------------------------------------------------------------------------
 static void scope_init_wrapper(void)
 {
+  // Back to the state of a boot before the instrument rebuilds itself: while
+  // an application was on screen its memory was somebody else's, and
+  // scope_init() is written against zeroed .bss, not against whatever a game
+  // left there. See tcm_borrow.h.
+  tcm_borrow_return();
+
   lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, LCD_BLACK_COLOR);
   scope_init(false); // Normal mode, not calibration
 }
@@ -89,6 +96,11 @@ static void scope_cleanup_wrapper(void)
   // one sequence that establishes the phase between the encode edge and the
   // DMA's read of the data bus - so the clocks never restart any other way.
   capture_disable_clock();
+
+  // The instrument's 28 KB of TCM are now an application's to use. Poisoned
+  // rather than left alone, so that anything still reading instrument state
+  // from here reads a pattern instead of numbers that look reasonable.
+  tcm_borrow_poison();
 
   lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, LCD_BLACK_COLOR);
 }

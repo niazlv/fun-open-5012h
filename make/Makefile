@@ -83,6 +83,7 @@ SRCS += \
   ../src/core/config.c \
   ../src/core/timer.c \
   ../src/core/utils.c \
+  ../src/core/tcm_borrow.c \
 
 # Parts that touch the hardware directly
 SRCS += \
