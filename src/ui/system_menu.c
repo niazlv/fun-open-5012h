@@ -20,6 +20,7 @@
 #include "timer.h"
 #include "buttons.h"
 #include "config.h"
+#include "flash.h"
 #include "common.h"
 #include "utils.h"
 #include "scope.h"
@@ -248,7 +249,7 @@ enum
 #ifdef GIT_USER
   SI_BUILT_BY,
 #endif
-  SI_LOOP, SI_PANEL, SI_STORE, SI_CALIB,
+  SI_LOOP, SI_PANEL, SI_STORE, SI_CALIB, SI_SPI, SI_SPI_HEAD,
   SI_COUNT,
 };
 
@@ -353,6 +354,19 @@ static const char *system_info_line(int index)
     // one failure in this dialog that a working-looking scope can be hiding.
     case SI_CALIB:
       config_get_calib_state(buf, size);
+      break;
+
+    // The SPI NOR part doc/Hardware.md puts on PA3/PA5-PA7 - 8 MB that this
+    // firmware does not use for anything yet. These two lines exist to settle
+    // whether it is actually on the board: the JEDEC ID, then the first bytes
+    // it hands back, which is a read of the array rather than of an ID
+    // register and so also says the wiring works.
+    case SI_SPI:
+      flash_get_state(buf, size);
+      break;
+
+    case SI_SPI_HEAD:
+      flash_get_head(buf, size);
       break;
 
     default:

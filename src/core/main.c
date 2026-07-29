@@ -295,7 +295,7 @@ int main(void)
   timer_init();
   lcd_init();
   crc32_init();
-  //flash_init();
+  flash_init();
   config_init();
   buttons_init();
   battery_init();
