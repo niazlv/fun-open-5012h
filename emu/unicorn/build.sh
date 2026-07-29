@@ -49,8 +49,25 @@ cmake -S "$SRC" -B "$SRC/cmake-build" \
 cmake --build "$SRC/cmake-build" -j "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 
 mkdir -p "$OUT/include"
+rm -rf "$OUT/include/unicorn"
 cp -R "$SRC/include/unicorn" "$OUT/include/"
+
+# Replaced rather than overwritten: writing into a dylib that is still mapped
+# by something leaves a file whose signature no longer matches it, and macOS
+# answers that with SIGKILL rather than an error anyone can read.
+rm -f "$OUT"/libunicorn*
 find "$SRC/cmake-build" -maxdepth 1 -name 'libunicorn*' -exec cp -P {} "$OUT/" \;
 
-echo
-echo "built into $(pwd)/$OUT - now: make -C .. clean && make -C .."
+# And an ad-hoc signature on top, because arm64 will not load a dylib without
+# one. Idempotent, so re-running this is free.
+if [ "$(uname -s)" = "Darwin" ]; then
+  for lib in "$OUT"/libunicorn*.dylib; do
+    [ -L "$lib" ] || codesign --sign - --force "$lib" >/dev/null 2>&1 || true
+  done
+fi
+
+# What ../Makefile waits on. Written last, so an interrupted build is not
+# mistaken for a finished one.
+touch "$OUT/.built"
+
+echo "unicorn $VER built into $(pwd)/$OUT"
