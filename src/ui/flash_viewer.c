@@ -21,6 +21,7 @@
 #include "ui.h"
 #include "menu_widget.h"
 #include "config.h"
+#include "flash.h"
 #include "flash_viewer.h"
 
 /*- Definitions -------------------------------------------------------------*/
@@ -62,20 +63,65 @@ static int g_section_count = 0;
  * it the unique id and flash size registers this file already reads.
  *
  * Flash's length is fixed up at init from the size register: it is the one
- * that varies by part, and reading past the end of the array bus-faults.
+ * that varies by part, and reading past the end of the array bus-faults. The
+ * SPI part's length comes from its JEDEC capacity byte, and is zero when there
+ * is no chip - the source stays in the list and says so rather than vanishing,
+ * because a missing entry reads as a bug in the viewer.
  */
 static struct {
     const char *name;
     uint32_t base;
     uint32_t size;
+    bool serial;            // reached by a bus command, not by a pointer
 } g_regions[MEM_REGION_COUNT] = {
-    [MEM_REGION_FLASH]  = { "Flash",  FLASH_START_ADDR, FLASH_SIZE },
-    [MEM_REGION_SRAM]   = { "SRAM",   0x20000000u, 128 * 1024 },
-    [MEM_REGION_TCM]    = { "TCM",    0x10000000u,  64 * 1024 },
-    [MEM_REGION_SYSTEM] = { "System", 0x1FFF0000u,  32 * 1024 },
+    [MEM_REGION_FLASH]  = { "Flash",  FLASH_START_ADDR, FLASH_SIZE, false },
+    [MEM_REGION_SRAM]   = { "SRAM",   0x20000000u, 128 * 1024, false },
+    [MEM_REGION_TCM]    = { "TCM",    0x10000000u,  64 * 1024, false },
+    [MEM_REGION_SYSTEM] = { "System", 0x1FFF0000u,  32 * 1024, false },
+    [MEM_REGION_SPI]    = { "SPI",    0x00000000u,  0,         true  },
 };
 
 static int g_region = MEM_REGION_FLASH;
+
+/*
+ * One page of the serial part, held back so that a screenful of hex is a
+ * couple of bus transactions instead of one per byte. Every view reads through
+ * read_flash_byte, and a hex page alone would otherwise be 144 commands.
+ *
+ * Invalidated whenever the source changes, and by anything that writes.
+ */
+#define SPI_CACHE_SIZE      FLASH_PAGE_SIZE
+#define SPI_CACHE_EMPTY     0xFFFFFFFFu
+
+static uint8_t g_spi_cache[SPI_CACHE_SIZE];
+static uint32_t g_spi_cache_base = SPI_CACHE_EMPTY;
+
+/*
+ * The used/blank map behind the Map view. One bit per cell, filled in a little
+ * at a time from flash_viewer_task: reading all 8 MB of the serial part takes
+ * about four seconds at 15.6 MHz, and doing it in one go would freeze the main
+ * loop - buttons, backlight and all - for exactly that long.
+ *
+ * A cell is "used" if it holds any byte that is neither 0x00 nor 0xFF. That is
+ * the honest test across all five sources: 0xFF is erased NOR, 0x00 is
+ * untouched RAM, and anything else is somebody's data.
+ */
+#define MAP_CELLS_MAX       2048
+#define MAP_SCAN_CHUNK      256         // bytes per read, and the stack cost
+#define MAP_SCAN_BUDGET_US  15000       // per pass of the main loop
+
+static struct {
+    bool running;
+    bool done;
+    uint32_t cell_bytes;                // how much of the source one cell is
+    uint32_t cells;
+    uint32_t next_cell;
+    uint32_t used;
+    uint32_t first_used;
+    uint8_t bits[MAP_CELLS_MAX / 8];
+} g_map;
+
+static int g_map_cursor = 0;
 
 // Config store browser: which entry is selected, and whether the decoded field
 // list for it is open
@@ -89,6 +135,9 @@ extern uint32_t __etext;  // end of everything in flash, .data image included
 
 /*- Local Prototypes --------------------------------------------------------*/
 static void analyze_flash_sections(void);
+static void map_scan_restart(void);
+static bool map_scan_step(void);
+static bool map_cell_used(uint32_t cell);
 
 /*- Implementations ---------------------------------------------------------*/
 
@@ -108,10 +157,27 @@ static uint32_t region_end(void)
 // Bounds-checked against the CURRENT region, which is what keeps the viewer
 // from wandering into an unmapped hole and taking the scope down with a bus
 // fault. Out of range reads as erased rather than faulting.
+//
+// A serial source cannot be dereferenced at all, so it comes through a cached
+// page read instead. Everything above this line is written as if memory were
+// memory.
 static uint8_t read_flash_byte(uint32_t addr)
 {
     if (addr < region_base() || addr >= region_end())
         return 0xFF;
+
+    if (g_regions[g_region].serial) {
+        uint32_t page = addr & ~(SPI_CACHE_SIZE - 1);
+
+        if (page != g_spi_cache_base) {
+            if (!flash_read(page, g_spi_cache, SPI_CACHE_SIZE))
+                return 0xFF;
+
+            g_spi_cache_base = page;
+        }
+
+        return g_spi_cache[addr - page];
+    }
 
     return *(volatile uint8_t *)addr;
 }
@@ -179,17 +245,128 @@ static void set_region(int region)
         return;
 
     g_region = region;
+    g_spi_cache_base = SPI_CACHE_EMPTY;
+
+    map_scan_restart();
     set_address(region_base());
+}
+
+//-----------------------------------------------------------------------------
+// A cell is the smallest erasable unit of the source where that means
+// something, and whatever divides the source into at most MAP_CELLS_MAX cells
+// where it does not. Both come out a power of two, so the arithmetic below is
+// shifts and masks.
+static void map_scan_restart(void)
+{
+    uint32_t size = g_regions[g_region].size;
+    uint32_t cell = FLASH_SECTOR_SIZE;
+
+    memset(&g_map, 0, sizeof(g_map));
+
+    g_map.first_used = SPI_CACHE_EMPTY;
+
+    if (0 == size)
+        return;
+
+    while (size / cell > MAP_CELLS_MAX)
+        cell *= 2;
+
+    // A small source would otherwise be one cell wide and tell nobody
+    // anything: 128 KB of SRAM is 32 sectors, and the screen has room for
+    // hundreds of cells
+    while (cell > FLASH_PAGE_SIZE && size / cell < MAP_CELLS_MAX / 4)
+        cell /= 2;
+
+    g_map.cell_bytes = cell;
+    g_map.cells = (size + cell - 1) / cell;
+    g_map.running = true;
+}
+
+//-----------------------------------------------------------------------------
+static bool map_cell_used(uint32_t cell)
+{
+    return 0 != (g_map.bits[cell >> 3] & (1 << (cell & 7)));
+}
+
+//-----------------------------------------------------------------------------
+// Runs for a fixed slice of wall clock and returns, so a source that takes
+// seconds to read costs a few frames of drawing rather than the whole main
+// loop. timer_us and not timer_ms: the millisecond counter only moves in
+// timer_task, which does not run while this does.
+static bool map_scan_step(void)
+{
+    uint32_t start = timer_us();
+
+    if (!g_map.running)
+        return false;
+
+    while (g_map.next_cell < g_map.cells) {
+        uint32_t base = region_base() + g_map.next_cell * g_map.cell_bytes;
+        uint32_t end = base + g_map.cell_bytes;
+        bool used = false;
+
+        if (end > region_end())
+            end = region_end();
+
+        for (uint32_t addr = base; addr < end && !used; addr++) {
+            uint8_t byte = read_flash_byte(addr);
+
+            if (0xFF != byte && 0x00 != byte)
+                used = true;
+        }
+
+        if (used) {
+            g_map.bits[g_map.next_cell >> 3] |= 1 << (g_map.next_cell & 7);
+            g_map.used++;
+
+            if (SPI_CACHE_EMPTY == g_map.first_used)
+                g_map.first_used = base;
+        }
+
+        g_map.next_cell++;
+
+        if (timer_us() - start > MAP_SCAN_BUDGET_US)
+            return true;                // more to do, but not this pass
+    }
+
+    g_map.running = false;
+    g_map.done = true;
+
+    return true;
+}
+
+//-----------------------------------------------------------------------------
+// What is being read, in the few characters the header has room for. The size
+// is part of the name because "SPI" alone does not say whether a chip
+// answered, and that is the first thing anybody wants to know here.
+static const char *source_summary(void)
+{
+    static char buf[32];
+    uint32_t size = g_regions[g_region].size;
+
+    if (0 == size)
+        return (MEM_REGION_SPI == g_region) ? "SPI - no device" : "empty";
+
+    if (size >= 1024 * 1024)
+        snprintf(buf, sizeof(buf), "%s  %lu MB", g_regions[g_region].name,
+            (unsigned long)(size >> 20));
+    else
+        snprintf(buf, sizeof(buf), "%s  %lu KB", g_regions[g_region].name,
+            (unsigned long)(size >> 10));
+
+    return buf;
 }
 
 //-----------------------------------------------------------------------------
 static const char *view_mode_name(void)
 {
     switch (g_view_mode) {
+        case FLASH_VIEW_MAP:       return "Map";
         case FLASH_VIEW_HEX:       return "Hex";
         case FLASH_VIEW_ASCII:     return "ASCII";
         case FLASH_VIEW_STRUCTURE: return "Layout";
         case FLASH_VIEW_THUMB:     return "Thumb";
+        case FLASH_VIEW_CONFIG:    return "Config";
         default:                   return "?";
     }
 }
@@ -307,24 +484,33 @@ static void draw_header(void)
     lcd_fill_rect(0, HEADER_H - 1, LCD_WIDTH, 1, FG);
 
     lcd_set_font(FONT_SMALL);
+
+    // The source is the title now, and the view is a subtitle of it: which
+    // memory you are looking at is the thing that is easy to lose track of
+    // once there are five of them
     lcd_set_color(HEADER_BG, ACCENT);
-    snprintf(buf, sizeof(buf), "FLASH VIEWER - %s", view_mode_name());
+    snprintf(buf, sizeof(buf), "%s", source_summary());
     lcd_puts(5, 5, buf);
 
     lcd_set_color(HEADER_BG, FG);
+    snprintf(buf, sizeof(buf), "%s", view_mode_name());
+    lcd_puts(LCD_WIDTH - 5 - 6 * (int)strlen(buf), 5, buf);
 
     if (FLASH_VIEW_STRUCTURE == g_view_mode) {
         snprintf(buf, sizeof(buf), "%d regions   %lu KB total", g_section_count,
             (unsigned long)((g_flash_end - FLASH_START_ADDR) / 1024));
     }
     else if (FLASH_VIEW_CONFIG == g_view_mode) {
-        snprintf(buf, sizeof(buf), "Settings store   0x%08lX",
-            (unsigned long)(uintptr_t)config_store_entry(0));
+        snprintf(buf, sizeof(buf), "Settings store   %s 0x%08lX",
+            config_store_is_external() ? "SPI" : "flash",
+            (unsigned long)config_store_base());
+    }
+    else if (FLASH_VIEW_MAP == g_view_mode) {
+        snprintf(buf, sizeof(buf), "whole source, %lu cells",
+            (unsigned long)g_map.cells);
     }
     else {
-        // The region is named too now that the viewer walks more than one:
-        // an address alone no longer says which space it belongs to
-        snprintf(buf, sizeof(buf), "%s  0x%08lX   %s", g_regions[g_region].name,
+        snprintf(buf, sizeof(buf), "0x%08lX   %s",
             (unsigned long)g_current_address,
             (MEM_REGION_FLASH == g_region) ?
                 section_name_at(g_current_address) : "-");
@@ -353,6 +539,114 @@ static void clear_body(void)
     lcd_fill_rect(0, HEADER_H, LCD_WIDTH, LCD_HEIGHT - HEADER_H - FOOTER_H, BG);
     lcd_set_font(FONT_SMALL);
     lcd_set_color(BG, FG);
+}
+
+//-----------------------------------------------------------------------------
+// Biggest cell that still fits the whole source on one screen, and how many of
+// them go across. Nothing scrolls in the map on purpose: a map you have to
+// page through is a dump. Shared with the button handler so that UP and DOWN
+// move by exactly one visible row.
+static int map_grid(int *cell_px_out)
+{
+    int grid_h = LCD_HEIGHT - BODY_Y - FOOTER_H - LINE_H - 2;
+    int cell_px = 10;
+    int cols = 1;
+
+    while (cell_px > 2) {
+        cols = (LCD_WIDTH - 10) / cell_px;
+
+        if ((((int)g_map.cells + cols - 1) / cols) * cell_px <= grid_h)
+            break;
+
+        cell_px--;
+    }
+
+    cols = (LCD_WIDTH - 10) / cell_px;
+
+    if (cell_px_out)
+        *cell_px_out = cell_px;
+
+    return cols;
+}
+
+//-----------------------------------------------------------------------------
+// The whole source at once, one cell per erase unit. This is the view that
+// answers the questions an 8 MB part actually raises - is there anything on
+// it, where does it start, how much is left - none of which a hex dump can
+// answer in under an hour of paging.
+//
+// Cells are laid out left to right, top to bottom, so the picture reads like
+// the address space: the top left is offset zero.
+static void draw_map_view(void)
+{
+    int grid_y = BODY_Y + LINE_H + 2;
+    int cell_px;
+    int cols = map_grid(&cell_px);
+    char text[64];
+
+    clear_body();
+
+    if (0 == g_map.cells) {
+        lcd_puts(5, BODY_Y + 20, "Nothing to map here.");
+
+        if (MEM_REGION_SPI == g_region)
+            lcd_puts(5, BODY_Y + 20 + LINE_H * 2,
+                "No SPI device answered at boot.");
+
+        draw_footer("F1: next memory   MODE: next view",
+            "MENU: settings and help");
+        return;
+    }
+
+    // Progress, then what the picture is made of
+    if (g_map.running) {
+        snprintf(text, sizeof(text), "scanning %lu%%   %luK per cell",
+            (unsigned long)(100ull * g_map.next_cell / g_map.cells),
+            (unsigned long)(g_map.cell_bytes / 1024));
+    }
+    else if (0 == g_map.used) {
+        snprintf(text, sizeof(text), "all blank   %luK per cell",
+            (unsigned long)(g_map.cell_bytes / 1024));
+    }
+    else {
+        snprintf(text, sizeof(text), "%lu of %lu used   from %08lX",
+            (unsigned long)g_map.used, (unsigned long)g_map.cells,
+            (unsigned long)g_map.first_used);
+    }
+
+    lcd_set_color(BG, FG);
+    lcd_puts(5, BODY_Y, text);
+
+    for (uint32_t i = 0; i < g_map.cells; i++) {
+        int x = 5 + (int)(i % (uint32_t)cols) * cell_px;
+        int y = grid_y + (int)(i / (uint32_t)cols) * cell_px;
+        int color;
+
+        if (g_map.running && i >= g_map.next_cell)
+            color = LCD_COLOR(40, 40, 40);          // not looked at yet
+        else if (map_cell_used(i))
+            color = ACCENT;
+        else
+            color = LCD_COLOR(0, 70, 110);          // blank, but accounted for
+
+        lcd_fill_rect(x, y, cell_px - 1, cell_px - 1, color);
+    }
+
+    if (g_map_cursor >= (int)g_map.cells)
+        g_map_cursor = (int)g_map.cells - 1;
+
+    {
+        int x = 5 + (g_map_cursor % cols) * cell_px;
+        int y = grid_y + (g_map_cursor / cols) * cell_px;
+
+        lcd_draw_rect(x - 1, y - 1, cell_px + 1, cell_px + 1, LCD_WHITE_COLOR);
+    }
+
+    snprintf(text, sizeof(text), "%08lX  %s",
+        (unsigned long)(region_base() + (uint32_t)g_map_cursor * g_map.cell_bytes),
+        map_cell_used((uint32_t)g_map_cursor) ? "used" : "blank");
+
+    draw_footer(text, "arrows: move   TRIG: open in hex   F1: next memory");
 }
 
 //-----------------------------------------------------------------------------
@@ -730,6 +1024,7 @@ static void draw_view(void)
     draw_header();
 
     switch (g_view_mode) {
+        case FLASH_VIEW_MAP:       draw_map_view(); break;
         case FLASH_VIEW_ASCII:     draw_ascii_view(); break;
         case FLASH_VIEW_STRUCTURE: draw_structure_view(); break;
         case FLASH_VIEW_THUMB:     draw_thumb_view(); break;
@@ -753,20 +1048,27 @@ void flash_viewer_init(void)
     // the end of a smaller part's array, which bus-faults
     g_regions[MEM_REGION_FLASH].size = g_flash_end - FLASH_START_ADDR;
 
+    // Whatever the part answered at boot. Zero when nothing did, and the
+    // source then says so instead of offering 8 MB of 0xFF.
+    g_regions[MEM_REGION_SPI].size = flash_size();
+
     // Back to flash whatever the last session left selected - the layout scan
     // below reads through read_flash_byte, and that answers for the region
     // that is current
     g_region = MEM_REGION_FLASH;
 
     g_current_address = FLASH_START_ADDR;
-    g_view_mode = FLASH_VIEW_HEX;
+    g_view_mode = FLASH_VIEW_MAP;
     g_section_index = 0;
     g_section_scroll = 0;
     g_cfg_index = 0;
     g_cfg_scroll = 0;
     g_cfg_detail = false;
+    g_map_cursor = 0;
+    g_spi_cache_base = SPI_CACHE_EMPTY;
 
     analyze_flash_sections();
+    map_scan_restart();
 
     g_dirty = true;
     draw_view();
@@ -785,6 +1087,21 @@ void flash_viewer_redraw(void)
 //-----------------------------------------------------------------------------
 void flash_viewer_task(void)
 {
+    // The map fills itself in from here, a slice per pass. Repainting on every
+    // slice would cost more than the scan does - the grid is a couple of
+    // thousand filled rectangles over a bit-banged bus - so the picture
+    // catches up four times a second and once more when it finishes.
+    if (FLASH_VIEW_MAP == g_view_mode && g_map.running) {
+        static uint32_t last_paint;
+
+        map_scan_step();
+
+        if (!g_map.running || timer_ms() - last_paint > 250) {
+            last_paint = timer_ms();
+            g_dirty = true;
+        }
+    }
+
     if (!g_dirty)
         return;
 
@@ -815,6 +1132,52 @@ void flash_viewer_buttons_handler(int buttons)
         g_cfg_scroll = 0;
 
         g_dirty = true;
+        return;
+    }
+
+    // One key for the thing this viewer is now mostly about: which memory.
+    // It used to be two levels down a menu, which is a long way to go to
+    // compare a byte in flash with the copy of it in RAM.
+    if ((buttons & BTN_F1) && !repeat) {
+        set_region((g_region + 1) % MEM_REGION_COUNT);
+        g_dirty = true;
+        return;
+    }
+
+    if (FLASH_VIEW_MAP == g_view_mode) {
+        int cols = map_grid(NULL);      // one visible row per UP/DOWN
+
+        if (g_map.cells > 0) {
+            int last = (int)g_map.cells - 1;
+
+            if (buttons & BTN_LEFT)
+                g_map_cursor--;
+
+            if (buttons & BTN_RIGHT)
+                g_map_cursor++;
+
+            if (buttons & BTN_UP)
+                g_map_cursor -= cols;
+
+            if (buttons & BTN_DOWN)
+                g_map_cursor += cols;
+
+            if (g_map_cursor < 0)
+                g_map_cursor = 0;
+
+            if (g_map_cursor > last)
+                g_map_cursor = last;
+
+            // The point of the map: pick a cell, read what is in it
+            if ((buttons & BTN_TRIG) && !repeat) {
+                g_view_mode = FLASH_VIEW_HEX;
+                set_address(region_base() +
+                    (uint32_t)g_map_cursor * g_map.cell_bytes);
+            }
+
+            g_dirty = true;
+        }
+
         return;
     }
 
@@ -904,6 +1267,20 @@ static void action_goto_image_end(const void *arg)
 }
 
 //-----------------------------------------------------------------------------
+// The map is a snapshot, and the sources it is taken over change underneath
+// it - SRAM constantly, the serial part whenever something writes to it
+static void action_rescan(const void *arg)
+{
+    (void)arg;
+
+    g_spi_cache_base = SPI_CACHE_EMPTY;
+    map_scan_restart();
+    g_view_mode = FLASH_VIEW_MAP;
+    g_dirty = true;
+    menu_close_popups();
+}
+
+//-----------------------------------------------------------------------------
 static void region_changed(void)
 {
     // The choice item has already written g_region; this puts the cursor
@@ -913,16 +1290,29 @@ static void region_changed(void)
 }
 
 //-----------------------------------------------------------------------------
-// Straight to the settings store as raw bytes, for when the decoded view is
-// not what is wanted - a slot that fails its CRC is sometimes only explicable
-// by looking at what is actually in it
+// Straight to a slot of the settings store as raw bytes, for when the decoded
+// view is not what is wanted - a slot that fails its CRC is sometimes only
+// explicable by looking at what is actually in it.
+//
+// It asks config.c where the store is rather than taking the address of an
+// entry, because the answer stopped being an address: on the SPI part an entry
+// is fetched into a buffer, and the pointer to that buffer says nothing about
+// where the store lives. These two used to jump to the RAM cache.
+static void goto_store_entry(int index)
+{
+    set_region(config_store_is_external() ? MEM_REGION_SPI : MEM_REGION_FLASH);
+
+    g_view_mode = FLASH_VIEW_HEX;
+    set_address(config_store_base() + (uint32_t)index * config_store_entry_size());
+
+    menu_close_popups();
+}
+
+//-----------------------------------------------------------------------------
 static void action_goto_store(const void *arg)
 {
     (void)arg;
-    g_region = MEM_REGION_FLASH;
-    g_view_mode = FLASH_VIEW_HEX;
-    set_address((uint32_t)(uintptr_t)config_store_entry(0));
-    menu_close_popups();
+    goto_store_entry(0);
 }
 
 //-----------------------------------------------------------------------------
@@ -930,10 +1320,7 @@ static void action_goto_store(const void *arg)
 static void action_goto_live_entry(const void *arg)
 {
     (void)arg;
-    g_region = MEM_REGION_FLASH;
-    g_view_mode = FLASH_VIEW_HEX;
-    set_address((uint32_t)(uintptr_t)config_store_entry(config_store_live_index()));
-    menu_close_popups();
+    goto_store_entry(config_store_live_index());
 }
 
 //-----------------------------------------------------------------------------
@@ -950,12 +1337,20 @@ static void action_open_store(const void *arg)
 
 static const char *const g_help_lines[] =
 {
+    "F1          - Next memory",
+    "MODE        - Next view",
     "UP/DOWN     - One line",
     "LEFT/RIGHT  - One page",
     "TRIG_UP/DN  - 4 KB",
-    "MODE        - Next view",
     "MENU        - This menu",
     "SHIFT+MENU  - Back to the launcher",
+    "",
+    "Map is the whole memory on one screen, one",
+    "cell per erase sector: amber holds data, blue",
+    "is blank. Arrows move the cursor and TRIG",
+    "opens that cell in hex. The scan runs in the",
+    "background because reading all 8 MB of the",
+    "SPI part takes about four seconds.",
     "",
     "Layout shows the regions of the image;",
     "RIGHT opens the selected one in hex.",
@@ -963,11 +1358,14 @@ static const char *const g_help_lines[] =
     "instructions and names the encoding group -",
     "enough to tell code from data.",
     "",
-    "Memory picks the address space: flash, SRAM,",
-    "TCM (stack and heap) or the system ROM. Only",
-    "these four are offered because an unmapped",
-    "address bus-faults and a peripheral register",
-    "can change state just from being read.",
+    "Memory picks what is being read: flash, SRAM,",
+    "TCM (stack and heap), the system ROM, or the",
+    "8 MB SPI part. The first four are whitelisted",
+    "because an unmapped address bus-faults and a",
+    "peripheral register can change state just",
+    "from being read. The SPI part is not in the",
+    "address space at all - its bytes arrive over",
+    "the bus, a page at a time.",
     "",
     "Config decodes the settings store instead of",
     "dumping it: one row per rotation slot, why an",
@@ -985,19 +1383,21 @@ static const info_page_t g_help_page =
 };
 
 static const char *const g_view_labels[] =
-    { "Hex", "ASCII", "Layout", "Thumb", "Config" };
+    { "Map", "Hex", "ASCII", "Layout", "Thumb", "Config" };
 
 static const char *const g_region_labels[] =
-    { "Flash", "SRAM", "TCM", "System" };
+    { "Flash", "SRAM", "TCM", "System", "SPI flash" };
 
 static const menu_item_t g_menu_items[] =
 {
-    { .kind = MI_CHOICE, .label = "View",
-      .u.choice = { &g_view_mode, g_view_labels, FLASH_VIEW_COUNT,
-                    view_mode_changed } },
     { .kind = MI_CHOICE, .label = "Memory",
       .u.choice = { &g_region, g_region_labels, MEM_REGION_COUNT,
                     region_changed } },
+    { .kind = MI_CHOICE, .label = "View",
+      .u.choice = { &g_view_mode, g_view_labels, FLASH_VIEW_COUNT,
+                    view_mode_changed } },
+    { .kind = MI_ACTION, .label = "Rescan map",
+      .u.action = { action_rescan, NULL } },
     { .kind = MI_SEPARATOR },
     { .kind = MI_ACTION, .label = "Go to start",
       .u.action = { action_goto_start, NULL } },

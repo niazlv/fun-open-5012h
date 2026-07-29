@@ -22,7 +22,8 @@
 #define FLASH_MAX_SECTIONS      12
 
 typedef enum {
-    FLASH_VIEW_HEX = 0,
+    FLASH_VIEW_MAP = 0,     // one cell per sector: what is used, and where
+    FLASH_VIEW_HEX,
     FLASH_VIEW_ASCII,
     FLASH_VIEW_STRUCTURE,
     FLASH_VIEW_THUMB,
@@ -34,12 +35,18 @@ typedef enum {
 // pointer: an unmapped address bus-faults, and a peripheral register can have
 // side effects just from being read - popping a FIFO, clearing a status bit -
 // so "read any address" would turn the viewer into a way to break the running
-// scope. These four are plain memory arrays and safe to walk.
+// scope. Everything here is a plain array and safe to walk.
+//
+// SPI is the odd one: it is not in the address space at all, so its bytes come
+// back through a command on the bus rather than off a pointer. The viewer does
+// not care - it asks a source for a byte - but it is why the read path is a
+// function and not a cast.
 typedef enum {
     MEM_REGION_FLASH = 0,
     MEM_REGION_SRAM,
     MEM_REGION_TCM,
     MEM_REGION_SYSTEM,      // bootloader ROM, and the id/size registers past it
+    MEM_REGION_SPI,         // the 8 MB serial NOR part, read over SPI0
     MEM_REGION_COUNT
 } mem_region_t;
 
