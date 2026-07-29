@@ -142,6 +142,8 @@ SRCS += \
   ../src/decode/knx_decode.c \
   ../src/decode/swo_decode.c \
   ../src/decode/swd_decode.c \
+  ../src/decode/sirc_decode.c \
+  ../src/decode/ppm_decode.c \
 
 # Widgets and screen furniture, with no scope logic of their own
 SRCS += \

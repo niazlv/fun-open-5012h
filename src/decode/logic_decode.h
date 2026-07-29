@@ -64,6 +64,12 @@ typedef enum
   // SPI, the protocol checks itself, so a transaction that reads clean is
   // confirmed rather than merely plausible.
   PROTO_SWD,
+  // Sony SIRC: the OTHER pulse-coded infrared family. A 4:1 leader, then 12,
+  // 15 or 20 bits LSB first - so the command arrives before the address.
+  PROTO_SIRC,
+  // CPPM: every channel of an RC link on one wire. The value is the time from
+  // one separator pulse to the next, and a long sync gap closes the frame.
+  PROTO_PPM,
   PROTO_COUNT,
 } proto_t;
 
@@ -370,6 +376,14 @@ typedef struct
 {
   uint32_t addr;    // 20 bits
   uint8_t  key;     // 4 bits: which buttons are down
+  // ...and the SAME twenty-four bits read as a PT2262. That part sends twelve
+  // TRI-STATE symbols and spends two pulses on each: two narrow ones are a
+  // '0', two wide ones a '1', narrow-then-wide the floating 'F'. Which is the
+  // 1527's 24 bits exactly, pulse for pulse - the only difference is where
+  // the reader puts the boundaries. Wide-then-narrow is the one pair a PT2262
+  // never sends, so a frame containing it is not one, and that is the whole
+  // test. See ev1527_tri_text() for the twelve symbols.
+  bool     tri_ok;
 } Ev1527Frame;
 
 typedef struct
@@ -377,6 +391,7 @@ typedef struct
   int      t_ns;    // the unit time, read off the frame's own sync ratio
   int      frames;
   bool     agree;   // every frame in the record said the same thing
+  bool     tri_all; // ...and every one of them also reads as a PT2262
   Ev1527Frame frame[EV1527_MAX_FRAMES];
 } Ev1527Analysis;
 
@@ -690,6 +705,60 @@ typedef struct
   SwdTx    tx[SWD_MAX_TX];
 } SwdAnalysis;
 
+// Sony SIRC. Read as a message and not as bits: the command, the device it
+// was addressed to, and - on the twenty-bit frame - the extended byte behind
+// them. The bits go out LSB first with the COMMAND at the bottom, so a frame
+// the record cut in half still says which key was pressed.
+#define SIRC_MAX_FRAMES  6
+
+typedef struct
+{
+  uint8_t bits;     // 12, 15 or 20; on a cut frame, however many arrived
+  uint8_t cmd;      // 7 bits
+  uint8_t addr;     // 5 bits on the 12- and 20-bit frames, 8 on the 15-bit one
+  uint8_t ext;      // 20-bit frames only
+  uint8_t first;    // its first byte in LogicResult.bytes
+  uint8_t count;    // 2, or 3 where there is an extended byte
+  // The record ran out inside the frame. Only the command came back - the
+  // address bits had not arrived yet, and which format this was is unknown.
+  bool    cut;
+} SircFrame;
+
+typedef struct
+{
+  int       t_ns;   // the 600 us unit, measured off the frame's own leader
+  int       frames;
+  bool      agree;  // every whole frame in the record said the same thing
+  SircFrame frame[SIRC_MAX_FRAMES];
+} SircAnalysis;
+
+// CPPM - the sum signal an RC receiver puts every channel on. One separator
+// pulse per channel and the VALUE is the time from one to the next, so the
+// channels are not measured against a clock but against each other.
+#define PPM_MAX_FRAMES  4
+
+typedef struct
+{
+  uint8_t chans;
+  uint8_t first;    // its first channel in LogicResult.bytes
+  uint8_t count;
+  // No closing sync gap: the record ended inside the frame, so this is the
+  // channels that fit and NOT a receiver that sent fewer
+  bool    cut;
+} PpmFrame;
+
+typedef struct
+{
+  int      frame_ns;  // sync to sync
+  int      sync_ns;   // the gap that closes a frame, off the first whole one
+  // The channel count every whole frame agreed on, and 0 when they did not -
+  // which is a receiver dropping a channel, and worth not averaging away
+  int      chans;
+  int      frames;
+  bool     inv;       // the separator pulses are the LOW level
+  PpmFrame frame[PPM_MAX_FRAMES];
+} PpmAnalysis;
+
 typedef union
 {
   OwAnalysis     ow;
@@ -708,6 +777,8 @@ typedef union
   WsAnalysis     ws;
   SwoAnalysis    swo;
   SwdAnalysis    swd;
+  SircAnalysis   sirc;
+  PpmAnalysis    ppm;
 } LogicAnalysis;
 
 extern LogicAnalysis g_logic_analysis;
@@ -875,6 +946,13 @@ void ev1527_group_at(const Ev1527Analysis *a, int idx, int *start, int *len);
 void ev1527_field_label(const Ev1527Analysis *a, int idx, uint8_t v,
     char *buf, int size);
 
+// The PT2262 reading of the same frame: twelve tri-state symbols written as
+// '0', '1' and 'F', which is the form the DIP switches inside the remote are
+// set in and therefore the form anyone matching a receiver to it wants. Only
+// meaningful where the frame's `tri_ok` said the pairs allow it; needs 13
+// bytes of buffer.
+void ev1527_tri_text(const Ev1527Frame *f, char *buf, int size);
+
 // DShot. Every frame is confirmed by its own CRC-4 before it is reported, so
 // this one is safe ahead of WS2812 - which is the signal it has to be told
 // apart from, both being constant-period and duty-encoded at about the same
@@ -1012,6 +1090,33 @@ void swd_byte_label(const SwdAnalysis *a, int idx, uint8_t v,
 void swd_field_label(const SwdAnalysis *a, int idx, uint8_t v,
     char *buf, int size);
 void swd_group_at(const SwdAnalysis *a, int idx, int *start, int *len);
+
+// Sony SIRC, and the Samsung and RCA remotes that share its shape. Found from
+// a leader whose mark is FOUR times its space - which is what tells it from
+// RC6's three, the one other infrared leader in this range - and confirmed by
+// every space after it being one unit and the frame ending on 12, 15 or 20
+// bits. Two result bytes per frame, three where an extended byte was sent.
+int sirc_decode(const uint8_t *data, int size, int offset, int period_ns,
+    LogicScratch *scratch, LogicResult *out);
+const SircAnalysis *sirc_analysis(void);
+void sirc_byte_label(const SircAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void sirc_field_label(const SircAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void sirc_group_at(const SircAnalysis *a, int idx, int *start, int *len);
+
+// CPPM. One byte per channel, the width in tens of microseconds exactly as
+// the servo decoder reports it - because it is the same number, and a reader
+// moving between the receiver's output and one of its channels should not
+// have to convert. Its channels each stand alone, so there is no group
+// function: what a channel is worth saying fits on the one row.
+int ppm_decode(const uint8_t *data, int size, int offset, int period_ns,
+    LogicScratch *scratch, LogicResult *out);
+const PpmAnalysis *ppm_analysis(void);
+void ppm_byte_label(const PpmAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
+void ppm_field_label(const PpmAnalysis *a, int idx, uint8_t v,
+    char *buf, int size);
 
 // Dispatcher: forced = PROTO_AUTO tries every decoder and keeps the best
 // fit (most bytes, then fewest errors); a specific proto runs only that one

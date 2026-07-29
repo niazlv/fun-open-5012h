@@ -647,7 +647,9 @@ static union
   KnxAnalysis  knx;    // ...who told whom on a building's twisted pair
   WsAnalysis   ws;     // ...what colour each pixel of a strip was told to be
   SwoAnalysis  swo;    // ...what a running MCU printed out of its trace pin
-  SwdAnalysis  swd;    // ...and which registers a debugger was reading
+  SwdAnalysis  swd;    // ...which registers a debugger was reading
+  SircAnalysis sirc;   // ...which key on a Sony remote went down
+  PpmAnalysis  ppm;    // ...and every channel of an RC link at once
 } g_pana;
 static int g_decode_sel = 0;              // selected byte (jump target)
 static int g_decode_period_ns = 0;        // record metrics the decode ran on
@@ -1994,6 +1996,9 @@ static void decode_group_at(int idx, int *start, int *len)
       case PROTO_WS2812:  ws2812_group_at(&g_pana.ws, idx, start, len); break;
       case PROTO_SWO:     swo_group_at(&g_pana.swo, idx, start, len); break;
       case PROTO_SWD:     swd_group_at(&g_pana.swd, idx, start, len); break;
+      case PROTO_SIRC:    sirc_group_at(&g_pana.sirc, idx, start, len); break;
+      // PPM is deliberately absent: its channels each stand alone, and a
+      // frame of eight of them is not one value written across eight bytes
       default: break;
     }
   }
@@ -2189,6 +2194,19 @@ static void dband_meaning_text(char *buf, int size, int idx, uint8_t v)
       swd_byte_label(&g_pana.swd, idx, v, buf, size);
       break;
 
+    case PROTO_SIRC:
+      // Which key on which device, written once across the two bytes the
+      // frame took - or the three, where an extended byte came with it
+      sirc_byte_label(&g_pana.sirc, idx, v, buf, size);
+      break;
+
+    case PROTO_PPM:
+      // The byte IS the interval, and the units the link is set up in are
+      // the only ones anyone reads it in - the same form the servo decoder
+      // puts the pin next door in
+      ppm_byte_label(&g_pana.ppm, idx, v, buf, size);
+      break;
+
     case PROTO_SERVO:
       // The byte IS the width, in tens of microseconds; put it back into the
       // units the servo is commanded in, which is the only form anyone reads
@@ -2249,6 +2267,19 @@ static void dband_field_text(char *buf, int size, int idx, uint8_t v)
 
     case PROTO_SWD:
       swd_field_label(&g_pana.swd, idx, v, buf, size);
+      break;
+
+    case PROTO_SIRC:
+      // The command comes FIRST off the wire, which is the opposite way round
+      // from how anyone writes a remote code down, so the row says which is
+      // which rather than leaving it to be inferred from the order
+      sirc_field_label(&g_pana.sirc, idx, v, buf, size);
+      break;
+
+    case PROTO_PPM:
+      // Which channel of its own frame - numbered from the sync in front of
+      // it, so channel 3 is channel 3 whichever frame the record opened in
+      ppm_field_label(&g_pana.ppm, idx, v, buf, size);
       break;
 
     // Everything else names its bytes one at a time already
@@ -3062,6 +3093,9 @@ static void draw_capture_state(void)
 // x runs [-MINIVIEW_WIDTH/2+1, MINIVIEW_WIDTH/2), i.e. -79..79 => 159 columns
 #define MINIVIEW_COLS  (MINIVIEW_WIDTH - 1)
 #define MINIVIEW_ROWS  8
+// Columns per blit. 40 splits the 159-wide strip into four, which costs four
+// window set-ups a frame instead of one and holds 640 bytes instead of 2544.
+#define MINIVIEW_CHUNK 40
 
 // Which decoded byte covers this miniview column? The miniview maps the
 // whole record linearly onto its width, so record position p sits at
@@ -3090,59 +3124,79 @@ static int miniview_byte_at(int x)
 static void draw_miniview(int trigger_offset, int window_offset, int window_width)
 {
   static const uint8_t wave_pattern[8] = { 1, 0, 0, 1, 2, 3, 3, 2 };
-  // Rendered row-major and sent as one blit: the 158 separate one-pixel-wide
-  // lcd_draw_buf calls this replaces each paid ~40% window-setup overhead
-  static uint16_t buf[MINIVIEW_ROWS * MINIVIEW_COLS];
+  // Rendered row-major in column chunks, one blit each.
+  //
+  // It started as 158 separate one-pixel-wide lcd_draw_buf calls, each paying
+  // ~40% window-setup overhead, and became one buffer for the whole strip -
+  // which fixed that and then stood in 2.5 KB of TCM for the 99% of the time
+  // the miniview is not being drawn. Four blits keep essentially all of the
+  // saving (four window set-ups against 158) and give back four fifths of the
+  // memory. The chunk is a width and not a height because the fill is
+  // column-major: each column's eight pixels are computed together, and
+  // splitting by ROWS would mean walking every column eight times.
+  static uint16_t buf[MINIVIEW_ROWS * MINIVIEW_CHUNK];
 
-  for (int x = -MINIVIEW_WIDTH/2+1; x < MINIVIEW_WIDTH/2; x++)
+  for (int base = 0; base < MINIVIEW_COLS; base += MINIVIEW_CHUNK)
   {
-    bool inside = ((x > window_offset) && (x < (window_offset + window_width)));
-    bool edge = ((x == window_offset) || (x == (window_offset + window_width - 1)));
-    int cx = x + MINIVIEW_WIDTH/2 - 1;
-    // C truncates toward zero, so a bare x % 8 is negative for the left half
-    // of the miniview; that indexed wave_pattern out of bounds and the value
-    // read there was then used as a write index into this column
-    int phase = ((x % (int)sizeof(wave_pattern)) + sizeof(wave_pattern)) % (int)sizeof(wave_pattern);
-    int byte_here = miniview_byte_at(x);
-    uint16_t col[MINIVIEW_ROWS];
+    // The last chunk is short, and its width is the buffer's STRIDE for the
+    // blit as well as its loop bound - the two cannot drift apart
+    int w = MINIVIEW_COLS - base;
 
-    if (edge)
-    {
-      for (int i = 0; i < MINIVIEW_ROWS; i++)
-        col[i] = MV_FRAME_COLOR;
-    }
-    else
-    {
-      for (int i = 0; i < MINIVIEW_ROWS; i++)
-        col[i] = BG_COLOR;
+    if (w > MINIVIEW_CHUNK)
+      w = MINIVIEW_CHUNK;
 
-      if (byte_here >= 0)
+    for (int k = 0; k < w; k++)
+    {
+      int cx = base + k;
+      int x = cx - MINIVIEW_WIDTH/2 + 1;
+      bool inside = ((x > window_offset) && (x < (window_offset + window_width)));
+      bool edge = ((x == window_offset) || (x == (window_offset + window_width - 1)));
+      // C truncates toward zero, so a bare x % 8 is negative for the left half
+      // of the miniview; that indexed wave_pattern out of bounds and the value
+      // read there was then used as a write index into this column
+      int phase = ((x % (int)sizeof(wave_pattern)) + sizeof(wave_pattern)) % (int)sizeof(wave_pattern);
+      int byte_here = miniview_byte_at(x);
+      uint16_t col[MINIVIEW_ROWS];
+
+      if (edge)
       {
-        // Decoder view: the record map shows where the decoded bytes sit
-        // instead of the decorative wave
-        uint16_t color = (byte_here == g_decode_sel) ? DSTRIP_SEL :
-            ((byte_here & 1) ? DSTRIP_ODD : DSTRIP_EVEN);
-
-        for (int i = 2; i <= 5; i++)
-          col[i] = color;
+        for (int i = 0; i < MINIVIEW_ROWS; i++)
+          col[i] = MV_FRAME_COLOR;
       }
       else
       {
-        col[2 + wave_pattern[phase]] = inside ? TRACE_COLOR : MV_FRAME_COLOR;
+        for (int i = 0; i < MINIVIEW_ROWS; i++)
+          col[i] = BG_COLOR;
+
+        if (byte_here >= 0)
+        {
+          // Decoder view: the record map shows where the decoded bytes sit
+          // instead of the decorative wave
+          uint16_t color = (byte_here == g_decode_sel) ? DSTRIP_SEL :
+              ((byte_here & 1) ? DSTRIP_ODD : DSTRIP_EVEN);
+
+          for (int i = 2; i <= 5; i++)
+            col[i] = color;
+        }
+        else
+        {
+          col[2 + wave_pattern[phase]] = inside ? TRACE_COLOR : MV_FRAME_COLOR;
+        }
+
+        if (inside)
+        {
+          col[0] = MV_FRAME_COLOR;
+          col[MINIVIEW_ROWS-1] = MV_FRAME_COLOR;
+        }
       }
 
-      if (inside)
-      {
-        col[0] = MV_FRAME_COLOR;
-        col[MINIVIEW_ROWS-1] = MV_FRAME_COLOR;
-      }
+      for (int i = 0; i < MINIVIEW_ROWS; i++)
+        buf[i * w + k] = col[i];
     }
 
-    for (int i = 0; i < MINIVIEW_ROWS; i++)
-      buf[i * MINIVIEW_COLS + cx] = col[i];
+    lcd_draw_buf(GRID_CENTER_X - MINIVIEW_WIDTH/2 + 1 + base, 7, w,
+        MINIVIEW_ROWS, buf);
   }
-
-  lcd_draw_buf(GRID_CENTER_X - MINIVIEW_WIDTH/2 + 1, 7, MINIVIEW_COLS, MINIVIEW_ROWS, buf);
 
 #define LEFT   (GRID_CENTER_X - MINIVIEW_WIDTH/2)
 #define RIGHT  (GRID_CENTER_X + MINIVIEW_WIDTH/2)
@@ -5361,6 +5415,10 @@ static void decode_update(void)
       g_pana.swo = *swo_analysis();
     else if (res.proto == PROTO_SWD)
       g_pana.swd = *swd_analysis();
+    else if (res.proto == PROTO_SIRC)
+      g_pana.sirc = *sirc_analysis();
+    else if (res.proto == PROTO_PPM)
+      g_pana.ppm = *ppm_analysis();
 
     g_logic_have = true;
     g_decode_held = false;

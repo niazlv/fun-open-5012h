@@ -58,6 +58,8 @@ const char *logic_proto_name(proto_t proto)
     case PROTO_KNX:     return "KNX";
     case PROTO_SWO:     return "ITM";
     case PROTO_SWD:     return "SWD";
+    case PROTO_SIRC:    return "SIRC";
+    case PROTO_PPM:     return "PPM";
     case PROTO_RAW:     return "RAW";
     default:            return "----";
   }
@@ -284,6 +286,15 @@ int logic_decode(const uint8_t *data, int size, int offset, int period_ns,
     // of bit times DShot uses, so first costs nobody anything.
     { PROTO_DSHOT,   dshot_decode },
     { PROTO_NEC,     nec_decode },
+    // Sony, and the Samsung and RCA remotes with it. It has to come ahead of
+    // RC5 and not behind it, because the confusion between them runs one way
+    // only: a SIRC frame whose unit has drifted to 700 us offers RC5 a bit
+    // time of 1.4 ms and a record of runs that all measure half a bit or a
+    // whole one, which is everything the bi-phase reader asks for. The other
+    // direction cannot happen - RC6's leader is 3:1 where this one is 4:1, and
+    // behind the leader every space in a SIRC frame is one unit where a
+    // bi-phase code's vary with the data. So the specific claim goes first.
+    { PROTO_SIRC,    sirc_decode },
     // The other infrared family, and it has to come before the generic
     // Manchester reader for the same reason NEC comes before everything:
     // read as a MESSAGE it says address, command and toggle, and read as a
@@ -348,6 +359,15 @@ int logic_decode(const uint8_t *data, int size, int offset, int period_ns,
     // parity, its stop and park bits, its acknowledgement and its data parity
     // all agree, and it takes two of those before it will claim a record.
     { PROTO_SWD,     swd_decode },
+    // Ahead of the servo decoder, which is the signal it shares a pin with -
+    // and the two cannot take each other's records in either direction. A
+    // servo line's pulses are 20 ms apart, so every interval on it is a sync
+    // gap and no channels ever fall between two of them; a PPM stream's are
+    // 1 to 2 ms apart, which is below the slowest frame rate a servo runs at.
+    // The order is here because the QUESTION is worth asking in this order:
+    // one pin of a receiver carries one channel and the other carries all of
+    // them, and the more specific reading of a pulse train is the sum signal.
+    { PROTO_PPM,     ppm_decode },
     { PROTO_SERVO,   servo_decode },
     { PROTO_UART,    uart_decode },
     // Dead last but for the raw reader, and it never wins anyway: a data
@@ -358,10 +378,13 @@ int logic_decode(const uint8_t *data, int size, int offset, int period_ns,
     { PROTO_RAW,     raw_decode },
   };
 
-  // Static, not automatic: half a kilobyte of decoded record does not belong
-  // on the stack of a function the main loop calls every frame
-  static LogicResult cur;
-
+  // Decoded straight into the caller's result, and there is no second copy
+  // anywhere. There WAS one - a static LogicResult the cascade filled and
+  // then assigned across on a match - and it cost 776 bytes of TCM to buy
+  // nothing: every decoder opens by memsetting the result it was handed, so
+  // a decoder that turns the record down leaves behind only what the NEXT
+  // one is about to overwrite. The one case that copy really covered is the
+  // last decoder failing, and one memset on the way out covers it instead.
   memset(out, 0, sizeof(*out));
 
   // The record behind an unchanged (data, size, offset) is refilled by the
@@ -375,7 +398,7 @@ int logic_decode(const uint8_t *data, int size, int offset, int period_ns,
     if (forced != PROTO_AUTO && forced != decoders[i].proto)
       continue;
 
-    if (decoders[i].fn(data, size, offset, period_ns, scratch, &cur) > 0)
+    if (decoders[i].fn(data, size, offset, period_ns, scratch, out) > 0)
     {
       // A decoder can report frames it cannot tell apart from something
       // simpler: a UART record that never catches the line at rest and holds
@@ -384,15 +407,20 @@ int logic_decode(const uint8_t *data, int size, int offset, int period_ns,
       // the next decoder. Asked for UART by name - by the user, or by the
       // caller's own earlier match - the question is already answered and the
       // frames stand.
-      if (cur.ambiguous && forced == PROTO_AUTO)
+      if (out->ambiguous && forced == PROTO_AUTO)
         continue;
 
-      *out = cur;
       scratch->cascade = 0;
 
-      return cur.count;
+      return out->count;
     }
   }
+
+  // Nothing matched, and the result still holds whatever the LAST decoder
+  // made of the record before turning it down. Callers read `count` rather
+  // than this return value - the scope does, on the very next line - so the
+  // failure has to be written into the result and not only reported.
+  memset(out, 0, sizeof(*out));
 
   scratch->cascade = 0;
 

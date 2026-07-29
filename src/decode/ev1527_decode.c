@@ -98,6 +98,58 @@ const Ev1527Analysis *ev1527_analysis(void)
 }
 
 //-----------------------------------------------------------------------------
+// The PT2262 reading of the SAME twenty-four bits, and it costs nothing to
+// make: the two parts put identical waveforms on the air and differ only in
+// where the reader puts the boundaries. A PT2262 sends twelve TRI-STATE
+// symbols and spends two pulses on each -
+//
+//   '0'   narrow, narrow
+//   '1'   wide, wide
+//   'F'   narrow, wide      the floating state, a pin left unconnected
+//
+// - which is 24 pulses of 4T, pulse for pulse the same signal a 1527 sends as
+// 24 bits. Wide-then-narrow is the one pair the part never emits, so a frame
+// containing one is not a PT2262 and that is the whole test.
+//
+// It is a real test and not a formality: a random 24-bit address survives all
+// twelve pairs about three times in a hundred, so a frame that reads as
+// tri-state is very probably from a part that meant it that way.
+static bool ev_tri_ok(uint32_t value)
+{
+  for (int i = 0; i < 12; i++)
+  {
+    // Sent most significant first, so symbol i is bits 23-2i and 22-2i
+    int a = (int)((value >> (23 - 2 * i)) & 1);
+    int b = (int)((value >> (22 - 2 * i)) & 1);
+
+    if (a && !b)
+      return false;
+  }
+
+  return true;
+}
+
+//-----------------------------------------------------------------------------
+// ...written out as the twelve symbols, which is the form the DIP switches
+// inside the remote are set in and therefore the form anyone matching a
+// receiver to it actually wants. Needs 13 bytes.
+void ev1527_tri_text(const Ev1527Frame *f, char *buf, int size)
+{
+  uint32_t value = ((f->addr & 0xFFFFFu) << 4) | (f->key & 0x0Fu);
+  int n = 0;
+
+  for (int i = 0; i < 12 && n + 1 < size; i++)
+  {
+    int a = (int)((value >> (23 - 2 * i)) & 1);
+    int b = (int)((value >> (22 - 2 * i)) & 1);
+
+    buf[n++] = a ? '1' : (b ? 'F' : '0');
+  }
+
+  buf[n] = 0;
+}
+
+//-----------------------------------------------------------------------------
 // The 24 bits go out most significant first and pack into three bytes, which
 // is why the hex dump reads the address and the buttons straight off: an
 // address of 0x5A3C7 with button 1 held is "5A 3C 71". The byte boundaries
@@ -113,6 +165,20 @@ void ev1527_byte_label(const Ev1527Analysis *a, int idx, uint8_t v, char *buf,
     return;
 
   const Ev1527Frame *f = &a->frame[(idx / 3) % EV1527_MAX_FRAMES];
+
+  // Where the bits also read as a PT2262, the twelve tri-state symbols are
+  // what goes here and the address-and-key reading moves up to the header.
+  // Both are true of the same waveform; this is the one somebody is holding a
+  // receiver's DIP switches next to, and the other is one line away.
+  if (f->tri_ok)
+  {
+    char tri[13];
+
+    ev1527_tri_text(f, tri, sizeof(tri));
+    snprintf(buf, size, "PT %s", tri);
+
+    return;
+  }
 
   snprintf(buf, size, "%05lX K%X", (unsigned long)f->addr, f->key);
 }
@@ -242,6 +308,7 @@ static int ev1527_scan(const LogicScratch *s, int runs, int period_ns, int hi,
 
       f->addr = (value >> 4) & 0xFFFFFu;
       f->key = (uint8_t)(value & 0x0F);
+      f->tri_ok = ev_tri_ok(value);
 
       for (int i = 0; i < 3; i++)
       {
@@ -326,26 +393,44 @@ int ev1527_decode(const uint8_t *data, int size, int offset, int period_ns,
       g_ev.agree = false;
   }
 
+  // ...and whether every one of them also reads as a PT2262. Per frame it is
+  // a one-in-thirty accident; over four repeats of a held button it is the
+  // part saying what it is.
+  g_ev.tri_all = true;
+
+  for (int i = 0; i < g_ev.frames; i++)
+  {
+    if (!g_ev.frame[i].tri_ok)
+      g_ev.tri_all = false;
+  }
+
   // Twenty-four bits of constant period is a statement no other protocol here
   // makes, so one whole frame settles it
   out->ambiguous = false;
 
   int us = g_ev.t_ns / 1000;
 
+  // The waveform is what it is and the header names it EV1527, which is the
+  // reading that is certainly true. The PT2262 mark says the same bits ALSO
+  // group into twelve tri-state symbols - and where it appears, those symbols
+  // are on the row under the bytes, because that is the form somebody holding
+  // a receiver's DIP switches is trying to match.
+  const char *pt = g_ev.tri_all ? " PT" : "";
+
   if (g_ev.agree)
   {
     if (g_ev.frames > 1)
-      snprintf(out->info, sizeof(out->info), "EV1527 %05lX K%X x%d %dus",
+      snprintf(out->info, sizeof(out->info), "EV1527 %05lX K%X x%d %dus%s",
           (unsigned long)g_ev.frame[0].addr, g_ev.frame[0].key, g_ev.frames,
-          us);
+          us, pt);
     else
-      snprintf(out->info, sizeof(out->info), "EV1527 %05lX K%X %dus",
-          (unsigned long)g_ev.frame[0].addr, g_ev.frame[0].key, us);
+      snprintf(out->info, sizeof(out->info), "EV1527 %05lX K%X %dus%s",
+          (unsigned long)g_ev.frame[0].addr, g_ev.frame[0].key, us, pt);
   }
   else
   {
-    snprintf(out->info, sizeof(out->info), "EV1527 %d frames %dus",
-        g_ev.frames, us);
+    snprintf(out->info, sizeof(out->info), "EV1527 %d frames %dus%s",
+        g_ev.frames, us, pt);
   }
 
   return out->count;

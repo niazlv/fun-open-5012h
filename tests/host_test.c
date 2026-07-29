@@ -1031,6 +1031,101 @@ static void rc6_g_frame(IrGen *g, uint32_t value, int nbits, int wide)
   ir_g_level(g, 0, 20);
 }
 
+// Sony SIRC off the same kind of demodulator: the output rests HIGH and a
+// mark pulls it low. Everything is a multiple of T - the leader is 4T of
+// mark and 1T of space, a '0' is 1T of mark and a '1' 2T, and the space
+// between two bits is always one T.
+typedef struct { uint8_t *buf; int size; double t; double sps_t; } SircGen;
+
+static void sirc_g_level(SircGen *g, int mark, double ticks)
+{
+  int a = (int)(g->t + 0.5);
+
+  g->t += ticks * g->sps_t;
+
+  int b = (int)(g->t + 0.5);
+
+  for (int i = a; i < b && i < g->size; i++)
+    g->buf[i] = mark ? (uint8_t)56 : (uint8_t)200;
+}
+
+static void sirc_g(SircGen *g, uint8_t *buf, int size, double period_ns,
+    double t_us)
+{
+  g->buf = buf;
+  g->size = size;
+  g->t = 0;
+  g->sps_t = t_us * 1000.0 / period_ns;
+
+  memset(buf, 200, (size_t)size);      // no carrier: the output rests high
+
+  sirc_g_level(g, 0, 12);
+}
+
+// LSB first, and the command is the bottom seven bits
+static void sirc_g_frame(SircGen *g, uint32_t value, int nbits)
+{
+  sirc_g_level(g, 1, 4);               // the leader: 4T of mark...
+  sirc_g_level(g, 0, 1);               // ...and 1T of space
+
+  for (int i = 0; i < nbits; i++)
+  {
+    sirc_g_level(g, 1, ((value >> i) & 1) ? 2 : 1);
+    sirc_g_level(g, 0, 1);
+  }
+
+  sirc_g_level(g, 0, 20);              // the gap to the next frame
+}
+
+// CPPM: narrow separator pulses on a line that rests low, and the value of a
+// channel is the time from one separator to the next. A frame is n channels,
+// a closing separator and then the sync gap that pads it out to frame_us.
+typedef struct { uint8_t *buf; int size; double t; double sps_us; int inv; } PpmGen;
+
+static void ppm_g_run(PpmGen *g, int high, double us)
+{
+  int a = (int)(g->t + 0.5);
+
+  g->t += us * g->sps_us;
+
+  int b = (int)(g->t + 0.5);
+  int v = ((high ^ g->inv) & 1) ? 200 : 56;
+
+  for (int i = a; i < b && i < g->size; i++)
+    g->buf[i] = (uint8_t)v;
+}
+
+static void ppm_g(PpmGen *g, uint8_t *buf, int size, double period_ns, int inv)
+{
+  g->buf = buf;
+  g->size = size;
+  g->t = 0;
+  g->sps_us = 1000.0 / period_ns;
+  g->inv = inv;
+
+  memset(buf, inv ? 200 : 56, (size_t)size);
+
+  ppm_g_run(g, 0, 2000);               // the line at rest in front of it all
+}
+
+static void ppm_g_frame(PpmGen *g, const int *ch, int n, int frame_us)
+{
+  const int mark = 400;                // the separator: fixed, and not the value
+  int used = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    ppm_g_run(g, 1, mark);
+    ppm_g_run(g, 0, ch[i] - mark);
+    used += ch[i];
+  }
+
+  // n channels take n+1 separators: this is the one that closes the last of
+  // them, and the sync gap behind it pads the frame to its period
+  ppm_g_run(g, 1, mark);
+  ppm_g_run(g, 0, frame_us - used - mark);
+}
+
 // DALI on the pair: the bus rests HIGH and a transmitter pulls it down. A
 // one is a low-to-high transition in the middle of the bit, a zero the other
 // way round, and the two stop bits are the bus simply left alone.
@@ -2832,6 +2927,156 @@ int main(void)
       synth_uart(buf, SIZE, 512.0, 115200.0, "servo?", 100000.0);
       check_near("uart is not servo",
           servo_decode(buf, SIZE, 0, 512, &scratch, &lr), 0, 0);
+    }
+
+    // ----- CPPM: the same receiver's other pin, with every channel on it ----
+    //
+    // Upside down from the servo line beside it: there the pulse carries the
+    // value in its width, here every separator is the same 400 us and the
+    // GAPS carry everything. A whole frame - a sync, its channels and the
+    // closing sync - is what the protocol is claimed on.
+    printf("cppm sum signal:\n");
+    {
+      const int ch[8] = { 1500, 1000, 2000, 1100, 1900, 1500, 1500, 1500 };
+      PpmGen g;
+      char lab[16];
+
+      ppm_g(&g, buf, SIZE, 3000.0, 0);
+
+      for (int i = 0; i < 3; i++)
+        ppm_g_frame(&g, ch, 8, 20000);
+
+      int n = logic_decode(buf, SIZE, 0, 3000, PROTO_AUTO, &scratch, &lr);
+      const PpmAnalysis *a = ppm_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_PPM, 0);
+      check_near("eight channels", a->chans, 8, 0);
+      check_near("header", !strcmp(lr.info, "PPM 8ch 50Hz"), 1, 0);
+      check_near("frame 20 ms", lr.rate, 20000000, 1);
+      check_near("idle low", lr.idle_high, 0, 0);
+
+      // The channels of the whole frame, and then the ones of the frame the
+      // record ended inside - which are numbered because the sync in front of
+      // them was seen, and marked cut because the one behind them was not
+      check_near("bytes for both frames", n, 16, 0);
+      check_near("ch1 1.50 ms", lr.bytes[0], 150, 0);
+      check_near("ch2 1.00 ms", lr.bytes[1], 100, 0);
+      check_near("ch3 2.00 ms", lr.bytes[2], 200, 0);
+      check_near("ch4 1.10 ms", lr.bytes[3], 110, 0);
+      check_near("ch5 1.90 ms", lr.bytes[4], 190, 0);
+
+      check_near("two frames recorded", a->frames, 2, 0);
+      check_near("the first one whole", a->frame[0].cut, 0, 0);
+      check_near("the last one cut", a->frame[1].cut, 1, 0);
+
+      // Separator to separator: the byte lights the interval its value was
+      // measured over, not the pulse that opened it
+      check_near("channel marked interval-wide",
+          lr.end[0] - lr.pos[0], 500, 1);
+
+      ppm_byte_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("the width, in the units it is set in",
+          !strcmp(lab, "1.50ms"), 1, 0);
+      ppm_field_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("channel numbered in its frame",
+          !strcmp(lab, "CH3"), 1, 0);
+      // ...and the cut frame's channels start over at one rather than
+      // carrying on from nine
+      ppm_field_label(a, 8, lr.bytes[8], lab, sizeof(lab));
+      check_near("the next frame starts at one",
+          !strcmp(lab, "CH1"), 1, 0);
+    }
+
+    // Two whole frames, and the Futaba convention with them: the line rests
+    // high and the separators pull it down, which is ordinary PPM
+    printf("cppm, repeats and the inverted convention:\n");
+    {
+      const int ch[8] = { 1500, 1000, 2000, 1100, 1900, 1500, 1500, 1500 };
+      PpmGen g;
+
+      ppm_g(&g, buf, SIZE, 3500.0, 0);
+
+      for (int i = 0; i < 4; i++)
+        ppm_g_frame(&g, ch, 8, 20000);
+
+      logic_decode(buf, SIZE, 0, 3500, PROTO_AUTO, &scratch, &lr);
+
+      check_near("two whole frames", !strcmp(lr.info, "PPM 8ch 50Hz x2"), 1, 0);
+
+      ppm_g(&g, buf, SIZE, 3500.0, 1);
+
+      for (int i = 0; i < 4; i++)
+        ppm_g_frame(&g, ch, 8, 20000);
+
+      logic_decode(buf, SIZE, 0, 3500, PROTO_AUTO, &scratch, &lr);
+
+      check_near("inverted still decodes", lr.proto, PROTO_PPM, 0);
+      check_near("...and says so",
+          !strcmp(lr.info, "PPM 8ch 50Hz x2 inv"), 1, 0);
+      check_near("idle is high now", lr.idle_high, 1, 0);
+      check_near("ch3 still 2.00 ms", lr.bytes[2], 200, 0);
+    }
+
+    // A receiver dropping a channel is the fault somebody is looking at this
+    // signal to find, so the count is not averaged into one number
+    printf("cppm, a frame that lost a channel:\n");
+    {
+      const int ch[8] = { 1500, 1000, 2000, 1100, 1900, 1500, 1500, 1500 };
+      PpmGen g;
+
+      ppm_g(&g, buf, SIZE, 3500.0, 0);
+      ppm_g_frame(&g, ch, 8, 20000);
+      ppm_g_frame(&g, ch, 8, 20000);
+      ppm_g_frame(&g, ch, 7, 20000);
+      ppm_g_frame(&g, ch, 8, 20000);
+
+      logic_decode(buf, SIZE, 0, 3500, PROTO_AUTO, &scratch, &lr);
+      const PpmAnalysis *a = ppm_analysis();
+
+      check_near("the two whole frames disagreed", a->chans, 0, 0);
+      check_near("...and the header says so, not an average",
+          !strcmp(lr.info, "PPM 2 frames 50Hz"), 1, 0);
+      check_near("eight in the first", a->frame[0].chans, 8, 0);
+      check_near("seven in the second", a->frame[1].chans, 7, 0);
+    }
+
+    // The two signals on the two pins of the same receiver, and neither
+    // decoder can take the other's record. A servo line's pulses are 20 ms
+    // apart, so every interval on it is a sync gap and no channels ever fall
+    // between two of them; a PPM stream's are 1 to 2 ms apart, which is below
+    // the slowest frame rate a servo runs at.
+    printf("cppm and servo are not each other:\n");
+    {
+      const int ch[8] = { 1500, 1000, 2000, 1100, 1900, 1500, 1500, 1500 };
+      PpmGen g;
+
+      servo_g(buf, SIZE, 10000, 1500, 20000, 8);
+      check_near("servo is not cppm",
+          ppm_decode(buf, SIZE, 0, 10000, &scratch, &lr), 0, 0);
+
+      ppm_g(&g, buf, SIZE, 3000.0, 0);
+
+      for (int i = 0; i < 3; i++)
+        ppm_g_frame(&g, ch, 8, 20000);
+
+      check_near("cppm is not servo",
+          servo_decode(buf, SIZE, 0, 3000, &scratch, &lr), 0, 0);
+
+      // A single frame with no closing sync is a train of pulses that could
+      // be a great many things, and one is not claimed for it
+      ppm_g(&g, buf, SIZE, 3000.0, 0);
+      ppm_g_frame(&g, ch, 8, 20000);
+
+      check_near("one frame is not enough",
+          ppm_decode(buf, SIZE, 0, 3000, &scratch, &lr), 0, 0);
+
+      synth_uart(buf, SIZE, 1000.0, 9600.0, "MILKV-UART-TEST 9600", 20000.0);
+      check_near("uart is not cppm",
+          ppm_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      check_near("sine is not cppm",
+          ppm_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
     }
 
     // ----- CAN 2.0A/2.0B: 500 kbit/s, 500 ns sample period (4 samples/bit) --
@@ -5089,6 +5334,279 @@ int main(void)
           sent_decode(buf, SIZE, 0, 4000, &scratch, &lr), 0, 0);
       check_near("ev1527 is not ws2812",
           ws2812_decode(buf, SIZE, 0, 4000, &scratch, &lr), 0, 0);
+    }
+
+    // The SAME twenty-four bits, read as a PT2262. The two parts put
+    // identical waveforms on the air: a PT2262 spends two pulses on each of
+    // twelve tri-state symbols, which is 24 pulses of 4T, pulse for pulse
+    // what a 1527 sends as 24 bits. Only the boundaries move.
+    printf("ev1527 read as a pt2262:\n");
+    {
+      EvGen g;
+      char lab[16], tri[16];
+
+      // 0F1F01FF0011: every pair is 00, 01 or 11, so the frame is one a
+      // PT2262 could have sent. Wide-then-narrow is the pair it never emits.
+      ev_g(&g, buf, SIZE, 4000.0, 320.0, 0);
+      ev_g_frame(&g, 0x1D350, 0xF);
+
+      logic_decode(buf, SIZE, 0, 4000, PROTO_AUTO, &scratch, &lr);
+      const Ev1527Analysis *a = ev1527_analysis();
+
+      check_near("still an EV1527 record", lr.proto, PROTO_EV1527, 0);
+      check_near("...and it reads as a PT2262", a->frame[0].tri_ok, 1, 0);
+      check_near("every frame did", a->tri_all, 1, 0);
+
+      ev1527_tri_text(&a->frame[0], tri, sizeof(tri));
+      check_near("twelve tri-state symbols",
+          !strcmp(tri, "0F1F01FF0011"), 1, 0);
+
+      // The header keeps the reading that is certainly true and marks the
+      // other; the symbols themselves go on the row under the bytes, which
+      // is where somebody matching DIP switches is looking
+      check_near("header", !strcmp(lr.info, "EV1527 1D350 KF 320us PT"), 1, 0);
+
+      ev1527_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("group reads the symbols",
+          !strcmp(lab, "PT 0F1F01FF0011"), 1, 0);
+
+      // ...and a frame that could NOT have come from one says nothing about
+      // it. 5A3C7 K1 holds a wide pulse followed by a narrow one, which is
+      // the one pair the part cannot produce.
+      ev_g(&g, buf, SIZE, 4000.0, 320.0, 0);
+      ev_g_frame(&g, 0x5A3C7, 1);
+
+      logic_decode(buf, SIZE, 0, 4000, PROTO_AUTO, &scratch, &lr);
+      a = ev1527_analysis();
+
+      check_near("this one is not a pt2262", a->frame[0].tri_ok, 0, 0);
+      check_near("header says nothing of it",
+          !strcmp(lr.info, "EV1527 5A3C7 K1 320us"), 1, 0);
+
+      ev1527_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("the address and key stand",
+          !strcmp(lab, "5A3C7 K1"), 1, 0);
+    }
+
+    // ============================ SIRC decoder ============================
+    //
+    // The other pulse-coded infrared family. Nothing in the frame announces
+    // its length: every space inside one is 1T and the one after the last bit
+    // is the rest of the 45 ms, so the decoder reads until a long gap and
+    // then asks whether it stopped on 12, 15 or 20 bits.
+    printf("sony sirc, a twelve-bit frame:\n");
+    {
+      SircGen g;
+      char lab[16];
+
+      // Command 21 to device 1: LSB first, so the command is the bottom
+      // seven bits and comes off the wire before the address does
+      sirc_g(&g, buf, SIZE, 2000.0, 600.0);
+      sirc_g_frame(&g, 21u | (1u << 7), 12);
+
+      int n = logic_decode(buf, SIZE, 0, 2000, PROTO_AUTO, &scratch, &lr);
+      const SircAnalysis *a = sirc_analysis();
+
+      check_near("auto takes it", lr.proto, PROTO_SIRC, 0);
+      check_near("two bytes for the frame", n, 2, 0);
+      check_near("command first off the wire", lr.bytes[0], 21, 0);
+      check_near("...then the address", lr.bytes[1], 1, 0);
+      check_near("twelve bits", a->frame[0].bits, 12, 0);
+      check_near("T off the leader", lr.rate, 600000, 2);
+      // A demodulator rests with no carrier, so the line rests high
+      check_near("idle is high", lr.idle_high, 1, 0);
+      check_near("header", !strcmp(lr.info, "SIRC12 A=1 C=21"), 1, 0);
+
+      int gs, gl;
+
+      sirc_group_at(a, 1, &gs, &gl);
+      check_near("one frame is one group", gs, 0, 0);
+      check_near("...of two bytes", gl, 2, 0);
+
+      sirc_byte_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("group reads both", !strcmp(lab, "A1 C21"), 1, 0);
+      sirc_field_label(a, 0, lr.bytes[0], lab, sizeof(lab));
+      check_near("first byte is the command", !strcmp(lab, "CMD"), 1, 0);
+      sirc_field_label(a, 1, lr.bytes[1], lab, sizeof(lab));
+      check_near("second is the address", !strcmp(lab, "ADDR"), 1, 0);
+    }
+
+    // The other two lengths. The address field widens on the fifteen-bit
+    // frame and an extended byte appears on the twenty-bit one, and only the
+    // bit count says which - so reading 15 bits as 12 puts the address out.
+    printf("sirc at fifteen and twenty bits:\n");
+    {
+      SircGen g;
+      char lab[16];
+
+      sirc_g(&g, buf, SIZE, 2500.0, 600.0);
+      sirc_g_frame(&g, 21u | (138u << 7), 15);
+
+      logic_decode(buf, SIZE, 0, 2500, PROTO_AUTO, &scratch, &lr);
+      const SircAnalysis *a = sirc_analysis();
+
+      check_near("fifteen bits", a->frame[0].bits, 15, 0);
+      check_near("command", a->frame[0].cmd, 21, 0);
+      check_near("eight bits of address", a->frame[0].addr, 138, 0);
+      check_near("header", !strcmp(lr.info, "SIRC15 A=138 C=21"), 1, 0);
+
+      sirc_g(&g, buf, SIZE, 3000.0, 600.0);
+      sirc_g_frame(&g, 21u | (26u << 7) | (144u << 12), 20);
+
+      int n = logic_decode(buf, SIZE, 0, 3000, PROTO_AUTO, &scratch, &lr);
+
+      a = sirc_analysis();
+
+      check_near("twenty bits", a->frame[0].bits, 20, 0);
+      check_near("three bytes for it", n, 3, 0);
+      check_near("command", a->frame[0].cmd, 21, 0);
+      check_near("five bits of address again", a->frame[0].addr, 26, 0);
+      check_near("...and the extended byte", a->frame[0].ext, 144, 0);
+      check_near("header", !strcmp(lr.info, "SIRC20 A=26 C=21 E=144"), 1, 0);
+
+      sirc_field_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("third byte is the extension", !strcmp(lab, "EXT"), 1, 0);
+      sirc_byte_label(a, 2, lr.bytes[2], lab, sizeof(lab));
+      check_near("group reads all three",
+          !strcmp(lab, "A26 C21 E144"), 1, 0);
+    }
+
+    // A key held down repeats the frame every 45 ms, and a remote sends it at
+    // least three times whatever the key does - so repeats agreeing is the
+    // only corroboration a protocol with no checksum has to offer
+    printf("sirc, a key held down:\n");
+    {
+      SircGen g;
+
+      sirc_g(&g, buf, SIZE, 5000.0, 600.0);
+
+      for (int i = 0; i < 3; i++)
+        sirc_g_frame(&g, 21u | (1u << 7), 12);
+
+      logic_decode(buf, SIZE, 0, 5000, PROTO_AUTO, &scratch, &lr);
+      const SircAnalysis *a = sirc_analysis();
+
+      check_near("three frames", a->frames, 3, 0);
+      check_near("all agreeing", a->agree, 1, 0);
+      check_near("bytes", lr.count, 6, 0);
+      check_near("header", !strcmp(lr.info, "SIRC12 A=1 C=21 x3"), 1, 0);
+    }
+
+    // The record is not long enough for the frame at every timebase - a
+    // twenty-bit frame is 33 ms - and the command is the BOTTOM seven bits,
+    // so a frame cut in half still says which key was pressed. That is worth
+    // reporting rather than refusing, exactly as it is for NEC.
+    printf("sirc, a frame the record cut short:\n");
+    {
+      SircGen g;
+
+      sirc_g(&g, buf, SIZE, 1000.0, 600.0);
+      sirc_g_frame(&g, 21u | (26u << 7) | (144u << 12), 20);
+
+      int n = logic_decode(buf, SIZE, 0, 1000, PROTO_AUTO, &scratch, &lr);
+      const SircAnalysis *a = sirc_analysis();
+
+      check_near("still SIRC", lr.proto, PROTO_SIRC, 0);
+      check_near("the command, and only it", n, 1, 0);
+      check_near("...and it is right", lr.bytes[0], 21, 0);
+      check_near("marked cut", a->frame[0].cut, 1, 0);
+      check_near("...on the record too", lr.overrun, 1, 0);
+      check_near("header says so", !strncmp(lr.info, "SIRC C=21 ", 10), 1, 0);
+    }
+
+    // Probe the emitter's LED driver instead of the receiver and everything
+    // inverts, purpose included. The decoder asks the record which level is
+    // rest rather than assuming, so the reading comes out the same.
+    printf("sirc off the emitter, inverted:\n");
+    {
+      SircGen g;
+
+      sirc_g(&g, buf, SIZE, 2000.0, 600.0);
+      sirc_g_frame(&g, 21u | (1u << 7), 12);
+
+      for (int i = 0; i < SIZE; i++)
+        buf[i] = (buf[i] > 128) ? 56 : 200;
+
+      logic_decode(buf, SIZE, 0, 2000, PROTO_AUTO, &scratch, &lr);
+
+      check_near("inverted still decodes", lr.proto, PROTO_SIRC, 0);
+      check_near("command", lr.bytes[0], 21, 0);
+      check_near("address", lr.bytes[1], 1, 0);
+      check_near("idle is low now", lr.idle_high, 0, 0);
+    }
+
+    // The one that matters. RC6 is the other infrared leader in this range
+    // and the two are close enough that "a long mark, then bits" reads one as
+    // the other. What separates them is the leader's own ratio - 4:1 here
+    // against RC6's 3:1 - and behind it, that every space in a SIRC frame is
+    // one unit where a bi-phase code's vary with the data.
+    printf("sirc and the philips remotes are not each other:\n");
+    {
+      SircGen sg;
+      IrGen ig;
+
+      ir_g(&ig, buf, SIZE, 2000.0, 889.0);
+      rc6_g_frame(&ig, (1u << 20) | (0u << 17) | (1u << 16) | (0x12 << 8) | 0x34,
+          21, 4);
+
+      check_near("rc6 is not sirc",
+          sirc_decode(buf, SIZE, 0, 2000, &scratch, &lr), 0, 0);
+      check_near("...and auto still says RC5",
+          logic_decode(buf, SIZE, 0, 2000, PROTO_AUTO, &scratch, &lr) > 0 &&
+          lr.proto == PROTO_RC5, 1, 0);
+
+      ir_g(&ig, buf, SIZE, 2000.0, 1778.0);
+      rc5_g_frame(&ig, (3u << 12) | (1u << 11) | (5u << 6) | 35u, 14);
+
+      check_near("rc5 is not sirc",
+          sirc_decode(buf, SIZE, 0, 2000, &scratch, &lr), 0, 0);
+
+      // ...and the other way. A unit that has drifted to 700 us is what
+      // offers the bi-phase reader a 1.4 ms bit time and a record of runs
+      // that all measure half a bit or a whole one, which is why this decoder
+      // has to come first in the cascade rather than after.
+      sirc_g(&sg, buf, SIZE, 2000.0, 700.0);
+      sirc_g_frame(&sg, 21u | (1u << 7), 12);
+
+      check_near("a drifted sirc is still taken by sirc",
+          logic_decode(buf, SIZE, 0, 2000, PROTO_AUTO, &scratch, &lr) > 0 &&
+          lr.proto == PROTO_SIRC, 1, 0);
+
+      // NEC is not a risk in either direction: its leader is 9 ms, which
+      // would put T at 2.25 ms - past the top of the window by a factor of
+      // two and a half - and a SIRC leader read as NEC's is out by four
+      sirc_g(&sg, buf, SIZE, 2000.0, 600.0);
+      sirc_g_frame(&sg, 21u | (1u << 7), 12);
+
+      check_near("sirc is not nec",
+          nec_decode(buf, SIZE, 0, 2000, &scratch, &lr), 0, 0);
+      check_near("sirc is not ev1527",
+          ev1527_decode(buf, SIZE, 0, 2000, &scratch, &lr), 0, 0);
+      check_near("sirc is not servo",
+          servo_decode(buf, SIZE, 0, 2000, &scratch, &lr), 0, 0);
+    }
+
+    printf("sirc rejects the rest:\n");
+    {
+      synth_uart(buf, SIZE, 1000.0, 9600.0, "MILKV-UART-TEST 9600", 20000.0);
+      check_near("uart is not sirc",
+          sirc_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      synth(buf, SIZE, 0, fn_sine, NULL, 5000.0, 1000.0, 90.0, ZERO_POINT);
+      check_near("sine is not sirc",
+          sirc_decode(buf, SIZE, 0, 1000, &scratch, &lr), 0, 0);
+
+      // A frame that stops at thirteen bits is a signal that started like
+      // SIRC and then was not one, and nothing is reported for it
+      {
+        SircGen g;
+
+        sirc_g(&g, buf, SIZE, 2000.0, 600.0);
+        sirc_g_frame(&g, 21u | (1u << 7), 13);
+
+        check_near("thirteen bits is not a frame",
+            sirc_decode(buf, SIZE, 0, 2000, &scratch, &lr), 0, 0);
+      }
     }
 
     // ============================ DShot decoder ===========================
