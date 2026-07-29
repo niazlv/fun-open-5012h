@@ -53,6 +53,17 @@ endif
 
 LDFLAGS += -Wl,--defsym=__store_reserved=$(STORE_RESERVED)
 
+# How much of a BK-0010-01 to build. The defaults are in src/bk/bk_config.h and
+# describe the real machine; this is where a smaller one is asked for:
+#
+#   make BK_CFLAGS="-DBK_DISASM=0 -DBK_DEBUGGER=0 -DBK_VIDEO_PALETTES=0"
+#
+# Nothing else in the image is affected - the switches only reach src/bk and
+# src/apps/bk_port.c, all of which include bk_config.h before anything else.
+BK_CFLAGS ?=
+
+CFLAGS += $(BK_CFLAGS)
+
 # One -I per subsystem, so a source keeps including a header by its bare name
 # ("measure.h", not "../dsp/measure.h"). The directories are an index for the
 # reader; they are deliberately not part of the include graph, so a file can be
@@ -72,6 +83,7 @@ INCLUDES += \
   -I../src/ui \
   -I../src/scope \
   -I../src/apps \
+  -I../src/bk \
   -I../src/debug \
 
 # Objects land flat in $(BUILD), so every basename here must be unique across
@@ -160,6 +172,19 @@ SRCS += \
   ../src/apps/snake_assets.c \
   ../src/apps/spi_tool.c \
   ../src/apps/doom_port.c \
+  ../src/apps/bk_port.c \
+
+# Электроника БК-0010-01: a PDP-11 and the five registers around it. Every
+# part of it is switchable from src/bk/bk_config.h - build a smaller one with
+# BK_CFLAGS="-DBK_DISASM=0 -DBK_DEBUGGER=0", and see the table in the README
+# for what each switch is worth.
+SRCS += \
+  ../src/bk/bk_cpu.c \
+  ../src/bk/bk_mem.c \
+  ../src/bk/bk_io.c \
+  ../src/bk/bk_video.c \
+  ../src/bk/bk_load.c \
+  ../src/bk/bk_disasm.c \
 
 # Size, not speed, for the 2D games and the toolkit they share.
 #
@@ -176,12 +201,19 @@ SRCS += \
 #
 # A target-specific variable, appended after the -O3 in CFLAGS, so the last -O
 # on the command line is the one that counts.
+# The BK emulator's own split is the same argument one level down: bk_cpu.c and
+# bk_video.c are the inner loop and stay at -O3, while the disassembler, the
+# loader and the application around them run once per keystroke and would
+# rather be small.
 SIZE_OPTIMIZED = \
   $(BUILD)/game_gfx.o \
   $(BUILD)/snake_game.o \
   $(BUILD)/flappy_bird.o \
   $(BUILD)/game2048.o \
   $(BUILD)/tetris.o \
+  $(BUILD)/bk_disasm.o \
+  $(BUILD)/bk_load.o \
+  $(BUILD)/bk_port.o \
 
 $(SIZE_OPTIMIZED): CFLAGS += -Os
 
@@ -280,6 +312,19 @@ $(shell $(MKDIR) -p $(BUILD); \
     echo "$(CONFIG_STORE)" | cmp -s - $(CONFIG_STORE_STAMP) || { \
       echo "$(CONFIG_STORE)" > $(CONFIG_STORE_STAMP); \
       rm -f $(BUILD)/*.o $(BUILD)/$(BIN).elf \
+            $(BUILD)/$(BIN).bin $(BUILD)/$(BIN).hex; })
+
+# And again for the emulator's switches. Narrower than the two above: they
+# only reach src/bk and bk_port.c, so only those objects are dropped - which
+# matters, because turning one off and rebuilding is how their cost gets
+# measured, and a full rebuild each time makes that a minute instead of two
+# seconds.
+BK_STAMP = $(BUILD)/bk_config.stamp
+
+$(shell $(MKDIR) -p $(BUILD); \
+    echo "$(BK_CFLAGS)" | cmp -s - $(BK_STAMP) || { \
+      echo "$(BK_CFLAGS)" > $(BK_STAMP); \
+      rm -f $(BUILD)/bk_*.o $(BUILD)/$(BIN).elf \
             $(BUILD)/$(BIN).bin $(BUILD)/$(BIN).hex; })
 
 all: directory $(BUILD)/$(BIN).elf $(BUILD)/$(BIN).hex $(BUILD)/$(BIN).bin size

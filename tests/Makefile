@@ -45,12 +45,12 @@ HOST_SRCS = \
   $(ROOT)/src/dsp/trend.c \
   $(wildcard $(ROOT)/src/decode/*.c) \
 
-.PHONY: all test host coredump snake flappy g2048 tetris doomhost doomcache clean
+.PHONY: all test host coredump snake flappy g2048 tetris bk doomhost doomcache clean
 
 all: test
 
 # The ones that run without an asset pack
-test: host coredump snake flappy g2048 tetris
+test: host coredump snake flappy g2048 tetris bk
 
 host: $(BUILD)/host_test
 	@./$(BUILD)/host_test
@@ -114,6 +114,29 @@ tetris: $(BUILD)/tetris_test
 $(BUILD)/tetris_test: $(TETRIS_SRCS) $(ROOT)/src/apps/tetris.c gamestub.h | $(BUILD)
 	@echo CC $@
 	@$(CC) $(CFLAGS) -I$(ROOT)/src/apps -I$(ROOT)/tests/hoststub $(TETRIS_SRCS) $(LIBS) -o $@
+
+# The БК-0010-01 emulator. Everything under src/bk is here, unmodified and
+# linked rather than #included, because none of it touches a register - the
+# processor and the bus are arithmetic over a 64 KB array, and the one file
+# that draws goes through the same lcd stub the games use.
+#
+# BK_LOAD_SPIFS=0 leaves out the half of bk_load.c that reads the flash, which
+# is the only part of the emulator that could not run on a host at all.
+BK_SRCS = \
+  bk_cpu_test.c \
+  $(ROOT)/src/bk/bk_cpu.c \
+  $(ROOT)/src/bk/bk_mem.c \
+  $(ROOT)/src/bk/bk_io.c \
+  $(ROOT)/src/bk/bk_video.c \
+  $(ROOT)/src/bk/bk_load.c \
+  $(ROOT)/src/bk/bk_disasm.c \
+
+bk: $(BUILD)/bk_cpu_test
+	@./$(BUILD)/bk_cpu_test
+
+$(BUILD)/bk_cpu_test: $(BK_SRCS) $(wildcard $(ROOT)/src/bk/*.h) | $(BUILD)
+	@echo CC $@
+	@$(CC) $(CFLAGS) -DBK_LOAD_SPIFS=0 -I$(ROOT)/src/bk $(BK_SRCS) $(LIBS) -o $@
 
 # Renders one DOOM frame to a .ppm. Not part of `test`: it needs the asset
 # pack, which is built from a real IWAD and is not in the repository.

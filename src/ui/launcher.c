@@ -27,6 +27,7 @@
 #include "game2048.h"
 #include "tetris.h"
 #include "doom_port.h"
+#include "bk_port.h"
 #include "debug_coredump.h"
 #include "flash_viewer.h"
 #include "spi_tool.h"
@@ -142,6 +143,10 @@ static const app_desc_t g_apps[] =
   { "DOOM", "id Software's renderer on a real WAD level",
     doom_port_init, doom_port_task, doom_port_buttons_handler,
     doom_port_cleanup, doom_port_redraw, &doom_port_menu, &doom_port_help_menu,
+    false },
+  { "BK-0010-01", "Electronika BK-0010-01, a PDP-11 from 1985",
+    bk_port_init, bk_port_task, bk_port_buttons_handler,
+    bk_port_cleanup, bk_port_redraw, &bk_port_menu, &bk_port_help_menu,
     false },
   { "CoreDump Viewer", "View crash dumps and stack traces",
     coredump_app_init, coredump_app_task, coredump_app_buttons_handler,
