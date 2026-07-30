@@ -516,10 +516,16 @@ uint8_t sig_adc_sample(uint64_t t_ns, const AfeState *afe, int converter)
   if (afe->ac_coupling)
     v_uv -= wave_dc_uv() / (fe->probe_div > 1 ? fe->probe_div : 1);
 
-  // The offset DAC moves the signal against the converter's window
+  // The offset DAC moves the signal within the converter's window, and it
+  // moves it UP: a higher code reads higher. That direction is not a guess -
+  // the firmware's own calibration is a binary search that only converges this
+  // way round (autocal_task: mean above zero means try a LOWER code), and the
+  // DAC-step phase discards a step it measures as negative. Modelled the other
+  // way round, the trace pans against its own ground marker and the auto-setup
+  // walks a DC level off the screen while hunting for it.
   offset_uv = (double)(afe->dac_code - DAC_ZERO_CODE) * g_uv_per_dac[scale];
 
-  counts = ZERO_COUNT + (v_uv - offset_uv) / g_uv_per_count[scale];
+  counts = ZERO_COUNT + (v_uv + offset_uv) / g_uv_per_count[scale];
 
   if (!fe->ideal)
   {
