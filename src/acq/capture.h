@@ -84,15 +84,19 @@ typedef struct
   int      top_raw;    // noise peaks excluded — use these for auto-setup
   int      vpp_mv;
   int      vamp_mv;    // top_raw - base_raw in mV: the swing to fit on screen
-  int      vrms_mv;
-  int      vavg_mv;
-  int      vmid_mv;    // (vmax + vmin) / 2 in mV: the 50% trigger level
+  int      vrms_mv;    // from GROUND, like the peaks below: true RMS of the
+  int      vavg_mv;    // input, DC included, and the DC level itself
+  int      vmid_mv;    // (vmax + vmin) / 2 in mV, from the middle of the
+                       // SCREEN: it is the 50% trigger level, and a trigger
+                       // level is measured from there. The one field left on
+                       // those terms, and the only one with no reading of its
+                       // own on screen.
   // The absolute extremes and the larger of the two in magnitude - peak
   // voltage as an instrument means it, measured from GROUND rather than from
-  // the middle of the screen. Everything above is either a difference (vpp,
-  // vamp, vrms) or deliberately screen-relative (vavg, vmid, which the
-  // trigger and the auto-setup steer by), so these are the only fields in
-  // here that the vertical position has been taken out of.
+  // the middle of the screen. Everything else here is either a difference
+  // (vpp, vamp - the reference cancels) or ground-referenced like these; the
+  // rule is that any field a user reads as a voltage means volts on the probe
+  // tip, whatever the vertical position was doing at the time.
   int      vmax_mv;
   int      vmin_mv;
   int      vp_mv;      // max(|vmax_mv|, |vmin_mv|), always >= 0

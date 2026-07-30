@@ -1553,13 +1553,18 @@ static bool get_measurements_ex(ScopeMeasure *out, bool fresh)
   // trim erases completely
   out->base_raw  = m.pk_lo;
   out->top_raw   = m.pk_hi;
+  // Differences, so the reference cancels out of them and neither the vertical
+  // position nor ZERO_POINT appears below: a swing is a swing wherever the
+  // trace sits. Which is also why they read ~0 on a steady level - there is
+  // nothing there to swing, and what is left is the noise band. The DC level
+  // is vavg_mv / vmax_mv, not these.
   out->vpp_mv    = (int)((int64_t)(m.vmax - m.vmin) * mult / CALIB_MULTIPLIER);
   out->vamp_mv   = (int)((int64_t)(m.pk_hi - m.pk_lo) * mult / CALIB_MULTIPLIER);
-  out->vrms_mv   = (int)((int64_t)m.rms_c100 * mult / CALIB_MULTIPLIER / 100);
-  out->vavg_mv   = (int)((int64_t)m.mean_c100 * mult / CALIB_MULTIPLIER / 100);
   // Mid level between the spike-trimmed peaks: works for continuous signals
   // (equals the rail midpoint) and for bursts (percentiles would put the
-  // "midpoint" at the baseline)
+  // "midpoint" at the baseline). Stays measured from the middle of the screen,
+  // because its one consumer is the 50% trigger key and a trigger level IS
+  // pixels from the middle of the screen.
   out->vmid_mv   = (int)((int64_t)((m.pk_hi + m.pk_lo) / 2 - ZERO_POINT) * mult / CALIB_MULTIPLIER);
 
   // ...and the same conversion with the vertical position taken back out, so
@@ -1595,6 +1600,29 @@ static bool get_measurements_ex(ScopeMeasure *out, bool fresh)
       lo = -lo;
 
     out->vp_mv = (hi > lo) ? hi : lo;
+
+    // The mean and the RMS on the same ground, and this is the whole reason
+    // they are computed here rather than beside vpp_mv: measure_run() has one
+    // reference and it is ZERO_POINT, so what it hands back is measured from
+    // wherever the trace happens to have been moved to. Left that way, a panel
+    // showing avg beside max quotes two different grounds - pan a division and
+    // avg walks a division while max stays put - and a DC level big enough to
+    // need panning to see is exactly when avg is the reading being looked at.
+    //
+    // Shifting a mean is a subtraction. Shifting an RMS is not, because it is
+    // quadratic: <(x-k)^2> = <x^2> - 2k<x> + k^2. That identity is exact, so
+    // the record does not have to be scanned a second time to re-reference it.
+    {
+      int64_t mean_mv = (int64_t)m.mean_c100 * mult / CALIB_MULTIPLIER / 100;
+      int64_t rms_mv  = (int64_t)m.rms_c100 * mult / CALIB_MULTIPLIER / 100;
+      int64_t sq = rms_mv * rms_mv - 2 * (int64_t)vpos * mean_mv +
+          (int64_t)vpos * vpos;
+
+      out->vavg_mv = (int)(mean_mv - vpos);
+      // A mean of squares cannot be negative; millivolt rounding of the two
+      // terms can still take it a hair under zero when the answer is zero
+      out->vrms_mv = (int)isqrt64(sq > 0 ? (uint64_t)sq : 0);
+    }
   }
 
   out->frequency = m.frequency;

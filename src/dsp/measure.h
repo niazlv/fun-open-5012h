@@ -77,6 +77,11 @@ typedef struct
 void measure_run(const uint8_t *data, int size, int offset,
     int period_ns, int zero_point, Measure *m);
 
+// Integer square root, no libm and no float. Exported because an RMS whose
+// reference moves has to be re-derived from the one measure_run() returned
+// (see get_measurements_ex) rather than rescanned.
+uint32_t isqrt64(uint64_t value);
+
 // Time index (samples from the oldest) of the center of the narrowest
 // complete pulse in the record, with its width in samples; -1 when the
 // record has no two transitions. Thresholds are the caller's Schmitt pair

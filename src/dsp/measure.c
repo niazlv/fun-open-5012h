@@ -49,7 +49,7 @@ static int sat_ps(int64_t ps)
 }
 
 //-----------------------------------------------------------------------------
-static uint32_t isqrt64(uint64_t value)
+uint32_t isqrt64(uint64_t value)
 {
   uint64_t result = 0;
   uint64_t bit = 1ull << 62;
