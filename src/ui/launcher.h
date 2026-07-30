@@ -13,6 +13,14 @@
 #include <stdbool.h>
 #include "menu_widget.h"
 
+/*- Definitions -------------------------------------------------------------*/
+// The one application another module opens by name rather than by the user
+// picking it off the list: main.c starts here when config.startup_app_mode
+// says so. A #define rather than the string spelled out at both ends, because
+// launcher_start_app() matches on it - the two spellings drifting apart is a
+// boot that quietly lands in the menu instead, with nothing to say why.
+#define LAUNCHER_APP_SCOPE   "Oscilloscope"
+
 /*- Prototypes --------------------------------------------------------------*/
 void launcher_start(void);
 

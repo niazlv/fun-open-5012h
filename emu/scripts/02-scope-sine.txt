@@ -1,7 +1,7 @@
 # A 10 kHz sine, found and scaled by the firmware's own auto-setup
-wait 300
-press mode
-wait 500
+# The device boots into the oscilloscope by itself (Startup = Oscilloscope,
+# the default), so there is no launcher row left to press MODE on here
+wait 800
 press auto
 wait 1500
 shot screenshots/02-scope-sine.png

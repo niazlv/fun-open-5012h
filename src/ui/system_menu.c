@@ -671,8 +671,25 @@ static void action_key_remap(const void *arg)
 // Menu tables (const, in flash). config changes are persisted automatically
 // by config_task once the struct CRC goes stale.
 //-----------------------------------------------------------------------------
+// What the device comes up in. A choice rather than a toggle because both
+// answers are screens with names, and "Startup: ON" would say neither of them.
+// config.startup_app_mode is read once, by main.c, at boot - there is nothing
+// to apply here, which is why the row has no on_change.
+//
+// "Startup" rather than the "Start With" it reads as, for the room: a popup row
+// puts the label at the left edge and the value hard against the right one, and
+// "Oscilloscope" is the longest value in this menu.
+static const char *const g_startup_labels[STARTUP_APP_COUNT] =
+{
+  "Oscilloscope",   // STARTUP_APP_SCOPE, the default
+  "App Menu",       // STARTUP_APP_LAUNCHER
+};
+
 static const menu_item_t g_general_items[] =
 {
+  { .kind = MI_CHOICE, .label = "Startup",
+    .u.choice = { &config.startup_app_mode, g_startup_labels,
+        STARTUP_APP_COUNT, NULL } },
   { .kind = MI_NUMBER, .label = "Brightness",
     .u.number = { &config.lcd_bl_level, 10, 100, 5, 10, "%", apply_backlight } },
   // Dims to a quarter of the brightness above after this long without a key,

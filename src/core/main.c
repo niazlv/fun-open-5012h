@@ -331,9 +331,29 @@ int main(void)
   launcher_start();
 
   // A dump left over from before the reset is the reason this boot happened,
-  // so go straight to it instead of making the user find the viewer
+  // so go straight to it instead of making the user find the viewer.
+  //
+  // It comes FIRST, and the startup application below is an else: only one
+  // screen is pushed onto the launcher here, and a crash to report outranks a
+  // preference about what to show. It is also the way out if the startup
+  // application is what crashed - that boot lands in the viewer, not back in
+  // the thing that faulted.
   if (debug_coredump_ring_retained())
+  {
     launcher_start_app("CoreDump Viewer");
+  }
+  else if (STARTUP_APP_SCOPE == config.startup_app_mode)
+  {
+    // Switched on and measuring, without the list in between. Nothing is
+    // lost by it: SHIFT+MENU leaves the instrument for the launcher exactly
+    // as it does from any application, and MENU > General Settings > Startup
+    // is where this is turned off.
+    //
+    // Failing here is harmless by construction: launcher_start_app() returns
+    // false for a name it does not have, and the launcher is already the root
+    // screen, so the device comes up on the list.
+    launcher_start_app(LAUNCHER_APP_SCOPE);
+  }
 
   while (1)
   {

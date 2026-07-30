@@ -7,9 +7,9 @@
 #
 # AUTO, slow the timebase until the record holds a whole message, STOP,
 # SHIFT+EDGE to decode, TRIG_UP x4 to the boundary, SHIFT+LEFT to 20 us/div.
-wait 300
-press mode
-wait 500
+# The device boots into the oscilloscope by itself (Startup = Oscilloscope,
+# the default), so there is no launcher row left to press MODE on here
+wait 800
 press auto
 wait 1500
 press shift+right

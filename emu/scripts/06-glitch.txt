@@ -1,8 +1,8 @@
 # SHIFT+50% hunts for the narrowest pulse in the record, stops on it and pans
 # the display there - the runt pulse the signal hides once every 32 periods
-wait 300
-press mode
-wait 500
+# The device boots into the oscilloscope by itself (Startup = Oscilloscope,
+# the default), so there is no launcher row left to press MODE on here
+wait 800
 press auto
 wait 1500
 press shift+50

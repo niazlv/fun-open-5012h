@@ -2,9 +2,9 @@
 # protocol decoder and calibration, all stored in flash. The scope's text
 # pages are not here - they are in the root Help section, with every other
 # application's.
-wait 300
-press mode
-wait 500
+# The device boots into the oscilloscope by itself (Startup = Oscilloscope,
+# the default), so there is no launcher row left to press MODE on here
+wait 800
 press auto
 wait 2500
 press menu

@@ -1,3 +1,7 @@
-# The application launcher, as the firmware draws it at boot
+# The application launcher. The device comes up in the oscilloscope now
+# (Startup = Oscilloscope, the default in General Settings), so this is taken
+# from the way out every application has: SHIFT+MENU.
+wait 400
+press shift+menu
 wait 400
 shot screenshots/01-launcher.png

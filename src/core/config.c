@@ -1820,6 +1820,7 @@ static const struct
   FIELD(draw_mode, FT_INT),
   FIELD(grid_mode, FT_INT),
   FIELD(roll_from, FT_INT),
+  FIELD(startup_app_mode, FT_INT),
 
   FIELD(snake_high_score, FT_INT),
   FIELD(flappy_high_score, FT_INT),
@@ -2059,6 +2060,12 @@ void config_reset(void)
   // whatever the band is showing the first time it is opened
   config.measure_layout_mode    = PANEL_LAYOUT_BAND;
   memset(config.measure_widget, 0, sizeof(config.measure_widget));
+
+  // Straight into the instrument when the device is switched on. The reset
+  // combo means "I have made a mess of the settings", and the stock answer to
+  // that is the scope, not its launcher.
+  config.startup_app_mode       = STARTUP_APP_SCOPE;
+
   config.show_vpp               = true;
   config.show_freq              = true;
   config.show_duty              = true;

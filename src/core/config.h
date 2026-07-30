@@ -156,6 +156,19 @@ enum
   DRAW_COUNT,
 };
 
+// What the device shows when it is switched on (config.startup_app_mode). The
+// instrument is what this thing is, so it is index 0: zero-is-default here
+// means the setting is ON out of the box and stays on across a firmware update
+// that predates it. The launcher's list is one SHIFT+MENU away from the scope
+// either way, which is what keeps this from being a setting you can get stuck
+// behind.
+enum
+{
+  STARTUP_APP_SCOPE = 0,
+  STARTUP_APP_LAUNCHER,
+  STARTUP_APP_COUNT,
+};
+
 // Health of the settings store, reported by config_get_state(). FRESH on any
 // boot other than the very first one means the previous session's settings
 // did not survive - the symptom this used to produce with no way to see it.
@@ -460,13 +473,27 @@ typedef struct
   // a blank screen (see scope_layout_edit_start).
   PanelWidget measure_widget[PANEL_WIDGETS_MAX];
 
+  // What the device opens by itself at power-on: STARTUP_APP_*. Zero is the
+  // oscilloscope, and that is deliberately both the default and what a config
+  // saved before this field existed - or migrated from an older layout - reads
+  // as. This is an instrument first; the list of applications is the detour,
+  // not the destination.
+  //
+  // Two states rather than an index into the launcher's table: that table's
+  // order is a build-time detail, so a stored index would quietly come to mean
+  // a different application on the first firmware that adds a row above it.
+  // See main.c for what still wins over this - a coredump left by the boot
+  // before, which is the more urgent thing to be shown.
+  int      startup_app_mode;
+
   /*
    * The reserve. A new field is carved out of HERE, shrinking the array by
    * exactly what it takes so that sizeof(Config) and every offset below stay
    * put - an entry whose size does not match is not read, and the padding is
    * what keeps that from being every entry on the flash after every change.
    *
-   * Four words. Two things bound it, and neither is generous:
+   * Three words - version 3 started with four, and startup_app_mode above
+   * has taken one. Two things bound the rest, and neither is generous:
    *
    * The flash. crc has to be the last word of the struct and the struct has to
    * fit the 512-byte entry slot the store tiles its sector with, which leaves
@@ -484,7 +511,7 @@ typedef struct
    * a layout forward now, so another version costs a row in g_old_layouts, a
    * static assert, and nothing else.
    */
-  uint32_t padding[4];
+  uint32_t padding[3];
 
   // The calibration block. Contiguous, and last before crc, on purpose:
   // calib_crc covers exactly the bytes from calib_channel_delta up to crc. A

@@ -125,7 +125,7 @@ static void scope_cleanup_wrapper(void)
 // by calling redraw() on the application below it
 static const app_desc_t g_apps[] =
 {
-  { "Oscilloscope", "Digital oscilloscope with signal analysis",
+  { LAUNCHER_APP_SCOPE, "Digital oscilloscope with signal analysis",
     scope_init_wrapper, scope_task, scope_buttons_handler, scope_cleanup_wrapper,
     scope_redraw_all, &scope_menu, &scope_help_menu, false },
   { "3D Graphics", "Rotating 3D cube demo",
