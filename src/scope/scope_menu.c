@@ -1473,6 +1473,28 @@ static const char *const g_calib_help_lines[] =
   "raw data in 0xd0-0xf0, and adjust until",
   "min and max match it. S and O are per",
   "vertical range; Z and D are shared.",
+  "",
+  INFO_HEAD "Calibrate gain",
+  "S by measurement instead of by eye, and",
+  "it does not stop after one range. Apply a",
+  "DC level, say what it is with LEFT/RIGHT,",
+  "and MODE trims the range to agree. The",
+  "line above shows what it reads against",
+  "what you typed, in percent, so the error",
+  "is visible BEFORE it is applied.",
+  "",
+  "SHIFT+UP/DOWN moves to the next range",
+  "without leaving. One source covers the two",
+  "or three ranges it fits on: on a range too",
+  "fine for it the trace clips and the trim",
+  "is refused rather than guessed.",
+  "",
+  "The level is at the PROBE TIP - the number",
+  "on the meter, not what reaches the BNC.",
+  "A 10x probe whose own ratio is off by a",
+  "few percent puts that error into the range",
+  "it is calibrated on, so calibrate at 1x if",
+  "the ranges are to be right for both.",
 };
 
 static const info_page_t g_page_calib_help =
@@ -1553,6 +1575,16 @@ static void action_autocal(const void *arg)
   scope_autocal_start();
 }
 
+//-----------------------------------------------------------------------------
+static void action_calib_gain(const void *arg)
+{
+  (void)arg;
+  // Same reason as the auto-calibration: it needs the trace, the bars and the
+  // band, so the menu has to be out of the way rather than merely backed out of
+  menu_close_popups();
+  scope_calib_gain_start();
+}
+
 static const menu_item_t g_calib_value_items[] =
 {
   { .kind = MI_CHOICE, .label = "Range",
@@ -1618,6 +1650,9 @@ static const menu_item_t g_calib_items[] =
   { .kind = MI_ACTION, .label = "Auto-calibrate",
     .desc = "Disconnect the probe first",
     .u.action = { action_autocal, NULL } },
+  { .kind = MI_ACTION, .label = "Calibrate gain",
+    .desc = "Against a known level, range by range",
+    .u.action = { action_calib_gain, NULL } },
   { .kind = MI_ACTION, .label = "Enter values",
     .desc = "Type Z, D, S and O per range",
     .u.action = { action_calib_values, NULL } },

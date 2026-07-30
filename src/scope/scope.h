@@ -74,6 +74,13 @@ void scope_calibration_changed(void);
 // (S) needs a reference amplitude and is not part of it.
 void scope_autocal_start(void);
 
+// Gain (S), which is per vertical range: apply a level of known size, say what
+// it is, and the range is trimmed to agree with it. Stays open afterwards so
+// the next range can be done without walking back through the menu - eight
+// ranges are eight separate attenuator paths, and one trim says nothing about
+// the other seven. Runs on the scope screen, like the auto-calibration.
+void scope_calib_gain_start(void);
+
 // Numeric calibration entry from the menu: change config.calib_* directly,
 // then call scope_calib_apply(). touch_dac only for the two parameters that
 // feed the offset DAC (zero and DAC step) - it restarts acquisition.

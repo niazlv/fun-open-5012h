@@ -491,6 +491,11 @@ enum
 #define CALIB_REF_DEFAULT_MV   1000
 // Reject a reading too small to divide by, or one that has run off the ADC
 #define CALIB_REF_MIN_COUNTS   20
+// Largest correction the gain step will commit, in 0.1%. An instrument that
+// needs more than half a range is not out of calibration, it is being told
+// the wrong thing - and the factory numbers it would be overwriting came off
+// a real unit.
+#define GAIN_TRIM_LIMIT        500
 
 enum
 {
@@ -851,6 +856,12 @@ static int g_autocal_saved_vpos = 0;
 static int g_autocal_saved_srl = 0;
 static int g_autocal_saved_tmode = 0;
 static bool g_autocal_did_gain = false; // whether the gain step actually ran
+// The gain pass on its own: no shorted-input preamble, and it does not stop
+// after one range. Zero, delta and the DAC step are statements about the
+// instrument and are found once; gain is a volts-per-count claim and there is
+// one per range, so the only way to have all eight right is to visit them.
+static bool g_autocal_gain_only = false;
+static int  g_autocal_gain_done = 0;    // ranges trimmed in this pass
 
 // Held-key coalescing: while a pan key auto-repeats, the DMA restart and
 // miniview/sample-rate redraw run only every Nth tick; this timer fires
@@ -8665,6 +8676,164 @@ static void autocal_set_position(int px)
   autocal_mark();
 }
 
+/*
+ * Gain, one range at a time, against a level the user already trusts.
+ *
+ * calib_vs_mult is a volts-per-ADC-count claim, and there are eight of them
+ * because there are eight attenuator settings - a divider network and an
+ * amplifier per range, each with its own tolerance. One trim cannot speak for
+ * the others: 3% out at 500 mV/div says nothing about 50 mV/div, which is why
+ * the gain step at the end of an auto-calibration run had to say "this range
+ * only". This is that step made repeatable, so the eight can be walked in one
+ * sitting with whatever references are to hand.
+ *
+ * The reference is STORED at the BNC, because calib_vs_mult is about the
+ * instrument and knows nothing about what is clipped to the front. It is SHOWN
+ * and typed at the probe tip, because that is what the meter beside it reads
+ * and what the screen already displays. With a 10x probe the two differ by
+ * exactly the factor the reading is multiplied by, so the round trip is exact.
+ */
+static int gain_ref_tip_mv(void)
+{
+  return scope_calib_ref_mv() * config_probe_mult();
+}
+
+//-----------------------------------------------------------------------------
+static void gain_ref_set_tip(int tip_mv)
+{
+  int mult = config_probe_mult();
+  int bnc = (tip_mv + mult / 2) / mult;
+
+  if (bnc < CALIB_REF_MIN_MV)
+    bnc = CALIB_REF_MIN_MV;
+  else if (bnc > CALIB_REF_MAX_MV)
+    bnc = CALIB_REF_MAX_MV;
+
+  config.calib_ref_mv = bnc;
+}
+
+//-----------------------------------------------------------------------------
+// The formatters pad to a fixed width so that a shorter reading covers the
+// longer one it replaces on the status line. In a sentence that padding is
+// just a hole, and there is no room for holes in fifty characters.
+static const char *gain_trim(const char *s)
+{
+  while (' ' == *s)
+    s++;
+
+  return s;
+}
+
+//-----------------------------------------------------------------------------
+// What the band says while the pass waits. A note (the result of a trim, or a
+// refusal) holds the line for a couple of seconds and then it goes back to the
+// live comparison - which after a successful trim is the same statement made
+// by the instrument itself.
+static uint32_t g_gain_note_until = 0;
+
+static void gain_prompt(void)
+{
+  // Generous, and clipped to the band by mpanel_set_lines(): a sentence that
+  // does not fit is a sentence to shorten, not a buffer to police here
+  char l0[80];
+  char want[16], reads[16];
+  ScopeMeasure sm;
+  int ref = gain_ref_tip_mv();
+
+  if (g_gain_note_until && (int32_t)(g_gain_note_until - timer_ms()) > 0)
+    return;
+
+  g_gain_note_until = 0;
+  snprintf(want, sizeof(want), "%s", gain_trim(format_voltage(ref, false)));
+
+  if (capture_get_measurements(&sm) && sm.vavg_mv > 0)
+  {
+    // Percent, because that is the shape of the error: a gain is a multiplier,
+    // and 3.5% out at 5 V/div is 3.5% out everywhere on that range
+    int err = (int)((int64_t)(sm.vavg_mv - ref) * 1000 / ref);
+    char sign = (err < 0) ? '-' : '+';
+
+    if (err < 0)
+      err = -err;
+
+    if (err > 9999)
+      err = 9999;
+
+    snprintf(reads, sizeof(reads), "%s", gain_trim(format_voltage(sm.vavg_mv, false)));
+    snprintf(l0, sizeof(l0), "%s/div reads %s, want %s  %c%d.%d%%",
+        gain_trim(vs_label(config.vertical_scale)), reads, want, sign,
+        err / 10, err % 10);
+  }
+  else
+  {
+    snprintf(l0, sizeof(l0), "%s/div: apply %s DC to the input",
+        gain_trim(vs_label(config.vertical_scale)), want);
+  }
+
+  autocal_say(l0, "MODE trims  L/R level  SHIFT+U/D range  STOP done");
+}
+
+//-----------------------------------------------------------------------------
+static void gain_note(const char *msg)
+{
+  g_gain_note_until = timer_ms() + 2500;
+  autocal_say(msg, "MODE trims  L/R level  SHIFT+U/D range  STOP done");
+}
+
+//-----------------------------------------------------------------------------
+// A measurement the gain step will not use. In the pass this is a note and the
+// prompt comes back, because the fix is usually one keypress away - a coarser
+// range, or the level that was actually applied. In a full auto-calibration
+// run there is nothing left to come back to, so it ends there.
+static void gain_refuse(const char *note, const char *l0, const char *l1)
+{
+  if (g_autocal_gain_only)
+  {
+    gain_note(note);
+    g_autocal_phase = ACAL_ASK_REF;
+    g_autocal_timer = TIMER_DISABLE;
+    autocal_mark();
+    return;
+  }
+
+  autocal_say(l0, l1);
+  g_autocal_phase = ACAL_DONE;
+}
+
+//-----------------------------------------------------------------------------
+// The expected level, on a round grid: snap first, then move, so that a value
+// walked up with the fast step still lands exactly on what the meter says
+// rather than 3 mV beside it.
+static void gain_ref_step(int dir, bool repeat)
+{
+  int step = repeat ? 200 : 10;
+  int tip = (gain_ref_tip_mv() / step) * step;
+
+  g_gain_note_until = 0;
+  gain_ref_set_tip(tip + dir * step);
+  gain_prompt();
+}
+
+//-----------------------------------------------------------------------------
+static void gain_range_step(int delta)
+{
+  int before = config.vertical_scale;
+
+  change_vertical_scale(delta);
+
+  if (config.vertical_scale == before)
+    return;
+
+  // The pass leaves the instrument on the range it was last working on, not
+  // on the one the menu was opened from: the user picked this one, and having
+  // it snap back would hide which range the last trim landed on
+  g_autocal_saved_vs = config.vertical_scale;
+  g_gain_note_until = 0;
+
+  autocal_set_position(0); // the reading is taken against the centre line
+  gain_prompt();
+}
+
 //-----------------------------------------------------------------------------
 // Restore the user's settings and report. It stays "active" so the band and
 // the keyboard remain ours until the result has actually been read - a
@@ -8686,6 +8855,39 @@ static void autocal_finish(bool ok)
   draw_trigger_mode();
   refresh_view();
   mpanel_invalidate();
+
+  g_gain_note_until = 0;
+
+  // The gain pass answers a different question, so it reports a different
+  // number: how many of the eight ranges now have a measured gain rather than
+  // the factory's. The ones it did not visit are not wrong, they are just
+  // still the numbers they came with.
+  if (g_autocal_gain_only)
+  {
+    char msg[MPANEL_TEXT_MAX + 2];
+
+    g_autocal_gain_only = false;
+
+    // ok is false only on the watchdog here - STOP is how this one is meant to
+    // end - and a measurement that never arrived is worth saying out loud
+    if (!ok)
+    {
+      autocal_say("Timed out waiting for a record.",
+          "Whatever was trimmed before it is kept.  MODE closes");
+      return;
+    }
+
+    if (0 == g_autocal_gain_done)
+    {
+      autocal_say("Nothing was changed.", "MODE closes");
+      return;
+    }
+
+    snprintf(msg, sizeof(msg), "Gain set on %d of %d ranges",
+        g_autocal_gain_done, VS_COUNT);
+    autocal_say(msg, "The others keep the gain they had.  MODE closes");
+    return;
+  }
 
   // Name what is still manual. "Calibrated" on its own would be a lie: the
   // gain is untouched, and it is the one the readings actually depend on.
@@ -8865,17 +9067,16 @@ static void autocal_advance(void)
     // whole range by a made-up number and quietly ruin it.
     if (m.vmax >= 254 || m.vmin <= 1)
     {
-      autocal_say("Signal is clipping - pick a coarser V/div",
-          "MODE closes");
-      g_autocal_phase = ACAL_DONE;
+      gain_refuse("Clipping - this range is too fine for that level",
+          "Signal is clipping - pick a coarser V/div", "MODE closes");
       return;
     }
 
     if (counts_x100 < CALIB_REF_MIN_COUNTS * 100)
     {
-      autocal_say("Reading too small or wrong polarity",
+      gain_refuse("Reading too small or wrong polarity - not trimmed",
+          "Reading too small or wrong polarity",
           "Check the level and the range.  MODE closes");
-      g_autocal_phase = ACAL_DONE;
       return;
     }
 
@@ -8884,9 +9085,9 @@ static void autocal_advance(void)
 
     if (reading_mv <= 0)
     {
-      autocal_say("Reading too small or wrong polarity",
+      gain_refuse("Reading too small or wrong polarity - not trimmed",
+          "Reading too small or wrong polarity",
           "Check the level and the range.  MODE closes");
-      g_autocal_phase = ACAL_DONE;
       return;
     }
 
@@ -8899,9 +9100,60 @@ static void autocal_advance(void)
     else if (mult > 4000000)
       mult = 4000000;
 
-    config.calib_vs_mult[config.vertical_scale] = (int)mult;
-    config.vertical_mult = (int)mult;
-    g_autocal_did_gain = true;
+    {
+      // Report the size of the correction rather than the multiplier itself.
+      // 20449 to 19764 means nothing to anyone; -3.4% is the number that says
+      // whether this was a trim or a mistake, and it is the same number that
+      // was on the line before MODE was pressed.
+      int64_t was = config.calib_vs_mult[config.vertical_scale];
+      int err = (int)((was - mult) * 1000 / (was > 0 ? was : 1));
+
+      // A trim is a few percent. Half a range is not a trim, it is the wrong
+      // range or the wrong number typed, and the ADC has nothing to say about
+      // it: 400 mV at 100 mV/div is four divisions up, off the top of the
+      // GRID but nowhere near the end of the converter's window, so the
+      // clipping guard above lets it through. Committed, it would multiply
+      // that range by 2.5 and every reading on it afterwards.
+      if (err > GAIN_TRIM_LIMIT || err < -GAIN_TRIM_LIMIT)
+      {
+        char msg[80];
+        char sign = (err > 0) ? '-' : '+';
+
+        if (err < 0)
+          err = -err;
+
+        snprintf(msg, sizeof(msg), "%c%d%% is not a trim - wrong range or level?",
+            sign, err / 10);
+        gain_refuse(msg, "Correction too large to be a calibration",
+            "Check the level and the range.  MODE closes");
+        return;
+      }
+
+      config.calib_vs_mult[config.vertical_scale] = (int)mult;
+      config.vertical_mult = (int)mult;
+      g_autocal_did_gain = true;
+
+      if (g_autocal_gain_only)
+      {
+        char msg[80];
+        char sign = (err > 0) ? '-' : '+';
+
+        if (err < 0)
+          err = -err;
+
+        g_autocal_gain_done++;
+
+        snprintf(msg, sizeof(msg), "%s/div gain %c%d.%d%% - now reads %s",
+            gain_trim(vs_label(config.vertical_scale)), sign, err / 10,
+            err % 10, gain_trim(format_voltage(gain_ref_tip_mv(), false)));
+        gain_note(msg);
+
+        g_autocal_phase = ACAL_ASK_REF;
+        g_autocal_timer = TIMER_DISABLE;
+        autocal_mark();
+        return;
+      }
+    }
 
     autocal_finish(true);
     return;
@@ -8917,6 +9169,14 @@ static void autocal_step(void)
   if (ACAL_ASK == g_autocal_phase || ACAL_ASK_REF == g_autocal_phase ||
       ACAL_DONE == g_autocal_phase)
   {
+    // ...except the gain pass, where the conversation IS a measurement: what
+    // it says is the live reading against the expected level, so the user can
+    // see the error settle before committing to it. mpanel_set_lines() drops a
+    // line identical to the one already up, so a steady reading is not a
+    // repaint.
+    if (ACAL_ASK_REF == g_autocal_phase && g_autocal_gain_only)
+      gain_prompt();
+
     update_display(); // just keep the trace alive under the message
     return;
   }
@@ -8952,8 +9212,44 @@ void scope_autocal_start(void)
   // input - so the one thing this cannot do without is the user shorting it.
   // No timer while it waits: fetching a wire takes as long as it takes.
   g_autocal_timer = TIMER_DISABLE;
+  g_autocal_gain_only = false;
   autocal_say("Short the BNC to ground (or unplug the probe)",
       "MODE starts   STOP cancels");
+}
+
+//-----------------------------------------------------------------------------
+// The gain pass on its own. Nothing here needs a shorted input - it needs the
+// opposite - so it starts where the auto-calibration run ends, and it stays
+// there: trim, change the range or the source, trim again, until the ranges
+// that matter have been done.
+void scope_calib_gain_start(void)
+{
+  g_autocal_saved_hs    = config.horizontal_scale;
+  g_autocal_saved_vs    = config.vertical_scale;
+  g_autocal_saved_vpos  = config.vertical_position;
+  g_autocal_saved_srl   = config.sample_rate_limit;
+  g_autocal_saved_tmode = config.trigger_mode;
+
+  g_autocal_active    = true;
+  g_autocal_gain_only = true;
+  g_autocal_gain_done = 0;
+  g_autocal_did_gain  = false;
+  g_autocal_phase     = ACAL_ASK_REF;
+  g_autocal_timer     = TIMER_DISABLE; // finding a reference takes as long as it takes
+  g_gain_note_until   = 0;
+
+  // A DC level never crosses a trigger threshold, so a normal-mode instrument
+  // would sit here showing the last frame it caught and calibrate against it.
+  // AUTO sweeps regardless, which is the whole reason the auto-calibration run
+  // uses it too.
+  config.trigger_mode = TRIGGER_MODE_AUTO;
+  capture_set_trigger_mode(config.trigger_mode);
+  draw_trigger_mode();
+
+  // The reading is the mean against the centre line, so the trace has to be
+  // on it: a panned trace would have the position folded into the gain.
+  autocal_set_position(0);
+  gain_prompt();
 }
 
 //-----------------------------------------------------------------------------
@@ -9287,6 +9583,33 @@ void scope_buttons_handler(int buttons)
   // mid-run would silently corrupt the values it is deriving.
   if (g_autocal_active)
   {
+    // The driver reports a release as an event with no keys in it, and the
+    // "MODE closes" message at the end is dismissed by ANY event - so a STOP
+    // that ends the run put the message up on the press and took it away again
+    // on the release, about sixty milliseconds later. Nothing else here reads
+    // a bare event as a keypress, so the guard belongs at the door.
+    if (0 == (buttons & ~(BTN_SHIFT | BTN_REPEAT | BTN_SHIFT_TAP)))
+      return;
+
+    // The gain pass is the exception, and only at its prompt: the expected
+    // level and the range are the two things the user is holding, so those
+    // four keys keep their normal meaning and their auto-repeat. Everything
+    // else in a run is a one-shot answer to a question that was asked.
+    if (ACAL_ASK_REF == g_autocal_phase && g_autocal_gain_only)
+    {
+      if (buttons & (BTN_LEFT | BTN_RIGHT))
+      {
+        gain_ref_step((buttons & BTN_RIGHT) ? 1 : -1, repeat);
+        return;
+      }
+
+      if (shift && (buttons & (BTN_UP | BTN_DOWN)))
+      {
+        gain_range_step((buttons & BTN_UP) ? 1 : -1);
+        return;
+      }
+    }
+
     if (repeat)
       return;
 
@@ -9309,8 +9632,10 @@ void scope_buttons_handler(int buttons)
       {
         g_autocal_phase = ACAL_SCALE;
         g_autocal_timer = AUTOCAL_TIMEOUT;
+        g_gain_note_until = 0;
         autocal_mark();
-        autocal_say("Step 4 of 4: gain", "Hold the level steady");
+        autocal_say(g_autocal_gain_only ? "Measuring this range" :
+            "Step 4 of 4: gain", "Hold the level steady");
       }
     }
 
