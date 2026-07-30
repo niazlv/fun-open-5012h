@@ -72,6 +72,20 @@ static void panel_look_changed(void)
   scope_measure_panel_changed();
 }
 
+// The editor is a screen, not a setting: it opens over the scope on its next
+// tick, which is after this menu has closed itself
+static void action_layout_edit(const void *arg)
+{
+  (void)arg;
+  scope_layout_edit_start();
+  menu_close_popups();
+}
+
+static const char *const g_panel_layout_labels[] = { "Band", "Widgets" };
+
+_Static_assert(ARRAY_SIZE(g_panel_layout_labels) == PANEL_LAYOUT_COUNT,
+    "one label per PANEL_LAYOUT_* value");
+
 static const char *const g_panel_font_labels[] = { "Small", "Large" };
 static const char *const g_panel_bg_labels[] = { "Dim", "Solid", "None" };
 
@@ -1175,6 +1189,13 @@ static const menu_item_t g_panel_items[] =
 {
   { .kind = MI_CHOICE, .label = "Panel",
     .u.choice = { &config.measure_panel_mode, g_measure_panel_labels, 2, NULL } },
+  { .kind = MI_CHOICE, .label = "Layout",
+    .desc = "A band at the bottom, or where you put them",
+    .u.choice = { &config.measure_layout_mode, g_panel_layout_labels,
+        PANEL_LAYOUT_COUNT, panel_look_changed } },
+  { .kind = MI_ACTION, .label = "Arrange layout...",
+    .desc = "Move the readings around on a mock trace",
+    .u.action = { action_layout_edit, NULL } },
   { .kind = MI_CHOICE, .label = "Size",
     .desc = "6x8: six readings. 8x16: four, bigger",
     .u.choice = { &config.measure_panel_font, g_panel_font_labels,

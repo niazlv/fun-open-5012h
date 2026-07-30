@@ -96,6 +96,14 @@ typedef struct
   int      vmax_mv;
   int      vmin_mv;
   int      vp_mv;      // max(|vmax_mv|, |vmin_mv|), always >= 0
+  // The two FLAT levels, from the percentiles of the amplitude histogram
+  // (measure.h), so overshoot and ringing are outside them - their difference
+  // is the amplitude of a square wave as a datasheet means it. Not the same
+  // thing as vamp_mv above, which trims spikes rather than distribution tails
+  // and is what the auto-setup steers by: a burst shorter than 2% of the
+  // record has peaks but no percentiles.
+  int      vtop_mv;
+  int      vbase_mv;
   int      frequency;  // Hz, 0 when not measurable
   int      duty_x10;   // 0.1% units, -1 when n/a
   int      width_pos_ns; // time per period above / below the mid level, ns;

@@ -106,6 +106,13 @@ void scope_display_settings_changed(void);
 // underneath has to be told about.
 void scope_measure_panel_changed(void);
 
+// Open the layout editor: the trace area becomes a mock waveform with the
+// readings on it and the arrows move them around. Switches the panel to the
+// widget layout and seeds it from the band the first time, so it never opens on
+// an empty screen. Takes effect immediately - the menu is closing over it - and
+// MENU inside the editor is what leaves.
+void scope_layout_edit_start(void);
+
 // Live state of the measurements panel, for the System Info page: this is
 // the path that has gone blank after an auto-setup, and the flags below say
 // which stage of it stopped (see scope_get_panel_state)

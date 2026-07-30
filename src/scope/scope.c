@@ -390,6 +390,7 @@ typedef struct
   char label[6];
   char tag[2];
   char value[16];
+  uint8_t metric;   // which MEASURE_* this is, for the layout editor
   uint8_t kind;
   bool present;
 } MeasureItem;
@@ -730,6 +731,34 @@ static int g_mpanel_cells = 0;
 static char g_mpanel_text[2][MPANEL_TEXT_MAX + 2];
 static bool g_mpanel_is_text = false;
 
+/*
+ * ...or readings placed where the user put them, which is the other layout.
+ *
+ * Same idea as a band cell and the same painter, with the position in pixels
+ * instead of character columns and the font per widget rather than per panel.
+ * Built from config.measure_widget[] at the same 2 Hz the band is.
+ */
+typedef struct
+{
+  char text[MPANEL_CHARS_MAX + 1];
+  uint8_t len;
+  uint8_t label_len;
+  uint8_t large;                   // the 8x16 font rather than the 6x8
+  int16_t x, y;                    // top-left, in trace-area pixels
+  uint16_t color;
+} PanelPlaced;
+
+static PanelPlaced g_placed[PANEL_WIDGETS_MAX];
+static int g_placed_n = 0;
+
+// The layout editor. It owns the screen and the keyboard while it is up: the
+// trace is a mock waveform and the readings are mock values, so that arranging
+// them is not a moving target and every one of them has something to show
+// whatever is on the probe.
+static bool g_layout_edit = false;
+static int g_layout_sel = 0;      // which slot the arrows act on
+static bool g_layout_grab = false; // ...and whether they move it or the choice
+
 // Logic decoder view; the run tables live in the spare main-SRAM block
 static bool g_decode_mode = false;
 static bool g_decode_panel_pending = false;
@@ -866,10 +895,24 @@ static int mpanel_row_h(void)
   return mpanel_font()->height + MPANEL_GAP_Y;
 }
 
+// Whether the readings are in the band at the bottom or placed as widgets.
+// Free text always takes the band: it is borrowed to say something, and a
+// sentence has nowhere else to go.
+static bool mpanel_band_mode(void)
+{
+  return g_mpanel_is_text ||
+      PANEL_LAYOUT_WIDGETS != config.measure_layout_mode;
+}
+
 // 24 px in the small font, 40 in the large: two rows of glyphs, the gap between
-// them, and a margin above and below
+// them, and a margin above and below. Zero in the widget layout, where there is
+// no band at all - which is also what gives the decoder's byte strip the whole
+// height back (DBAND_BOTTOM follows this).
 static int mpanel_h(void)
 {
+  if (!mpanel_band_mode())
+    return 0;
+
   return 2 * MPANEL_PAD_Y + MPANEL_ROWS * mpanel_row_h() - MPANEL_GAP_Y;
 }
 
@@ -1321,6 +1364,78 @@ static void mpanel_glyph_column(uint16_t *column, int row0, const Font *font,
 // reading cells, or two lines of free text. Both are stored as characters and
 // turned into pixels here, inside the column buffer, so the panel is composed
 // by the same sweep that draws the trace and can never flicker against it.
+//-----------------------------------------------------------------------------
+// The placed readings, for one trace column: each widget's own background over
+// its own box, then its text. Same painter as the band, and for the same
+// reason - a reading composited by the sweep cannot flicker against the trace.
+//
+// The selection frame belongs to the editor and is drawn here too, because here
+// is where this column's pixels are.
+__attribute__((noinline))
+static void widgets_paint_column(int c, uint16_t *column)
+{
+  for (int i = 0; i < g_placed_n; i++)
+  {
+    const PanelPlaced *w = &g_placed[i];
+    const Font *font = w->large ? FONT_LARGE : FONT_SMALL;
+    int at = c - w->x;
+    int wide = w->len * font->width;
+    bool sel = g_layout_edit && i == g_layout_sel;
+    int ch_i, bit;
+    uint16_t color;
+
+    // One pixel of air around the text, which is also what the frame and the
+    // solid background cover
+    if (at < -1 || at > wide)
+      continue;
+
+    for (int y = w->y - 1; y <= w->y + font->height; y++)
+    {
+      if (y < 0 || y >= GRID_HEIGHT - 1)
+        continue;
+
+      if (PANEL_BG_SOLID == config.measure_panel_bg || sel)
+        column[y] = BG_COLOR;
+      else if (PANEL_BG_OFF != config.measure_panel_bg)
+        column[y] = MPANEL_DIM(column[y]);
+    }
+
+    // The frame: the box's edge, so a grabbed widget reads as held
+    if (sel)
+    {
+      uint16_t edge = g_layout_grab ? MEASURE_VOLTAGE_COLOR : MPANEL_EDGE_COLOR;
+      int top = w->y - 1;
+      int bot = w->y + font->height;
+
+      if (-1 == at || at == wide)
+      {
+        for (int y = top; y <= bot; y++)
+        {
+          if (y >= 0 && y < GRID_HEIGHT - 1)
+            column[y] = edge;
+        }
+      }
+      else
+      {
+        if (top >= 0)
+          column[top] = edge;
+
+        if (bot < GRID_HEIGHT - 1)
+          column[bot] = edge;
+      }
+    }
+
+    if (at < 0 || at >= wide)
+      continue;
+
+    ch_i = at / font->width;
+    bit = at % font->width;
+    color = (ch_i < w->label_len) ? MPANEL_DIM(w->color) : w->color;
+
+    mpanel_glyph_column(column, w->y, font, w->text[ch_i], bit, color);
+  }
+}
+
 __attribute__((noinline))
 static void mpanel_paint_column(int c, uint16_t *column)
 {
@@ -1579,20 +1694,27 @@ static void build_trace_column(int c, uint16_t *column)
   // under them with the numbers still there.
   if (g_mpanel_active)
   {
-    int h = mpanel_h();
-    int row0 = mpanel_row0();
-
-    for (int y = 0; y < h; y++)
+    if (mpanel_band_mode())
     {
-      uint16_t *px = &column[row0 + y];
+      int h = mpanel_h();
+      int row0 = mpanel_row0();
 
-      if (PANEL_BG_SOLID == config.measure_panel_bg)
-        *px = (0 == y) ? MPANEL_EDGE_COLOR : BG_COLOR;
-      else if (PANEL_BG_OFF != config.measure_panel_bg)
-        *px = MPANEL_DIM(*px);
+      for (int y = 0; y < h; y++)
+      {
+        uint16_t *px = &column[row0 + y];
+
+        if (PANEL_BG_SOLID == config.measure_panel_bg)
+          *px = (0 == y) ? MPANEL_EDGE_COLOR : BG_COLOR;
+        else if (PANEL_BG_OFF != config.measure_panel_bg)
+          *px = MPANEL_DIM(*px);
+      }
+
+      mpanel_paint_column(c, column);
     }
-
-    mpanel_paint_column(c, column);
+    else
+    {
+      widgets_paint_column(c, column);
+    }
   }
 }
 
@@ -2030,9 +2152,13 @@ static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
       break;
 
     case MEASURE_VAMP:
-      // The swing between the flat levels, which is the amplitude of a square
-      // wave: overshoot and ringing live in Vpp and are left out of this
-      tag = "a"; label = "amp"; value = format_voltage(sm->vamp_mv, false);
+      // The swing between the flat LEVELS, which is the amplitude of a square
+      // wave as a datasheet means it: the overshoot and the ringing that Vpp
+      // reports are outside the percentiles this comes from. vamp_mv is not
+      // this number - it trims spikes, not distribution tails, and it belongs
+      // to the auto-setup, which needs a short burst to still have a swing.
+      tag = "a"; label = "amp";
+      value = format_voltage(sm->vtop_mv - sm->vbase_mv, false);
       break;
 
     case MEASURE_PERIOD:
@@ -2113,6 +2239,7 @@ static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
   snprintf(it->label, sizeof(it->label), "%s", label);
   snprintf(it->tag, sizeof(it->tag), "%s", tag);
   snprintf(it->value, sizeof(it->value), "%s", value);
+  it->metric = (uint8_t)metric;
   it->kind = (uint8_t)kind;
   it->present = present;
 
@@ -2200,6 +2327,7 @@ static void mpanel_cell_set(MPanelCell *cell, const char *label,
 static void overlay_repaint_region(int row0, int rows)
 {
   uint16_t column[GRID_HEIGHT];
+  int saved = g_trace_column;
 
   for (int c = 0; c < GRID_WIDTH - 1; c++)
   {
@@ -2212,9 +2340,20 @@ static void overlay_repaint_region(int row0, int rows)
         row0 < SNAP_TAG_H)
       continue;
 
+    // The trace half of a column is indexed by g_trace_column, not by the
+    // argument - the sweep sets one and passes the other, and they are the same
+    // number there. Here they are not, so every column would be composed over
+    // the trace pixels of whichever column the sweep last drew. It went
+    // unnoticed while this only ever repainted the panel band: those rows are
+    // below the waveform most of the time, and where they were not, the smear
+    // was under a dimmed overlay. The widget layout put readings anywhere in
+    // the trace area and made it a flat line across the screen.
+    g_trace_column = c;
     build_trace_column(c, column);
     lcd_draw_buf(GRID_LEFT+1 + c, GRID_TOP+1 + row0, 1, rows, &column[row0]);
   }
+
+  g_trace_column = saved;
 }
 
 //-----------------------------------------------------------------------------
@@ -3267,6 +3406,11 @@ static void mpanel_invalidate(void)
 // to composite into (the spectrum and the calibration screen draw their own)
 static bool mpanel_wanted(void)
 {
+  // The editor IS the readings on screen; without them there would be nothing
+  // to arrange
+  if (g_layout_edit)
+    return true;
+
   // The calibration screen draws its own trace but goes through the same
   // sweep, so the band is available there too - and that is where a hint is
   // worth more than a measurement
@@ -3317,6 +3461,121 @@ static void mpanel_set_lines(const char *l0, const char *l1)
 // Rebuild the panel's cells from the selected metrics; on change, invalidate
 // the columns they cover.
 //
+// What colour a reading is drawn in, wherever it is drawn: by what it measures,
+// or grey when there is nothing to report
+static uint16_t measure_item_color(const MeasureItem *it)
+{
+  static const uint16_t kind_color[] =
+  {
+    [MK_VOLT]  = MEASURE_VOLTAGE_COLOR,
+    [MK_TIME]  = MEASURE_FREQ_COLOR,
+    [MK_OTHER] = MEASURE_MODE_COLOR,
+  };
+
+  if (!it->present)
+    return MPANEL_NONE_COLOR;
+
+  return kind_color[it->kind < ARRAY_SIZE(kind_color) ? it->kind : MK_OTHER];
+}
+
+//-----------------------------------------------------------------------------
+// Plausible readings for the editor. Arranging a layout against numbers that
+// jump - or against a probe with nothing on it, where half the metrics read
+// "--" and the grey makes them hard to see - is arranging blind. A 10 kHz,
+// 2 Vpp, 50% square is what the mock trace behind them draws.
+static void layout_mock_measure(ScopeMeasure *sm)
+{
+  memset(sm, 0, sizeof(*sm));
+
+  sm->vpp_mv  = 2000;
+  sm->vamp_mv = 1980;
+  sm->vtop_mv = 1000;
+  sm->vbase_mv = -1000;
+  sm->vrms_mv = 1000;
+  sm->vavg_mv = 0;
+  sm->vmax_mv = 1000;
+  sm->vmin_mv = -1000;
+  sm->vp_mv   = 1000;
+  sm->vmid_mv = 0;
+  sm->frequency     = 10000;
+  sm->duty_x10      = 500;
+  sm->period_med_ns = 100000;
+  sm->period_min_ns = 99800;
+  sm->period_max_ns = 100200;
+  sm->width_pos_ns  = 50000;
+  sm->width_neg_ns  = 50000;
+  sm->jitter_rms_ps = 1200;
+  sm->jitter_pp_ps  = 8000;
+  sm->periods       = 80;
+  sm->period_good_pct = 100;
+  sm->level_pct     = 90;
+}
+
+//-----------------------------------------------------------------------------
+// Build the placed readings from config.measure_widget[]. Slot for slot, not
+// compacted: the editor selects by slot, and a hole in the middle of the array
+// is a slot the user emptied rather than a reason to renumber the rest.
+static void widgets_update(const ScopeMeasure *sm)
+{
+  PanelPlaced next[PANEL_WIDGETS_MAX];
+  static int heartbeat = 0;
+
+  memset(next, 0, sizeof(next));
+
+  for (int i = 0; i < PANEL_WIDGETS_MAX; i++)
+  {
+    const PanelWidget *w = &config.measure_widget[i];
+    PanelPlaced *p = &next[i];
+    MeasureItem item;
+    int len;
+
+    if (MEASURE_NONE == w->metric || w->metric >= MEASURE_COUNT)
+      continue;
+
+    if (!measure_format(w->metric, sm, &item))
+      continue;
+
+    len = snprintf(p->text, sizeof(p->text), "%s %s", item.label, item.value);
+
+    if (len < 0)
+      len = 0;
+    else if (len > (int)sizeof(p->text) - 1)
+      len = (int)sizeof(p->text) - 1;
+
+    p->len       = (uint8_t)len;
+    p->label_len = (uint8_t)strlen(item.label);
+    p->large     = (w->flags & PW_LARGE) ? 1 : 0;
+    p->x         = (int16_t)(w->x * PANEL_WIDGET_STEP);
+    p->y         = (int16_t)(w->y * PANEL_WIDGET_STEP);
+    p->color     = measure_item_color(&item);
+  }
+
+  if (g_placed_n == PANEL_WIDGETS_MAX &&
+      0 == memcmp(next, g_placed, sizeof(next)))
+  {
+    // Same readings in the same places - but heal the area anyway every few
+    // seconds, for the reason the band does (see mpanel_update)
+    if (++heartbeat < MPANEL_HEARTBEAT)
+      return;
+
+    heartbeat = 0;
+    g_mpanel_paints++;
+    overlay_repaint_region(0, GRID_HEIGHT - 1);
+    return;
+  }
+
+  heartbeat = 0;
+  g_mpanel_builds++;
+  memcpy(g_placed, next, sizeof(next));
+  g_placed_n = PANEL_WIDGETS_MAX;
+
+  // The whole trace area, because a widget can be anywhere in it. At 2 Hz that
+  // is a fraction of what the sweep itself costs.
+  g_mpanel_paints++;
+  overlay_repaint_region(0, GRID_HEIGHT - 1);
+}
+
+//-----------------------------------------------------------------------------
 // noinline deliberately: it is called once per scope tick from one place, and
 // welded into scope_task() -O3 unrolls the metric scan and the cell building
 // into three kilobytes of straight-line code. A call costs nothing at 2 Hz.
@@ -3339,8 +3598,11 @@ static void mpanel_update(void)
   throttle = 0;
 
   // Unthrottled: this runs at 2 Hz anyway, and the 10 Hz recompute throttle
-  // behind capture_get_measurements() can only ever hand back an older frame
-  if (!capture_get_measurements_fresh(&sm))
+  // behind capture_get_measurements() can only ever hand back an older frame.
+  // The editor arranges against mock values instead - see layout_mock_measure.
+  if (g_layout_edit)
+    layout_mock_measure(&sm);
+  else if (!capture_get_measurements_fresh(&sm))
     return;
 
   // Only now: nothing was rebuilt, so a request made before the first
@@ -3348,6 +3610,13 @@ static void mpanel_update(void)
   // Consuming it here used to cost the panel up to half a second of the
   // throttle before it first appeared.
   g_mpanel_force = false;
+
+  // The other layout: readings where the user put them, not a band
+  if (!mpanel_band_mode())
+  {
+    widgets_update(&sm);
+    return;
+  }
 
   n = measure_build_items(&sm, items);
 
@@ -3359,24 +3628,15 @@ static void mpanel_update(void)
   // many were left out instead of the band simply ending. Running out of room
   // silently reads exactly like "there is nothing more to show".
   {
-    static const uint16_t kind_color[] =
-    {
-      [MK_VOLT]  = MEASURE_VOLTAGE_COLOR,
-      [MK_TIME]  = MEASURE_FREQ_COLOR,
-      [MK_OTHER] = MEASURE_MODE_COLOR,
-    };
-
     int chars = mpanel_chars();
     int x = 0, row = 0;
 
     for (int i = 0; i < n && cells < MPANEL_CELLS_MAX; i++)
     {
       MPanelCell *cell = &next[cells];
-      uint16_t color = items[i].present ?
-          kind_color[items[i].kind < ARRAY_SIZE(kind_color) ? items[i].kind : MK_OTHER] :
-          MPANEL_NONE_COLOR;
 
-      mpanel_cell_set(cell, items[i].label, items[i].value, color);
+      mpanel_cell_set(cell, items[i].label, items[i].value,
+          measure_item_color(&items[i]));
 
       // Wrap to the second row when this pair would run off the first, and
       // stop when there is no third row to wrap into
@@ -3450,6 +3710,367 @@ static void mpanel_update(void)
 
   g_mpanel_paints++;
   overlay_repaint_region(mpanel_row0(), mpanel_h());
+}
+
+/*- The layout editor -------------------------------------------------------*/
+// Both live further down, and the editor is here because it belongs beside the
+// panel it edits
+static void draw_status_line(void);
+static void refresh_view(void);
+
+/*
+ * A screen for arranging the readings, because a menu cannot do it: where a
+ * number should sit is a question about the picture, and a list of coordinates
+ * is not a picture. So the trace area stays the trace area, the readings stay
+ * on it, and the arrows move them.
+ *
+ * Two things are mocked while it is up. The trace is a synthetic square wave,
+ * and the readings are the fixed set in layout_mock_measure(): a layout arranged
+ * against numbers that jump - or against a probe with nothing on it, where half
+ * the readings are grey dashes - is a layout arranged blind. What is NOT mocked
+ * is the drawing: the widgets go through the same column compositor they will be
+ * drawn by afterwards, so the editor cannot flatter the result.
+ */
+
+//-----------------------------------------------------------------------------
+// A 10 kHz-looking square at 50% into the display buffer, which is what the
+// mock readings describe. Pixel space, so it needs no acquisition and no
+// timebase: this is a backdrop to arrange against, not a measurement.
+#define LAYOUT_MOCK_PERIOD   60
+#define LAYOUT_MOCK_AMP      45
+
+static void layout_mock_trace(void)
+{
+  for (int c = 0; c < GRID_WIDTH; c++)
+  {
+    int phase = c % LAYOUT_MOCK_PERIOD;
+    bool high = phase < LAYOUT_MOCK_PERIOD / 2;
+    bool edge = (0 == phase) || (LAYOUT_MOCK_PERIOD / 2 == phase);
+    int top = GRID_CENTER_Y - LAYOUT_MOCK_AMP;
+    int bottom = GRID_CENTER_Y + LAYOUT_MOCK_AMP;
+
+    // An edge column spans both levels, which is how a real record draws a
+    // transition too
+    g_display_buffer.min[c] = (uint8_t)(edge ? top : (high ? top : bottom));
+    g_display_buffer.max[c] = (uint8_t)(edge ? bottom : (high ? top : bottom));
+    g_display_buffer.flags[c] = SAMPLE_FLAG_VALID;
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Lay the band's own readings out as widgets, in the places the band had them.
+// That is the layout the user is already looking at, so the editor opens on
+// something familiar rather than on an empty screen - and AUTO brings it back
+// when an arrangement has gone wrong.
+static void layout_seed_from_band(void)
+{
+  ScopeMeasure sm;
+  MeasureItem items[MEASURE_ITEMS_MAX];
+  const Font *font = mpanel_font();
+  bool large = (PANEL_FONT_LARGE == config.measure_panel_font);
+  int chars = (GRID_WIDTH - 2 * MPANEL_PAD_X) / font->width;
+  int row_h = font->height + MPANEL_GAP_Y;
+  int band_y = GRID_HEIGHT - 1 - (2 * MPANEL_PAD_Y + MPANEL_ROWS * row_h -
+      MPANEL_GAP_Y) + MPANEL_PAD_Y;
+  int n, placed = 0, x = 0, row = 0;
+
+  layout_mock_measure(&sm);
+  n = measure_build_items(&sm, items);
+
+  memset(config.measure_widget, 0, sizeof(config.measure_widget));
+
+  for (int i = 0; i < n && placed < PANEL_WIDGETS_MAX; i++)
+  {
+    PanelWidget *w = &config.measure_widget[placed];
+    int len = (int)strlen(items[i].label) + 1 + (int)strlen(items[i].value);
+
+    if (x + len > chars)
+    {
+      if (++row >= MPANEL_ROWS)
+        break;
+
+      x = 0;
+    }
+
+    w->metric = (uint8_t)items[i].metric;
+    w->x = (uint8_t)((MPANEL_PAD_X + x * font->width) / PANEL_WIDGET_STEP);
+    w->y = (uint8_t)((band_y + row * row_h) / PANEL_WIDGET_STEP);
+    w->flags = large ? PW_LARGE : 0;
+
+    x += len + MPANEL_GUTTER;
+    placed++;
+  }
+}
+
+//-----------------------------------------------------------------------------
+// The selected slot, and the moves the arrows make on it
+static PanelWidget *layout_selected(void)
+{
+  if (g_layout_sel < 0 || g_layout_sel >= PANEL_WIDGETS_MAX)
+    g_layout_sel = 0;
+
+  return &config.measure_widget[g_layout_sel];
+}
+
+static int layout_used(void)
+{
+  int n = 0;
+
+  for (int i = 0; i < PANEL_WIDGETS_MAX; i++)
+  {
+    if (MEASURE_NONE != config.measure_widget[i].metric)
+      n++;
+  }
+
+  return n;
+}
+
+// A reading the layout is not already showing, so that adding one twice takes
+// two deliberate presses of the metric key rather than being the default
+static int layout_unused_metric(void)
+{
+  for (int m = MEASURE_NONE + 1; m < MEASURE_COUNT; m++)
+  {
+    bool taken = false;
+
+    for (int i = 0; i < PANEL_WIDGETS_MAX; i++)
+    {
+      if (config.measure_widget[i].metric == m)
+        taken = true;
+    }
+
+    if (!taken)
+      return m;
+  }
+
+  return MEASURE_VPP;
+}
+
+//-----------------------------------------------------------------------------
+// The next slot that holds something, wrapping, so the selection walks the
+// readings rather than the array's holes
+static void layout_select_step(int dir)
+{
+  for (int i = 0; i < PANEL_WIDGETS_MAX; i++)
+  {
+    g_layout_sel = (g_layout_sel + dir + PANEL_WIDGETS_MAX) % PANEL_WIDGETS_MAX;
+
+    if (MEASURE_NONE != config.measure_widget[g_layout_sel].metric)
+      return;
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Which reading a widget shows, stepped through the metrics. MEASURE_NONE is
+// skipped: a widget showing nothing would be an invisible thing to be holding.
+static void layout_metric_step(PanelWidget *w, int dir)
+{
+  int m = w->metric + dir;
+
+  if (m <= MEASURE_NONE)
+    m = MEASURE_COUNT - 1;
+  else if (m >= MEASURE_COUNT)
+    m = MEASURE_NONE + 1;
+
+  w->metric = (uint8_t)m;
+}
+
+//-----------------------------------------------------------------------------
+// Move the selected widget, clamped so it cannot be pushed off the screen and
+// lost. The text's own width decides the right-hand limit, which is why this
+// asks g_placed rather than the config: that is where the composed width is.
+static void layout_move(int dx, int dy)
+{
+  PanelWidget *w = layout_selected();
+  const PanelPlaced *p = &g_placed[g_layout_sel];
+  const Font *font = (w->flags & PW_LARGE) ? FONT_LARGE : FONT_SMALL;
+  int wide = (p->len ? p->len : 8) * font->width;
+  int max_x = (GRID_WIDTH - 2 - wide) / PANEL_WIDGET_STEP;
+  int max_y = (GRID_HEIGHT - 2 - font->height) / PANEL_WIDGET_STEP;
+  int x = w->x + dx;
+  int y = w->y + dy;
+
+  if (max_x < 0)
+    max_x = 0;
+
+  if (max_y < 0)
+    max_y = 0;
+
+  w->x = (uint8_t)((x < 0) ? 0 : ((x > max_x) ? max_x : x));
+  w->y = (uint8_t)((y < 0) ? 0 : ((y > max_y) ? max_y : y));
+}
+
+//-----------------------------------------------------------------------------
+// One line of key hints where the status line normally is. The editor owns that
+// line: what the arrows do here changes with whether a widget is held, and a
+// screen full of readings with no way to know that is a puzzle.
+static void layout_edit_footer(void)
+{
+  char buf[64];
+
+  // Two rows of the 6x8 font in the sixteen pixels the status line has, which
+  // is the only way all of the keys fit: 51 characters to a row here.
+  //
+  // Exactly the rectangle draw_status_line() clears, and no wider: a footer
+  // that reached x=0 left its first letters standing in the margin the status
+  // line does not own when the editor closed.
+  lcd_fill_rect(GRID_LEFT, GRID_BOTTOM + 1, GRID_WIDTH + 1,
+      STATUS_LINE_HEIGHT, BG_COLOR);
+  lcd_set_font(FONT_SMALL);
+  lcd_set_color(BG_COLOR, MEASURE_MODE_COLOR);
+
+  if (g_layout_grab)
+  {
+    snprintf(buf, sizeof(buf), "HOLDING %s", g_placed[g_layout_sel].text);
+    lcd_puts(GRID_LEFT + 2, STATUS_LINE_Y, buf);
+    lcd_puts(GRID_LEFT + 2, STATUS_LINE_Y + 8,
+        "arrows move it   MODE put it down");
+  }
+  else
+  {
+    lcd_puts(GRID_LEFT + 2, STATUS_LINE_Y,
+        "L/R pick   U/D metric   MODE take   F1 size");
+    lcd_puts(GRID_LEFT + 2, STATUS_LINE_Y + 8,
+        "EDGE add   50% delete   AUTO tidy   SAVE done");
+  }
+
+  lcd_set_font(FONT_LARGE);
+}
+
+//-----------------------------------------------------------------------------
+// Redraw everything the editor owns: the mock trace under the widgets, the
+// widgets themselves (built from the mock readings), and the hint line.
+static void layout_edit_refresh(void)
+{
+  ScopeMeasure sm;
+
+  layout_mock_measure(&sm);
+  layout_mock_trace();
+  g_placed_n = 0;            // force the rebuild past its own compare
+  widgets_update(&sm);
+  layout_edit_footer();
+}
+
+//-----------------------------------------------------------------------------
+void scope_layout_edit_start(void)
+{
+  // An empty layout would be an empty screen to arrange nothing on, so the
+  // band's own arrangement is the starting point
+  if (0 == layout_used())
+    layout_seed_from_band();
+
+  config.measure_layout_mode = PANEL_LAYOUT_WIDGETS;
+  g_layout_edit = true;
+  g_layout_grab = false;
+  g_layout_sel = 0;
+
+  if (MEASURE_NONE == config.measure_widget[0].metric)
+    layout_select_step(1);
+
+  g_mpanel_is_text = false;
+  g_mpanel_active = true;
+  mpanel_invalidate();
+  layout_edit_refresh();
+}
+
+//-----------------------------------------------------------------------------
+static void layout_edit_finish(void)
+{
+  g_layout_edit = false;
+  g_layout_grab = false;
+
+  // Back to the real record and the real readings. The layout itself stays as
+  // it was arranged - it is in config, so the store writes it out on its own.
+  mpanel_invalidate();
+  refresh_view();
+  draw_status_line();
+}
+
+//-----------------------------------------------------------------------------
+// The editor owns the keyboard while it is up, the way auto-calibration does:
+// every key here means something else than it does over a live trace.
+static void layout_edit_keys(int buttons)
+{
+  PanelWidget *w = layout_selected();
+
+  // SAVE and not MENU: the launcher takes MENU for the system menu before an
+  // application sees it (a plain press opens the menu over whatever is on
+  // screen), so the editor never gets to hear about it. Closing that menu
+  // repaints straight back into the editor, which is at least consistent.
+  if (buttons & BTN_SAVE)
+  {
+    layout_edit_finish();
+    return;
+  }
+
+  if (buttons & BTN_MODE)
+  {
+    g_layout_grab = !g_layout_grab;
+  }
+  else if (buttons & BTN_F1)
+  {
+    w->flags ^= PW_LARGE;
+  }
+  else if (buttons & BTN_EDGE)
+  {
+    // A new reading in the first free slot, at the top left corner - which is
+    // empty in every layout that came from the band - and already held, so the
+    // arrows carry it away from there without another keypress. Anywhere near
+    // the widget it was added from would land on top of something.
+    for (int i = 0; i < PANEL_WIDGETS_MAX; i++)
+    {
+      if (MEASURE_NONE != config.measure_widget[i].metric)
+        continue;
+
+      config.measure_widget[i].metric = (uint8_t)layout_unused_metric();
+      config.measure_widget[i].x = 1;
+      config.measure_widget[i].y = 1;
+      config.measure_widget[i].flags = w->flags;
+      g_layout_sel = i;
+      g_layout_grab = true;
+      break;
+    }
+  }
+  else if (buttons & BTN_50P)
+  {
+    // ...and never the last one: an empty layout is a screen with no readings
+    // and no way back to them except the menu
+    if (layout_used() > 1)
+    {
+      w->metric = MEASURE_NONE;
+      layout_select_step(1);
+    }
+  }
+  else if (buttons & BTN_AUTO)
+  {
+    layout_seed_from_band();
+    g_layout_sel = 0;
+    g_layout_grab = false;
+  }
+  else if (g_layout_grab)
+  {
+    if (buttons & BTN_LEFT)
+      layout_move(-1, 0);
+    else if (buttons & BTN_RIGHT)
+      layout_move(1, 0);
+    else if (buttons & BTN_UP)
+      layout_move(0, -1);
+    else if (buttons & BTN_DOWN)
+      layout_move(0, 1);
+  }
+  else
+  {
+    if (buttons & BTN_LEFT)
+      layout_select_step(-1);
+    else if (buttons & BTN_RIGHT)
+      layout_select_step(1);
+    else if (buttons & BTN_UP)
+      layout_metric_step(w, 1);
+    else if (buttons & BTN_DOWN)
+      layout_metric_step(w, -1);
+  }
+
+  layout_edit_refresh();
 }
 
 //-----------------------------------------------------------------------------
@@ -7960,6 +8581,14 @@ static void draw_calibration_info(void)
 //-----------------------------------------------------------------------------
 static void draw_status_line(void)
 {
+  // The layout editor owns the line too, and for the same reason: what the keys
+  // do there is not what they do here
+  if (g_layout_edit)
+  {
+    layout_edit_footer();
+    return;
+  }
+
   // The trend view and the cursors each own the whole line while they are
   // up; both repaint it themselves, toast expiry included
   if (g_trend_mode)
@@ -7989,6 +8618,16 @@ void scope_buttons_handler(int buttons)
 {
   bool shift  = (buttons & BTN_SHIFT);
   bool repeat = (buttons & BTN_REPEAT);
+
+  // ...and so does the layout editor, for a simpler reason: every key on this
+  // screen means something else than it does over a live trace
+  if (g_layout_edit)
+  {
+    if (!repeat || (buttons & (BTN_LEFT | BTN_RIGHT | BTN_UP | BTN_DOWN)))
+      layout_edit_keys(buttons);
+
+    return;
+  }
 
   // While auto-calibration is up it owns the keyboard: it is rewriting the
   // vertical settings underneath, so letting anything else change them
@@ -8439,6 +9078,12 @@ void scope_redraw_all(void)
   update_sample_rate();
   redraw_trace();
 
+  // The editor's backdrop is its own, and this has just cleared the screen and
+  // re-armed the sweep - which is exactly the path taken when the menu that
+  // opened the editor closes over it
+  if (g_layout_edit)
+    layout_edit_refresh();
+
   if (g_decode_mode)
     g_decode_panel_pending = true;
 
@@ -8476,7 +9121,19 @@ void scope_task(void)
     {
       g_fps_counter++;
 
-      if (g_autocal_active)
+      // The editor's trace is its own: a mock waveform where update_display()
+      // would put whatever is on the probe. Re-laid every frame rather than
+      // once, because a sweep that began before the editor opened paints its
+      // first columns from the buffer as it was then - which showed as half a
+      // screen of real trace beside half a screen of mock. The frame still has
+      // to be consumed, or acquisition stalls behind it.
+      if (g_layout_edit)
+      {
+        capture_consume_frame();
+        layout_mock_trace();
+        g_sweep_force = true;
+      }
+      else if (g_autocal_active)
         autocal_step();
       else if (scope_calibration_mode)
         draw_calibration_info();
@@ -8799,7 +9456,9 @@ void scope_task(void)
       if (g_mpanel_active)
         mpanel_update();
 
-      if (measure_owns_status_line() && !g_toast_active)
+      // ...but not over the editor's hint line, which is the only thing on
+      // screen saying what the keys do there
+      if (measure_owns_status_line() && !g_toast_active && !g_layout_edit)
         draw_measure();
     }
   }

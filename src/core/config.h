@@ -109,6 +109,42 @@ enum
   PANEL_BG_COUNT,
 };
 
+// Where the readings go. The band along the bottom is what this instrument has
+// always had and stays the default; WIDGETS lets each reading sit where the
+// user put it, which is what the layout editor edits (see PanelWidget).
+enum
+{
+  PANEL_LAYOUT_BAND = 0,
+  PANEL_LAYOUT_WIDGETS,
+  PANEL_LAYOUT_COUNT,
+};
+
+/*
+ * One placed reading: which metric, where its top-left corner is, and how big.
+ *
+ * Four bytes, and packed on purpose - the layout is ten of these and every byte
+ * of Config is resident twice in a TCM that counts them. Coordinates are in
+ * PANEL_WIDGET_STEP-pixel units of the trace area, which is also the grid the
+ * editor snaps to: 300x200 pixels then fits a byte each with room to spare, and
+ * a layout is legible in a hex dump.
+ *
+ * metric == MEASURE_NONE is an empty slot. Slots are not kept in any order -
+ * the editor places them, and where a reading sits is the whole point.
+ */
+#define PANEL_WIDGET_STEP    4
+#define PANEL_WIDGETS_MAX    10
+
+// flags
+#define PW_LARGE             0x01   // the 8x16 font instead of the 6x8
+
+typedef struct
+{
+  uint8_t metric;
+  uint8_t x;
+  uint8_t y;
+  uint8_t flags;
+} PanelWidget;
+
 // What to draw between samples once the screen has more pixels than the
 // record has samples. Straight lines are the default because they invent
 // nothing beyond the corner at each sample; the reconstruction is exact for
@@ -407,29 +443,48 @@ typedef struct
   int      measure_panel_bg;
 
   /*
+   * ---- Everything above this line is the VERSION 2 layout, byte for byte ----
+   *
+   * Same rule as the version 1 line further up, for the same reason: config.c
+   * carries an old store forward by copying this prefix whole, so nothing above
+   * here may move, ever. New fields go below, out of padding[].
+   */
+
+  // PANEL_LAYOUT_*: the band or the placed widgets. Zero is the band, so a
+  // config saved before the editor existed comes back to the panel it had.
+  int      measure_layout_mode;
+
+  // The placed readings, edited by the layout editor. All-zero is an empty
+  // layout, which is what a migrated config reads as - and what makes the
+  // editor offer to lay the current band out for you rather than starting from
+  // a blank screen (see scope_layout_edit_start).
+  PanelWidget measure_widget[PANEL_WIDGETS_MAX];
+
+  /*
    * The reserve. A new field is carved out of HERE, shrinking the array by
    * exactly what it takes so that sizeof(Config) and every offset below stay
    * put - an entry whose size does not match is not read, and the padding is
    * what keeps that from being every entry on the flash after every change.
    *
-   * One word. Version 2 started with four; grid_mode took one and the panel's
-   * font and background two. The limit is not the flash: the 512-byte entry slot
-   * would
-   * take another 68 bytes happily. What cannot take them is the TCM, where this
-   * struct is resident THREE times over - config itself, the snapshot config.c
-   * compares against to decide whether a save is due, and its one-entry read
-   * cache - against a linker assert that keeps 16 KB of the 64 clear for stack
-   * and heap. That assert had about 100 bytes of slack left before version 2,
-   * and 24 bytes of struct is 72 bytes of TCM.
+   * Four words. Two things bound it, and neither is generous:
    *
-   * So this is what fits rather than what would be comfortable, and the way to
-   * make it comfortable is to free TCM (the read cache is the obvious 500
-   * bytes: nothing needs it to outlive the call that reads it), not to trim the
-   * flash side. Running out is also no longer the dead end it was in version 1:
-   * config.c can carry a layout forward now, so a version 3 costs a prefix
-   * constant, a static assert and one more branch in adopt_v1_entry().
+   * The flash. crc has to be the last word of the struct and the struct has to
+   * fit the 512-byte entry slot the store tiles its sector with, which leaves
+   * sixteen bytes past this reserve. Outgrowing that means a 1 KB slot and half
+   * the rotation, which doubles the erase rate - a version 4 decision.
+   *
+   * The TCM, which is the one that used to bite first. Every byte here is
+   * resident twice - config itself and the snapshot config.c compares against
+   * to decide whether a save is due - against a linker assert keeping 16 KB of
+   * the 64 clear for stack and heap. Version 2 left that assert 16 bytes of
+   * slack; retiring the store's read cache (nothing needed an entry to outlive
+   * the call that read it) bought 456 back, and version 3 spent 112 of them.
+   *
+   * Running out is no longer the dead end it was in version 1: config.c carries
+   * a layout forward now, so another version costs a row in g_old_layouts, a
+   * static assert, and nothing else.
    */
-  uint32_t padding[1];
+  uint32_t padding[4];
 
   // The calibration block. Contiguous, and last before crc, on purpose:
   // calib_crc covers exactly the bytes from calib_channel_delta up to crc. A
@@ -494,11 +549,10 @@ typedef enum
   CONFIG_ENTRY_BAD_VERSION,  // written by another firmware
   CONFIG_ENTRY_BAD_SIZE,     // ...one whose Config was a different size
   CONFIG_ENTRY_BAD_CRC,      // written, and did not survive
-  CONFIG_ENTRY_V1,           // the layout before this one, and intact. What
-                             // the store looks like on the first boot after
-                             // the update, and not a fault: config.c reads it
-                             // (calibration included) and writes it back as
-                             // one of ours.
+  CONFIG_ENTRY_OLD,          // an earlier layout, and intact. What the store
+                             // looks like on the first boot after an update,
+                             // and not a fault: config.c reads it (calibration
+                             // included) and writes it back as one of ours.
 } ConfigEntryState;
 
 int config_store_entries(void);

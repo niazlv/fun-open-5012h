@@ -1574,6 +1574,13 @@ static bool get_measurements_ex(ScopeMeasure *out, bool fresh)
     out->vmax_mv = hi;
     out->vmin_mv = lo;
 
+    // The flat levels, on the same ground-referenced terms. From the
+    // percentiles rather than the trimmed peaks: what this pair is for is an
+    // amplitude with the overshoot left out, and a 4% overshoot lasts far
+    // longer than the eight samples a spike trim discards.
+    out->vtop_mv  = (int)((int64_t)(m.top - ZERO_POINT) * mult / CALIB_MULTIPLIER) - vpos;
+    out->vbase_mv = (int)((int64_t)(m.base - ZERO_POINT) * mult / CALIB_MULTIPLIER) - vpos;
+
     if (hi < 0)
       hi = -hi;
 
