@@ -138,6 +138,32 @@ void lcd_puts(int x, int y, const char *str)
 /*- Everything else the application reaches for -----------------------------*/
 Config config;
 
+/*
+ * The games' own dice, replacing the host's.
+ *
+ * Every game seeds with srand(timer_us()), and timer_us() below starts from a
+ * constant precisely so that a run is repeatable. That is only half of it: the
+ * same seed does not give the same sequence on two libcs, and glibc's rand()
+ * and macOS's disagree from the first call. The pipe layout in Flappy Bird
+ * came out different on Linux, the autopilot that clears five pipes on a Mac
+ * scored zero there, and the test called that a regression - on a build where
+ * nothing in the firmware had changed.
+ *
+ * So the tests bring dice of their own: the LCG from the C standard's own
+ * example, defined here to win over libc for anything linked into a test. A
+ * failure is then a property of the code, and reproducing one means running
+ * the same test, not running it on the same laptop.
+ */
+static unsigned long g_rand_state = 1;
+
+void srand(unsigned int seed) { g_rand_state = seed; }
+
+int rand(void)
+{
+    g_rand_state = g_rand_state * 1103515245 + 12345;
+    return (int)((g_rand_state >> 16) & 0x7fff);
+}
+
 static uint32_t g_now_us = 1234567;
 static int *g_timers[8];
 static int g_timer_count;

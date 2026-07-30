@@ -221,8 +221,16 @@ static bool t_should_flap(void)
     return g_bird_y > target;
 }
 
+// The best score of the flight, not the score at the final frame: the bird
+// dies eventually, the loop above restarts it, and reading g_score at a fixed
+// frame number reads whichever run happens to be in progress there. That made
+// the check a question about where the window falls - one pipe layout scored
+// twelve, the next scored zero with the same autopilot, and neither said
+// anything about the game.
 static int t_fly(int frames)
 {
+    int best = 0;
+
     for (int f = 0; f < frames; f++)
     {
         if (ST_PLAY == g_state && t_should_flap())
@@ -231,9 +239,12 @@ static int t_fly(int frames)
             flappy_bird_buttons_handler(BTN_MODE);
 
         advance(FRAME_MS);
+
+        if (g_score > best)
+            best = g_score;
     }
 
-    return g_score;
+    return best;
 }
 
 /*- Main --------------------------------------------------------------------*/

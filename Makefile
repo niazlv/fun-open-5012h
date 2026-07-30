@@ -36,6 +36,8 @@ clean:
 
 help:
 	@echo "make            firmware (make DOOM=1 to link the DOOM asset pack)"
+	@echo "  DOOM_APP=0    leave DOOM out of the image entirely - what CI ships,"
+	@echo "                because its assets cannot be published"
 	@echo "make test       host tests for the DSP and the decoders"
 	@echo "make emu        host emulator"
 	@echo "make shots      emulator screenshots"
