@@ -473,6 +473,15 @@ typedef struct
   // a blank screen (see scope_layout_edit_start).
   PanelWidget measure_widget[PANEL_WIDGETS_MAX];
 
+  // Which probe is on the input, as an index into probe_ratio_labels. Index 0 is
+  // 1x - no scaling - because that is what a config saved before this field
+  // existed reads as, and it is the only value that is safe to read there.
+  // Whether the probe is APPLIED is `x10` above, which the 1X/10X key toggles:
+  // the key keeps its legend, and this says what the legend is worth. Pressing
+  // it while the probe still says 1x picks 10x, which is the legend's own
+  // promise on an instrument nobody has configured yet.
+  int      probe_ratio;
+
   // What the device opens by itself at power-on: STARTUP_APP_*. Zero is the
   // oscilloscope, and that is deliberately both the default and what a config
   // saved before this field existed - or migrated from an older layout - reads
@@ -492,8 +501,9 @@ typedef struct
    * put - an entry whose size does not match is not read, and the padding is
    * what keeps that from being every entry on the flash after every change.
    *
-   * Three words - version 3 started with four, and startup_app_mode above
-   * has taken one. Two things bound the rest, and neither is generous:
+   * Two words - version 3 started with four, and probe_ratio and
+   * startup_app_mode above have each taken one. Two things bound the rest, and
+   * neither is generous:
    *
    * The flash. crc has to be the last word of the struct and the struct has to
    * fit the 512-byte entry slot the store tiles its sector with, which leaves
@@ -511,7 +521,7 @@ typedef struct
    * a layout forward now, so another version costs a row in g_old_layouts, a
    * static assert, and nothing else.
    */
-  uint32_t padding[3];
+  uint32_t padding[2];
 
   // The calibration block. Contiguous, and last before crc, on purpose:
   // calib_crc covers exactly the bytes from calib_channel_delta up to crc. A
@@ -527,6 +537,36 @@ typedef struct
 
 /*- Variables ---------------------------------------------------------------*/
 extern Config config;
+
+// The probes the menu offers, and what each divides by. Labels and values
+// together so a menu row cannot drift away from the number it names; 10x first
+// because index 0 is what a config saved before this field existed reads as.
+#define PROBE_RATIO_COUNT  11
+#define PROBE_RATIO_10X    3    // the index of "10x" in the list below
+extern const char *const probe_ratio_labels[PROBE_RATIO_COUNT];
+
+// What config.probe_ratio names, whatever is stored there
+int config_probe_ratio(void);
+
+/*- Implementations ---------------------------------------------------------*/
+/*
+ * A 10x probe divides the signal by ten before the instrument ever sees it, so
+ * everything the instrument REPORTS is multiplied by ten: the scale label, the
+ * measurements, the cursors, the trigger level.
+ *
+ * What does not change is the trace. A probe changes what the axis says, not
+ * where the beam is - which is why this has to multiply the millivolts-per-count
+ * and the millivolts-per-pixel by the same factor, and why applying it to one of
+ * the two would shrink the waveform tenfold instead.
+ *
+ * Off in calibration mode, and not by a check here: scope_init() clears it,
+ * because calibrating the instrument's own chain through an attenuator is not a
+ * calibration of anything.
+ */
+static inline int config_probe_mult(void)
+{
+  return config.x10 ? config_probe_ratio() : 1;
+}
 
 /*- Prototypes --------------------------------------------------------------*/
 void config_init(void);

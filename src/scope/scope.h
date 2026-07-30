@@ -113,6 +113,16 @@ void scope_measure_panel_changed(void);
 // MENU inside the editor is what leaves.
 void scope_layout_edit_start(void);
 
+// F1 / F2: the one setting each, as a popup over the trace - which of the two
+// large status-line readouts shows what. Defined in scope_menu.c, because the
+// row it opens is the row the menu itself uses.
+void scope_menu_open_slot(int slot);
+
+// The probe attenuation changed - the 1X/10X key or the menu. Every millivolt on
+// screen comes from one of two multipliers and both have to move together, so
+// nothing may write config.x10 or config.probe_ratio without calling this.
+void scope_probe_changed(void);
+
 // Live state of the measurements panel, for the System Info page: this is
 // the path that has gone blank after an auto-setup, and the flags below say
 // which stage of it stopped (see scope_get_panel_state)

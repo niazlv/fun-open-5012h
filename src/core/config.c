@@ -377,6 +377,31 @@ _Static_assert(CALIB_LENGTH == V1_CRC_LENGTH - V1_CALIB_OFFSET &&
 
 /*- Variables ---------------------------------------------------------------*/
 Config config;
+
+/*
+ * The probes on offer, and what each one divides by. Labels and values in one
+ * place so a menu row cannot drift away from the number it names.
+ *
+ * Wider than the 1x/10x switch on a passive probe, because the input does not
+ * care what is in front of it: attenuator pads come as 2x, 5x, 20x and 50x,
+ * current and differential probes as 25x, 200x and 500x, and high-voltage ones
+ * as 100x and 1000x.
+ *
+ * 1x is index 0 on purpose. It is what a config saved before this field existed
+ * reads as, and it is the only value that is safe to read there: no scaling, so
+ * nothing on screen is off by a factor nobody chose.
+ */
+const char *const probe_ratio_labels[PROBE_RATIO_COUNT] =
+{
+  "1x", "2x", "5x", "10x", "20x", "25x", "50x", "100x", "200x", "500x", "1000x",
+};
+
+// PROBE_RATIO_10X indexes this. An array element is not a constant expression
+// in C, so that cannot be a static assert - keep the two together instead.
+static const int g_probe_ratio_values[PROBE_RATIO_COUNT] =
+{
+  1, 2, 5, 10, 20, 25, 50, 100, 200, 500, 1000,
+};
 static int g_config_timer = 0;
 static int g_entry_offset;
 static Config g_config_copy;
@@ -1566,6 +1591,18 @@ void config_get_calib_state(char *buf, int size)
 }
 
 //-----------------------------------------------------------------------------
+// Whatever is stored, a probe ratio comes back: an index out of range reads as
+// the default rather than as an out-of-bounds multiplier on every voltage the
+// instrument reports.
+int config_probe_ratio(void)
+{
+  if ((unsigned)config.probe_ratio >= PROBE_RATIO_COUNT)
+    return g_probe_ratio_values[0];
+
+  return g_probe_ratio_values[config.probe_ratio];
+}
+
+//-----------------------------------------------------------------------------
 ConfigCalibSource config_calib_source(void)
 {
   return g_calib_source;
@@ -1777,6 +1814,7 @@ static const struct
   FIELD(measure_panel_font, FT_INT),
   FIELD(measure_panel_bg, FT_INT),
   FIELD(measure_layout_mode, FT_INT),
+  FIELD(probe_ratio, FT_INT),
   FIELD_N(measure_widget, FT_WARR, PANEL_WIDGETS_MAX),
   FIELD(show_vpp, FT_BOOL),
   FIELD(show_freq, FT_BOOL),
@@ -2059,6 +2097,7 @@ void config_reset(void)
   // The band, and an empty layout behind it: the editor fills that in from
   // whatever the band is showing the first time it is opened
   config.measure_layout_mode    = PANEL_LAYOUT_BAND;
+  config.probe_ratio            = 0;   // 10x, the one nearly everybody has
   memset(config.measure_widget, 0, sizeof(config.measure_widget));
 
   // Straight into the instrument when the device is switched on. The reset

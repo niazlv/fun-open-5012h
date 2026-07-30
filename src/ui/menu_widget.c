@@ -85,6 +85,10 @@ typedef struct
   int scroll;
   int vis;      // rows that fit on screen; count > vis means the menu scrolls
   bool editing; // value edit focus: arrows adjust the value, not the cursor
+  // A one-row shortcut (menu_open_item_popup): MENU closes it outright rather
+  // than stepping out of the value first. There is nothing else on it to step
+  // out to, and a shortcut that takes two presses to dismiss is not one.
+  bool shortcut;
   int x, y, w, h;
 } menu_inst_t;
 
@@ -437,7 +441,7 @@ static void choice_adjust(const menu_item_t *it, int dir)
 
 //-----------------------------------------------------------------------------
 static void popup_open_common(const menu_item_t *items, int count, int x, int y,
-    int w, bool is_submenu)
+    int w, bool is_submenu, bool editing)
 {
   menu_inst_t *m = alloc_inst();
 
@@ -466,6 +470,13 @@ static void popup_open_common(const menu_item_t *items, int count, int x, int y,
 
   m->sel = first_selectable(m);
 
+  // Straight into editing when the caller asks: a one-row popup over a choice
+  // is a shortcut, and making the user press MODE to start turning the value
+  // would give the shortcut a step of its own
+  m->editing = editing && (MI_CHOICE == m->items[m->sel].kind ||
+      MI_NUMBER == m->items[m->sel].kind);
+  m->shortcut = editing;
+
   ui_push(&menu_screen_popup, m);
 }
 
@@ -486,7 +497,7 @@ static void open_submenu(const menu_inst_t *parent, const menu_item_t *it)
   }
 
   popup_open_common(it->u.submenu.items, it->u.submenu.count, x, y,
-      POPUP_SUBMENU_WIDTH, true);
+      POPUP_SUBMENU_WIDTH, true, false);
 }
 
 //-----------------------------------------------------------------------------
@@ -534,7 +545,16 @@ void menu_open_dialog(const menu_def_t *def)
 //-----------------------------------------------------------------------------
 void menu_open_popup(const menu_def_t *def, int x, int y)
 {
-  popup_open_common(def->items, def->count, x, y, POPUP_WIDTH, false);
+  popup_open_common(def->items, def->count, x, y, POPUP_WIDTH, false, false);
+}
+
+//-----------------------------------------------------------------------------
+// One row of an existing menu, on its own, as a shortcut to that one setting.
+// The row is the same object the menu holds, so the shortcut and the menu can
+// never disagree about what the setting is called or what it may be.
+void menu_open_item_popup(const menu_item_t *item, int x, int y, bool editing)
+{
+  popup_open_common(item, 1, x, y, POPUP_WIDTH, false, editing);
 }
 
 //-----------------------------------------------------------------------------
@@ -913,6 +933,12 @@ static bool menu_input(void *ctx, int buttons)
     {
       if (!repeat)
       {
+        if (m->shortcut)
+        {
+          ui_pop();       // done: the value is already applied
+          return true;
+        }
+
         m->editing = false;
         ui_request_redraw();
       }

@@ -1270,12 +1270,44 @@ static const menu_item_t g_line_items[] =
         MEASURE_COUNT, NULL } },
 };
 
+//-----------------------------------------------------------------------------
+// F1 and F2, straight to what the two big readouts show. Changing those was
+// four levels of menu for something that gets changed while probing - and the
+// popup is the menu's own row, so the two can never name different things.
+//
+// Placed above the status line rather than over it, so the slot itself is
+// visible while the arrows turn it: the value changes under the popup as it is
+// chosen, which is the confirmation.
+void scope_menu_open_slot(int slot)
+{
+  if (slot < 0 || slot >= MEASURE_LINE_SLOTS)
+    return;
+
+  menu_open_item_popup(&g_line_items[slot], slot ? 150 : 40, 186, true);
+}
+
 // Measurements display: values live in config; the scope picks them up on
 // its next tick, no callbacks needed
+static void probe_changed(void)
+{
+  scope_probe_changed();
+}
+
 static const menu_item_t g_measure_items[] =
 {
   { .kind = MI_TOGGLE, .label = "Show (MODE)",
     .u.toggle = { &config.measure_display, NULL } },
+  { .kind = MI_SEPARATOR },
+  // What is in front of the input, and whether it is being counted. The key
+  // labelled 1X/10X toggles the second one; this is where the first is said,
+  // because a 25x current probe is not something a key can guess.
+  { .kind = MI_CHOICE, .label = "Probe",
+    .desc = "What the probe on the input divides by",
+    .u.choice = { &config.probe_ratio, probe_ratio_labels,
+        PROBE_RATIO_COUNT, probe_changed } },
+  { .kind = MI_TOGGLE, .label = "Probe applied",
+    .desc = "Same as tapping the 1X/10X key",
+    .u.toggle = { &config.x10, probe_changed } },
   { .kind = MI_SEPARATOR },
   { .kind = MI_SUBMENU, .label = "Panel over the trace",
     .u.submenu = { g_panel_items, ARRAY_SIZE(g_panel_items) } },

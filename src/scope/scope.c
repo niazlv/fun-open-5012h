@@ -83,6 +83,12 @@
 // nothing to take.
 #define TRIGGER_EDGE_X         243
 #define TRIGGER_EDGE_Y         2
+
+// The vertical scale field: x=10 up to the AC/DC glyph at 54. Six characters of
+// the large font, or two rows of the small one when a probe is being counted in
+// - see draw_vertical_scale().
+#define VSCALE_FIELD_W         44
+#define PROBE_TAG_COLOR        LCD_COLOR(255, 170, 0)
 #define SAMPLE_RATE_X          252
 
 #define CALIB_AREA_LEFT        140
@@ -438,6 +444,42 @@ static const int vs_px_value[VS_COUNT] =
 {
   2, 4, 8, 20, 40, 80, 200, 400,
 };
+
+
+//-----------------------------------------------------------------------------
+// Millivolts per pixel at a scale, with the probe in it. Everything that maps
+// between the screen and volts goes through here rather than reading the table,
+// so a 10x probe cannot end up applied to half of the arithmetic - see
+// config_probe_mult() for why that would shrink the trace instead of relabelling
+// the axis.
+static int vs_mv_px(int scale)
+{
+  if (scale < 0 || scale >= VS_COUNT)
+    scale = 0;
+
+  return vs_px_value[scale] * config_probe_mult();
+}
+
+//-----------------------------------------------------------------------------
+// The scale label, computed rather than looked up, because a probe may multiply
+// it by anything in the list: 500 mV/div through a 1000x probe is 500 V/div, and
+// no table of eight strings covers that. Reproduces vs_str[] exactly at 1x -
+// same three digits, same half space, same two-character unit, same width - so
+// nothing on this line moves when a probe is switched in.
+static const char *vs_label(int scale)
+{
+  static char buf[10];
+  int mv_div = vs_mv_px(scale) * GRID_DIV_PX;
+
+  if (mv_div < 1000)
+    snprintf(buf, sizeof(buf), "%3d\x01mV", mv_div);
+  else if (mv_div < 1000000)
+    snprintf(buf, sizeof(buf), "%3d\x01V ", mv_div / 1000);
+  else
+    snprintf(buf, sizeof(buf), "%3d\x01kV", mv_div / 1000000);
+
+  return buf;
+}
 
 /*- Variables ---------------------------------------------------------------*/
 // Five distinct grid column patterns; g_grid_index picks one per column
@@ -1897,8 +1939,35 @@ static void draw_vertical_scale(void)
   if (g_toast_active)
     return;
 
+  lcd_fill_rect(10, STATUS_LINE_Y, VSCALE_FIELD_W, STATUS_LINE_HEIGHT, BG_COLOR);
+
+  /*
+   * With a probe counted in, this field says both things instead of one: the
+   * ratio above, what a division is now worth below, in the small font and in
+   * orange. Two rows of 6x8 fit the sixteen pixels the status line has and the
+   * forty-four this field owns, which is the only unclaimed space on the line -
+   * the top bar has none at all (the trigger mode ends at 41, the capture state
+   * runs 46..77, the record map starts at 81) and the two slots to the right are
+   * the measurements, or the trigger readouts when those are off.
+   *
+   * It matters that the ratio is on screen and not just in the menu: the label
+   * alone cannot distinguish 5 V/div from 500 mV/div through a 10x probe, and
+   * with 25x and 100x probes in the list the difference is not guessable.
+   */
+  if (config.x10)
+  {
+    lcd_set_font(FONT_SMALL);
+    lcd_set_color(BG_COLOR, PROBE_TAG_COLOR);
+    lcd_puts(10, STATUS_LINE_Y, probe_ratio_labels[
+        ((unsigned)config.probe_ratio < PROBE_RATIO_COUNT) ?
+            config.probe_ratio : 0]);
+    lcd_puts(10, STATUS_LINE_Y + 8, vs_label(config.vertical_scale));
+    lcd_set_font(FONT_LARGE);
+    return;
+  }
+
   lcd_set_color(BG_COLOR, VSCALE_COLOR);
-  lcd_puts(10, STATUS_LINE_Y, vs_str[config.vertical_scale]);
+  lcd_puts(10, STATUS_LINE_Y, vs_label(config.vertical_scale));
 }
 
 //-----------------------------------------------------------------------------
@@ -4564,6 +4633,31 @@ void scope_display_settings_changed(void)
 }
 
 //-----------------------------------------------------------------------------
+// The probe attenuation changed - from the 1X/10X key or from the menu. Every
+// millivolt on this screen is derived from one of the two multipliers below, so
+// both have to be recomputed together; the trace itself does not move, because
+// the mV-per-count and the mV-per-pixel moved by the same factor.
+void scope_probe_changed(void)
+{
+  if (scope_calibration_mode)
+    return;   // it is forced off there, see scope_init
+
+  config.vertical_mult = config.calib_vs_mult[config.vertical_scale] *
+      config_probe_mult();
+  config.vertical_position_mv = config.vertical_position *
+      vs_mv_px(config.vertical_scale);
+  config.trigger_level_mv = config.trigger_level * vs_mv_px(config.vertical_scale);
+
+  // The hardware trigger is a converter code, and the level it is derived from
+  // has just changed units
+  capture_set_trigger_level(config.trigger_level_mv);
+
+  mpanel_invalidate();
+  draw_status_line();
+  refresh_view();
+}
+
+//-----------------------------------------------------------------------------
 void scope_measure_panel_changed(void)
 {
   // The cells were composed to the old font's cell width, so they go; the band
@@ -4748,7 +4842,7 @@ static int cursor_t_col(int64_t t_ns)
 //-----------------------------------------------------------------------------
 static int cursor_v_row(int mv)
 {
-  int px = (mv - config.vertical_position_mv) / vs_px_value[config.vertical_scale] +
+  int px = (mv - config.vertical_position_mv) / vs_mv_px(config.vertical_scale) +
       config.vertical_position;
 
   return clip_for_display(px);
@@ -4856,7 +4950,7 @@ static bool cursor_buttons(int buttons, bool shift, bool repeat)
   }
   else
   {
-    int step = vs_px_value[config.vertical_scale] * mul;
+    int step = vs_mv_px(config.vertical_scale) * mul;
     int *v = &g_cursor_v[g_cursor_sel - 3];
 
     if (buttons & BTN_UP)
@@ -5113,7 +5207,7 @@ static int roll_row(int raw)
       CALIB_MULTIPLIER;
 
   return clip_for_display((mv - config.vertical_position_mv) /
-      vs_px_value[config.vertical_scale] + config.vertical_position);
+      vs_mv_px(config.vertical_scale) + config.vertical_position);
 }
 
 //-----------------------------------------------------------------------------
@@ -5258,7 +5352,7 @@ static void roll_retime(int old_us, int new_us)
 // says.
 static void roll_rescale(int old_scale, int old_vpos)
 {
-  int scale = vs_px_value[config.vertical_scale];
+  int scale = vs_mv_px(config.vertical_scale);
 
   for (int c = 0; c < GRID_WIDTH; c++)
   {
@@ -5525,7 +5619,7 @@ static void dbit_span_update(void)
 //-----------------------------------------------------------------------------
 static void update_display(void)
 {
-  int scale = vs_px_value[config.vertical_scale];
+  int scale = vs_mv_px(config.vertical_scale);
 
   // The display buffer is the trend plot while that view is up: a frame
   // landing (or a pan-settle refresh) must not overwrite it with the trace
@@ -5977,13 +6071,13 @@ static void change_vertical_scale(int delta)
   if (scale == config.vertical_scale)
     return;
 
-  int old_scale = vs_px_value[config.vertical_scale];
+  int old_scale = vs_mv_px(config.vertical_scale);
 
   config.vertical_scale = scale;
-  config.vertical_mult = config.calib_vs_mult[config.vertical_scale];
-  config.vertical_position_mv = config.vertical_position * vs_px_value[config.vertical_scale];
+  config.vertical_mult = config.calib_vs_mult[config.vertical_scale] * config_probe_mult();
+  config.vertical_position_mv = config.vertical_position * vs_mv_px(config.vertical_scale);
 
-  config.trigger_level_mv = config.trigger_level * vs_px_value[config.vertical_scale];
+  config.trigger_level_mv = config.trigger_level * vs_mv_px(config.vertical_scale);
 
   scope_display_settings_changed(); // px-to-mV mapping changed under them
   roll_rescale(old_scale, config.vertical_position); // ...including the plot's
@@ -6004,10 +6098,10 @@ static void change_vertical_position_ex(int delta, bool repeat)
   int old_vpos = config.vertical_position;
 
   config.vertical_position += delta;
-  config.vertical_position_mv = config.vertical_position * vs_px_value[config.vertical_scale];
+  config.vertical_position_mv = config.vertical_position * vs_mv_px(config.vertical_scale);
 
   scope_display_settings_changed(); // every column moved on screen
-  roll_rescale(vs_px_value[config.vertical_scale], old_vpos); // the plot too
+  roll_rescale(vs_mv_px(config.vertical_scale), old_vpos); // the plot too
 
   // Same held-key coalescing as horizontal pan: the DAC/DMA restart runs
   // every 4th repeat tick, the settle timer finalizes after release
@@ -6203,7 +6297,7 @@ void scope_apply_trigger_level(void)
   else if (config.trigger_level > MAX_TRIGGER_LEVEL)
     config.trigger_level = MAX_TRIGGER_LEVEL;
 
-  config.trigger_level_mv = config.trigger_level * vs_px_value[config.vertical_scale];
+  config.trigger_level_mv = config.trigger_level * vs_mv_px(config.vertical_scale);
 
   capture_set_trigger_level(config.trigger_level_mv);
 }
@@ -7385,7 +7479,7 @@ void scope_trigger_50_percent(void)
   if (!capture_get_measurements_fresh(&sm))
     return;
 
-  config.trigger_level = sm.vmid_mv / vs_px_value[config.vertical_scale];
+  config.trigger_level = sm.vmid_mv / vs_mv_px(config.vertical_scale);
 
   scope_apply_trigger_level();
 }
@@ -7549,7 +7643,7 @@ static int autoset_center_step(int mid_err)
 {
   int64_t mv = (int64_t)mid_err * config.calib_vs_mult[config.vertical_scale] /
       CALIB_MULTIPLIER;
-  int step = (int)(mv / vs_px_value[config.vertical_scale]);
+  int step = (int)(mv / vs_mv_px(config.vertical_scale));
 
   if (step == 0)
     step = (mid_err > 0) ? 1 : -1;
@@ -7568,7 +7662,7 @@ static int autoset_target_scale(int vamp_mv)
 
   for (s = 0; s < VS_LAST; s++)
   {
-    if (vamp_mv / vs_px_value[s] <= AUTOSET_TARGET_PX)
+    if (vamp_mv / vs_mv_px(s) <= AUTOSET_TARGET_PX)
       break;
   }
 
@@ -7622,7 +7716,7 @@ static bool autoset_vertical(const ScopeMeasure *sm)
     {
       config.vertical_position = want;
       config.vertical_position_mv =
-          config.vertical_position * vs_px_value[config.vertical_scale];
+          config.vertical_position * vs_mv_px(config.vertical_scale);
 
       g_autoset_cent_prev = mid_err;
       g_autoset_vert_tries++;
@@ -7740,11 +7834,11 @@ static void autoset_abort(void)
   {
     config.vertical_position = g_autoset_saved_vpos;
     config.vertical_scale = g_autoset_saved_vs;
-    config.vertical_mult = config.calib_vs_mult[config.vertical_scale];
+    config.vertical_mult = config.calib_vs_mult[config.vertical_scale] * config_probe_mult();
     config.vertical_position_mv =
-        config.vertical_position * vs_px_value[config.vertical_scale];
+        config.vertical_position * vs_mv_px(config.vertical_scale);
     config.trigger_level_mv =
-        config.trigger_level * vs_px_value[config.vertical_scale];
+        config.trigger_level * vs_mv_px(config.vertical_scale);
 
     capture_set_vertical_parameters();
     capture_set_trigger_level(config.trigger_level_mv);
@@ -8006,7 +8100,7 @@ static bool autocal_ready(void)
 static void autocal_set_position(int px)
 {
   config.vertical_position = px;
-  config.vertical_position_mv = px * vs_px_value[config.vertical_scale];
+  config.vertical_position_mv = px * vs_mv_px(config.vertical_scale);
 
   capture_set_vertical_parameters();
   autocal_mark();
@@ -8143,7 +8237,7 @@ static void autocal_advance(void)
 
     // One position pixel must move the trace one screen pixel, and a screen
     // pixel is vs_px_value mV, which at this range is this many ADC counts
-    target_x100 = vs_px_value[g_autocal_range] * CALIB_MULTIPLIER * 100 /
+    target_x100 = vs_mv_px(g_autocal_range) * CALIB_MULTIPLIER * 100 /
         config.calib_vs_mult[g_autocal_range];
     observed_x100 = (m.mean_c100 - g_autocal_ref) / AUTOCAL_DAC_PX;
 
@@ -8416,7 +8510,7 @@ static void change_calibration_value(int delta, bool shift, bool repeat)
 // is a pure display multiplier and needs no hardware at all.
 void scope_calib_apply(bool touch_dac)
 {
-  config.vertical_mult = config.calib_vs_mult[config.vertical_scale];
+  config.vertical_mult = config.calib_vs_mult[config.vertical_scale] * config_probe_mult();
 
   // The trigger level is stored in mV and converted through the gain, so it
   // has to follow it. This one does not restart the DMA.
@@ -8691,7 +8785,7 @@ void scope_buttons_handler(int buttons)
     config.vertical_position_mv = 0;
 
     capture_set_vertical_parameters();
-    roll_rescale(vs_px_value[config.vertical_scale], old_vpos);
+    roll_rescale(vs_mv_px(config.vertical_scale), old_vpos);
     draw_vertical_position(true);
     refresh_view();
   }
@@ -8893,6 +8987,49 @@ void scope_buttons_handler(int buttons)
     }
   }
 
+  // The legend on the shift key. A tap of it - no chord, no hold - is the one
+  // press that was free to mean 1X/10X, see BTN_SHIFT_TAP.
+  else if (buttons & BTN_SHIFT_TAP)
+  {
+    if (scope_calibration_mode)
+      return;   // calibrating through an attenuator is not a calibration
+
+    // Switching a 1x probe on would do nothing at all, and this key's legend
+    // promises 10x: an instrument nobody has told about its probe gets the one
+    // nearly everybody has, and the menu is where an odd ratio is said.
+    if (!config.x10 && 1 == config_probe_ratio())
+      config.probe_ratio = PROBE_RATIO_10X;
+
+    config.x10 = !config.x10;
+    scope_probe_changed();
+
+    // Said out loud, because every reading on screen just changed by that
+    // factor and the tag in the top bar is easy to miss on a key that used to
+    // do nothing
+    {
+      char msg[40];
+
+      snprintf(msg, sizeof(msg), config.x10 ?
+          "Probe %s - readings scaled" : "Probe off - readings direct",
+          probe_ratio_labels[((unsigned)config.probe_ratio < PROBE_RATIO_COUNT) ?
+              config.probe_ratio : 0]);
+      toast_show();
+      lcd_puts(GRID_LEFT, STATUS_LINE_Y, msg);
+    }
+  }
+
+  // Straight to what the two large readouts show, one key each. Which two
+  // measurements are worth the big font changes while probing, and reaching it
+  // through Menu > Measurements > Status line > Left was four levels of menu
+  // for a question asked that often.
+  else if (buttons & (BTN_F1 | BTN_F2))
+  {
+    if (repeat || scope_calibration_mode)
+      return;
+
+    scope_menu_open_slot((buttons & BTN_F1) ? 0 : 1);
+  }
+
   else if (buttons & BTN_AUTO)
   {
     if (repeat || g_fft_mode)
@@ -8949,7 +9086,7 @@ void scope_buttons_handler(int buttons)
     {
       // Never used yet: park the pairs two divisions around the view centre
       int64_t div_ns = hs_div_value[config.horizontal_scale];
-      int div_mv = vs_px_value[config.vertical_scale] * GRID_DIV_PX;
+      int div_mv = vs_mv_px(config.vertical_scale) * GRID_DIV_PX;
 
       g_cursor_t[0] = config.horizontal_position - 2 * div_ns;
       g_cursor_t[1] = config.horizontal_position + 2 * div_ns;
@@ -8977,7 +9114,7 @@ void scope_init(bool calibration_mode)
   scope_calibration_mode = calibration_mode;
 
   config.horizontal_period = hs_px_value[config.horizontal_scale];
-  config.vertical_mult = config.calib_vs_mult[config.vertical_scale];
+  config.vertical_mult = config.calib_vs_mult[config.vertical_scale] * config_probe_mult();
 
   grid_init();
   persist_build_ramp();

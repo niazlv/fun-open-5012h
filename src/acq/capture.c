@@ -585,7 +585,11 @@ static inline void dma_start(void)
 
   g_capture_buffer_info.period  = g_sample_period;
   g_capture_buffer_info.vpos    = config.vertical_position_mv;
-  g_capture_buffer_info.vs_mult = config.calib_vs_mult[config.vertical_scale];
+  // With the probe's attenuation in it, so the millivolts this record reports
+  // are the millivolts at the probe TIP. The trace does not move: scope.c maps
+  // these to pixels with the same factor applied (config_probe_mult).
+  g_capture_buffer_info.vs_mult = config.calib_vs_mult[config.vertical_scale] *
+      config_probe_mult();
   g_capture_buffer_info.valid   = false;
 
   DMA1->INTC0 = DMA1_INTC0_FTFIFC2_Msk;
@@ -1133,7 +1137,10 @@ void capture_record_fill(int *done_ms, int *total_ms)
 //-----------------------------------------------------------------------------
 void capture_set_trigger_level(int level)
 {
-  g_trigger_level = (level * CALIB_MULTIPLIER) / config.calib_vs_mult[config.vertical_scale] + ZERO_POINT;
+  // The level arrives in reported millivolts, so the probe factor has to come
+  // back OUT of it to reach a converter code
+  g_trigger_level = (level * CALIB_MULTIPLIER) /
+      (config.calib_vs_mult[config.vertical_scale] * config_probe_mult()) + ZERO_POINT;
 
   if (g_trigger_level < 20)
     g_trigger_level = 20;
@@ -1537,7 +1544,7 @@ static bool get_measurements_ex(ScopeMeasure *out, bool fresh)
   if (!measure_active_buffer_ex(&m, fresh))
     return false;
 
-  mult = config.calib_vs_mult[config.vertical_scale];
+  mult = (int64_t)config.calib_vs_mult[config.vertical_scale] * config_probe_mult();
 
   out->vmin_raw  = m.vmin;
   out->vmax_raw  = m.vmax;

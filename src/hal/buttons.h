@@ -55,6 +55,18 @@ enum
   BTN_SHIFT        = (1 << 17),
 
   BTN_REPEAT       = (1 << 18),
+
+  /*
+   * Not a key: the input layer raises it when 1X/10X was pressed and released
+   * on its own, without another key and without being held.
+   *
+   * That key IS the shift key on this hardware - same pin, same bit - so its
+   * printed function had nowhere to live. A modifier is used by being HELD,
+   * which leaves the tap free to mean what the legend says. See
+   * input_translate(): the tap has to be over before it can be told from the
+   * start of a chord, so this arrives on release rather than on press.
+   */
+  BTN_SHIFT_TAP    = (1 << 19),
 };
 
 /*- Prototypes --------------------------------------------------------------*/

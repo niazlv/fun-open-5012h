@@ -263,6 +263,70 @@ static uint32_t key_remapping_translate(uint32_t buttons)
   return result;
 }
 
+/*
+ * The 1X/10X tap, tracked beside the shift logic and independent of it.
+ *
+ * The key is the shift key on this hardware - same pin, same bit - so the
+ * function printed on it had nowhere to live. A modifier is used by being HELD,
+ * though, which leaves the tap free: pressed and released on its own, with
+ * nothing else down and not long enough to latch, it is the legend rather than
+ * the modifier. Shift itself is untouched by any of this.
+ *
+ * Three presses deliberately do not produce a tap. One that had another key
+ * down at any point during it was a chord. One long enough to latch shift was a
+ * hold. And one that RELEASED a latch was the user putting shift away, which is
+ * why this runs before shift_mode_track() - afterwards the latch is already
+ * gone and the press looks like any other.
+ *
+ * Double-click sticky shift is not one of them, and does not need to be: its
+ * first tap toggles the probe, its second toggles it back, so a double click
+ * arms sticky shift and leaves the probe exactly as it was.
+ */
+#define SHIFT_TAP_MAX_MS        400
+
+static struct
+{
+  bool down;
+  bool chord;
+  bool was_locked;   // this press found a latch on, so it is releasing one
+  bool pending;      // a clean tap has completed and not been reported yet
+  uint32_t press_at;
+} g_tap;
+
+static void shift_tap_track(int buttons)
+{
+  uint32_t now = timer_ms();
+
+  if (buttons & BTN_SHIFT)
+  {
+    if (!g_tap.down)
+    {
+      g_tap.down = true;
+      g_tap.chord = false;
+      g_tap.was_locked = g_shift.locked;
+      g_tap.press_at = now;
+    }
+
+    // Any other key at any time during the press makes the whole press a
+    // modifier, including the poll that reports that key being released
+    if (buttons & ~(BTN_SHIFT | BTN_REPEAT))
+      g_tap.chord = true;
+
+    return;
+  }
+
+  if (!g_tap.down)
+    return;
+
+  g_tap.down = false;
+
+  if (g_tap.chord || g_tap.was_locked ||
+      (now - g_tap.press_at) >= SHIFT_TAP_MAX_MS)
+    return;
+
+  g_tap.pending = true;
+}
+
 //-----------------------------------------------------------------------------
 // Two ways to get shift without holding it, and they end differently:
 //
@@ -374,10 +438,20 @@ int input_translate(int buttons)
     return buttons;
 
   shift_mode_track(buttons);
+  shift_tap_track(buttons);
+
+  // The tap is reported on the release, which is the poll where the key state
+  // is empty - so it rides out on its own and no application can mistake it
+  // for a modifier on something else
+  if (g_tap.pending)
+  {
+    g_tap.pending = false;
+    buttons |= BTN_SHIFT_TAP;
+  }
 
   buttons = key_remapping_translate(buttons);
 
-  int keys = buttons & ~(BTN_SHIFT | BTN_REPEAT);
+  int keys = buttons & ~(BTN_SHIFT | BTN_REPEAT | BTN_SHIFT_TAP);
 
   // A latch is shift on the keyboard, not shift on the next key: everything
   // gets it, repeats included, until it is switched off again

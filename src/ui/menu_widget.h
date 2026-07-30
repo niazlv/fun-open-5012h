@@ -132,6 +132,13 @@ typedef struct
 void menu_open_fullscreen(const menu_def_t *def);
 void menu_open_dialog(const menu_def_t *def); // fullscreen, MENU/LEFT close it
 void menu_open_popup(const menu_def_t *def, int x, int y);
+
+// A single row of an existing menu as a shortcut to that one setting, opened
+// over whatever is on screen. `editing` starts it with the arrows already on
+// the value, which is the point of a shortcut; MENU closes it. Sharing the row
+// with the menu is deliberate - a shortcut with its own copy of the labels is a
+// shortcut that will one day name a different thing than the menu does.
+void menu_open_item_popup(const menu_item_t *item, int x, int y, bool editing);
 void menu_open_info(const info_page_t *page);
 void menu_close_popups(void);
 
