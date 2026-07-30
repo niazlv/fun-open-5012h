@@ -83,6 +83,7 @@ enum
 
 /*- Variables ---------------------------------------------------------------*/
 static const Font *lcd_font = NULL;
+static int lcd_scale = 1;
 static int bg_color[2];
 static int fg_color[2];
 
@@ -521,6 +522,41 @@ void lcd_set_font(const Font *font)
 }
 
 //-----------------------------------------------------------------------------
+void lcd_set_text_scale(int scale)
+{
+  lcd_scale = (scale < 1) ? 1 : ((scale > 4) ? 4 : scale);
+}
+
+int lcd_text_scale(void)
+{
+  return lcd_scale;
+}
+
+int lcd_glyph_w(void)
+{
+  return lcd_font->width * lcd_scale;
+}
+
+int lcd_glyph_h(void)
+{
+  return lcd_font->height * lcd_scale;
+}
+
+//-----------------------------------------------------------------------------
+// Pixel width of a string as it will be drawn: the half-space the value
+// formatters put before a unit is half a glyph, so counting characters is not
+// the same thing
+int lcd_text_w(const char *str)
+{
+  int w = 0;
+
+  for (; *str; str++)
+    w += (FONT_HALF_SPACE == *str) ? lcd_glyph_w() / 2 : lcd_glyph_w();
+
+  return w;
+}
+
+//-----------------------------------------------------------------------------
 void lcd_set_color(int bg, int fg)
 {
   bg_color[0] = (bg >> 8) & 0xff;
@@ -533,7 +569,8 @@ void lcd_set_color(int bg, int fg)
 //-----------------------------------------------------------------------------
 void lcd_putc(int x, int y, char ch)
 {
-  int size = lcd_font->width * lcd_font->height;
+  int gw = lcd_font->width * lcd_scale;
+  int gh = lcd_font->height * lcd_scale;
   uint32_t fg0 = LCD_BOP_WORD(fg_color[0]);
   uint32_t fg1 = LCD_BOP_WORD(fg_color[1]);
   uint32_t bg0 = LCD_BOP_WORD(bg_color[0]);
@@ -542,11 +579,10 @@ void lcd_putc(int x, int y, char ch)
 
   // A glyph that does not fit is dropped rather than drawn through an
   // off-panel window, which the controller would wrap somewhere else
-  if (x < 0 || y < 0 || x + lcd_font->width > LCD_WIDTH ||
-      y + lcd_font->height > LCD_HEIGHT)
+  if (x < 0 || y < 0 || x + gw > LCD_WIDTH || y + gh > LCD_HEIGHT)
     return;
 
-  lcd_set_rect(x, y, lcd_font->width, lcd_font->height);
+  lcd_set_rect(x, y, gw, gh);
 
   HAL_GPIO_LCD_CS_clr();
   lcd_command_write(ST7789_RAMWR);
@@ -556,20 +592,28 @@ void lcd_putc(int x, int y, char ch)
 
   bitmap = lcd_font->data + (ch - FONT_FIRST_CHAR) * lcd_font->pitch;
 
-  for (int i = 0; i < size; i++)
+  // Written in the window's own order, which is a row of the glyph at a time.
+  // At scale 1 this is the loop it has always been - one bit, one pixel - and
+  // above it each source row is written `scale` times over and each source bit
+  // `scale` times across.
+  for (int row = 0; row < gh; row++)
   {
-    int byte = bitmap[i / 8];
-    int pixel = (byte >> (i % 8)) & 1;
+    int i0 = (row / lcd_scale) * lcd_font->width;
 
-    if (pixel)
+    for (int col = 0; col < gw; col++)
     {
-      lcd_data_write_bop(fg0);
-      lcd_data_write_bop(fg1);
-    }
-    else
-    {
-      lcd_data_write_bop(bg0);
-      lcd_data_write_bop(bg1);
+      int i = i0 + col / lcd_scale;
+
+      if ((bitmap[i / 8] >> (i % 8)) & 1)
+      {
+        lcd_data_write_bop(fg0);
+        lcd_data_write_bop(fg1);
+      }
+      else
+      {
+        lcd_data_write_bop(bg0);
+        lcd_data_write_bop(bg1);
+      }
     }
   }
 
@@ -579,18 +623,21 @@ void lcd_putc(int x, int y, char ch)
 //-----------------------------------------------------------------------------
 void lcd_puts(int x, int y, const char *str)
 {
+  int gw = lcd_font->width * lcd_scale;
+  int gh = lcd_font->height * lcd_scale;
+
   while (*str)
   {
     if (FONT_HALF_SPACE == *str)
     {
       int color = (bg_color[0] << 8) | bg_color[1];
-      lcd_fill_rect(x, y, lcd_font->width / 2, lcd_font->height, color);
-      x += lcd_font->width / 2;
+      lcd_fill_rect(x, y, gw / 2, gh, color);
+      x += gw / 2;
     }
     else
     {
       lcd_putc(x, y, *str);
-      x += lcd_font->width;
+      x += gw;
     }
 
     str++;

@@ -123,6 +123,13 @@ void scope_menu_open_slot(int slot);
 // nothing may write config.x10 or config.probe_ratio without calling this.
 void scope_probe_changed(void);
 
+// config.ui_scale changed: the screen is divided up differently - a taller pair
+// of bars and two fewer divisions - so the geometry, the caches that hold pixel
+// rows, and the vertical position and trigger level (which are pixels from the
+// middle of a grid that just changed size) are all settled again. The caller
+// repaints; this only rearranges.
+void scope_ui_scale_changed(void);
+
 // Live state of the measurements panel, for the System Info page: this is
 // the path that has gone blank after an auto-setup, and the flags below say
 // which stage of it stopped (see scope_get_panel_state)

@@ -705,13 +705,12 @@ static const menu_item_t g_general_items[] =
   // preview this setting needs. It does not touch the oscilloscope's bars -
   // see UI_SCALE_* in config.h for why those cannot grow, and README for the
   // readings that can.
-  // "Menu Text" and not "Text Size": it is the menus, the popups and the text
-  // pages. The oscilloscope's two bars are 20 and 16 px tall and full end to
-  // end, so 8x16 is their ceiling whatever this says - what makes the
-  // instrument's own numbers big is the panel's Size (up to 16x32) and the
-  // layout editor. A row that promised "text size" promised the bars too.
-  { .kind = MI_CHOICE, .label = "Menu Text",
-    .desc = "Menus and text pages, not the scope's bars",
+  // Everything: the menus, the text pages AND the oscilloscope's own two bars,
+  // which is what this had to mean. The bars cost divisions to grow - see
+  // ScopeGeom in scope.c - so what it does there is a trade, and a deliberate
+  // one: the readings at 16x32, six divisions down the screen instead of eight.
+  { .kind = MI_CHOICE, .label = "Text Size",
+    .desc = "Menus, pages and the scope's bars",
     .u.choice = { &config.ui_scale, ui_scale_labels, UI_SCALE_COUNT,
         ui_scale_changed } },
   // Dims to a quarter of the brightness above after this long without a key,

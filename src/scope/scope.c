@@ -55,20 +55,92 @@
 /*- Definitions -------------------------------------------------------------*/
 #define ZERO_POINT             0x80
 
+/*
+ * THE SCREEN, and the one number in it that may not move.
+ *
+ * 240 rows, and they are spent three ways: the top bar, the graticule, the
+ * status line. Horizontally nothing changes - 12 divisions of 25 px, the full
+ * width - and neither does the division PITCH, ever: 25 px is what makes
+ * vs_px_value[] read 50 mV, 100 mV, 200 mV ... per division, so a grid with a
+ * different pitch would silently relabel every vertical range the instrument
+ * has. What can change is HOW MANY divisions there are down the screen, and
+ * that is the whole of what a bigger interface costs.
+ *
+ *   Normal   top bar 20, grid 8 x 25 = 200, status line 20.  8x16 in the bars.
+ *   Large    top bar 41, grid 6 x 25 = 150, status line 48. 16x32 in the bars,
+ *            over two rows, and two divisions fewer to put the trace in.
+ *
+ * That is a quarter of the vertical RANGE - not of the resolution, which is
+ * still 25 px to a division at every setting, so a division is worth what its
+ * label says and a measurement is what it always was. It buys the readings and
+ * the settings at four times the area, which on a 2.4" panel is the difference
+ * between reading the instrument and leaning into it.
+ *
+ * These are runtime values behind their old names, so that the ~130 places that
+ * lay something out against the grid did not each have to be found and changed;
+ * what the compiler DID find is every place that needed a constant, which is
+ * the array sizes below and one static initialiser. Those use the _MAX forms.
+ */
 #define GRID_CENTER_X          160
-#define GRID_CENTER_Y          120
 #define GRID_LEFT              10
 #define GRID_RIGHT             310
-#define GRID_TOP               20
-#define GRID_BOTTOM            220
 #define GRID_WIDTH             300
-#define GRID_HEIGHT            200
 #define GRID_DIV_PX            25
 #define GRID_DIVS_H            12
-#define GRID_DIVS_V            10
 
-#define STATUS_LINE_Y          223
-#define STATUS_LINE_HEIGHT     16
+#define GRID_HEIGHT_MAX        200   // buffers are sized for the biggest grid
+#define GRID_TOP               (g_geom.grid_top)
+#define GRID_HEIGHT            (g_geom.grid_h)
+#define GRID_BOTTOM            (g_geom.grid_top + g_geom.grid_h)
+#define GRID_CENTER_Y          (g_geom.grid_top + g_geom.grid_h / 2)
+#define GRID_DIVS_V            (g_geom.grid_h / GRID_DIV_PX)
+
+// The bottom bar: where it starts and how tall it is. At the large size it is
+// two rows - the readings at 16x32 above, the scale settings at 8x16 below -
+// and STATUS_LINE_Y is the first of them, which is what every other owner of
+// this line (toasts, cursors, the trend readout, the editor's key hints) draws
+// its own first row at.
+#define STATUS_LINE_Y          (g_geom.status_y)
+#define STATUS_LINE_HEIGHT     (g_geom.status_h)
+
+// Second row of the bottom bar at the large size; the same row at the normal
+// one, where there is only the one
+#define STATUS_ROW2_Y          (g_geom.status_y + g_geom.status_row2)
+
+typedef struct
+{
+  int16_t grid_top;
+  int16_t grid_h;
+  int16_t status_y;
+  int16_t status_h;
+  int16_t status_row2;   // offset of the second row, 0 when there is not one
+  int16_t top_text_y;    // the top bar's word row (trigger mode, capture state)
+  int16_t mv_y;          // ...and the record map's block, under it
+  int16_t slot0_x;       // the two big readings on the status line
+  int16_t slot1_x;
+  int8_t  bar_scale;     // glyph scale for the bars: 1, or 2 at the large size
+} ScopeGeom;
+
+/*
+ * Normal: what this instrument has always looked like. 8 divisions down, both
+ * bars one row of 8x16.
+ *
+ * Large: the top bar's words and the two readings at 16x32, which needs 32 rows
+ * where 16 were, twice. The record map keeps its full width and moves under the
+ * words; the settings row keeps 8x16, because doubling it too would cost a
+ * fifth division. Six divisions instead of eight - a quarter of the vertical
+ * RANGE, at the same 25 px and therefore the same volts to a division.
+ */
+static const ScopeGeom g_geom_normal = { 20, 200, 223, 16,  0, 4,  1, 140, 228, 1 };
+static const ScopeGeom g_geom_large  = { 41, 150, 192, 48, 32, 0, 26,   0, 160, 2 };
+
+static ScopeGeom g_geom = { 20, 200, 223, 16, 0, 4, 1, 140, 228, 1 };
+
+// Glyph scale for the bars, and the font that goes with it. One place, because
+// every field on both bars has to agree about how big the row is.
+#define BAR_SCALE              (g_geom.bar_scale)
+#define TOP_TEXT_Y             (g_geom.top_text_y)
+#define MV_Y                   (g_geom.mv_y)
 
 #define MINIVIEW_WIDTH         160
 
@@ -206,9 +278,14 @@ enum
 // Status-line layout: a one-character tag and a value per slot. Values are
 // right-aligned in a fixed width by format_*(), which comes to 76 px, so a
 // tagged slot is 84 and the two of them run 140..312.
-#define MEASURE_SLOT_0_X       140
-#define MEASURE_SLOT_1_X       228
-#define MEASURE_TAG_W          8     // one glyph of the large font
+//
+// At the large size they are twice that and own a row to themselves - 152 px
+// each, from x=2 and x=164 - with the settings (V/div, AC/DC, s/div) on the row
+// below. Two readings is what 320 px holds at 16 px a character, which is why
+// the settings did not double with them.
+#define MEASURE_SLOT_0_X       (g_geom.slot0_x)
+#define MEASURE_SLOT_1_X       (g_geom.slot1_x)
+#define MEASURE_TAG_W          8     // one glyph of the large font, both sizes
 
 // "There is no reading", at the width format_time() and format_voltage() come
 // out at, so it covers the number it replaces instead of leaving its tail on
@@ -484,11 +561,11 @@ static const char *vs_label(int scale)
 /*- Variables ---------------------------------------------------------------*/
 // Five distinct grid column patterns; g_grid_index picks one per column
 // (a byte index table instead of 300 pointers saves ~1.3 KB of scarce TCM)
-static uint16_t g_grid_column_0[GRID_HEIGHT];
-static uint16_t g_grid_column_1[GRID_HEIGHT];
-static uint16_t g_grid_column_2[GRID_HEIGHT];
-static uint16_t g_grid_column_3[GRID_HEIGHT];
-static uint16_t g_grid_column_4[GRID_HEIGHT];
+static uint16_t g_grid_column_0[GRID_HEIGHT_MAX];
+static uint16_t g_grid_column_1[GRID_HEIGHT_MAX];
+static uint16_t g_grid_column_2[GRID_HEIGHT_MAX];
+static uint16_t g_grid_column_3[GRID_HEIGHT_MAX];
+static uint16_t g_grid_column_4[GRID_HEIGHT_MAX];
 
 static uint16_t *const g_grid_columns[5] =
 {
@@ -646,7 +723,7 @@ static int g_fft_cursor = -1;       // trace column, -1 when the cursor is off
 static int g_fft_cursor_bin = 0;
 static bool g_fft_panel_pending = false;
 static bool g_fft_panel_on = true;  // MODE toggles the breakdown panel
-static uint16_t g_fft_grad[GRID_HEIGHT]; // heat ramp, indexed by curve height
+static uint16_t g_fft_grad[GRID_HEIGHT_MAX]; // heat ramp, indexed by curve height
 static bool g_fft_grad_ready = false;
 // Spectrum hold: EDGE cycles Off -> Max -> Avg. Max-hold pins anything that
 // ever appeared (intermittent interference, drifting tones); the exponential
@@ -1145,7 +1222,10 @@ static bool g_dbit_on = false;
 // they follow - the decode changes rarely, the signal's height every frame.
 static int g_dbit_top = 0;
 static int g_dbit_bot = -1;
-static int g_dbit_text_row = GRID_HEIGHT / 2 - 4;
+// Middle of the grid until a decode places it; not GRID_HEIGHT/2-4 written out
+// here, because the grid's height is a runtime value now and this is a file
+// scope initialiser. decode_bit_rows() sets it before anything reads it.
+static int g_dbit_text_row = GRID_HEIGHT_MAX / 2 - 4;
 
 _Static_assert(LOGIC_MAX_BYTES <= 127, "byte index must fit g_dband_byte");
 _Static_assert(DBAND_TEXT_Y1 + 8 <= DBAND_H2, "second text row must fit the band");
@@ -1210,7 +1290,7 @@ static void grid_init(void)
 static void toast_show(void)
 {
   if (!g_toast_active)
-    lcd_fill_rect(GRID_LEFT, GRID_BOTTOM+1, GRID_WIDTH+1, STATUS_LINE_HEIGHT, BG_COLOR);
+    lcd_fill_rect(0, GRID_BOTTOM+1, LCD_WIDTH, STATUS_LINE_HEIGHT, BG_COLOR);
 
   lcd_set_color(BG_COLOR, TOAST_COLOR);
   g_toast_active = true;
@@ -1879,7 +1959,7 @@ static void build_trace_column(int c, uint16_t *column)
 //-----------------------------------------------------------------------------
 static void draw_trace(void)
 {
-  uint16_t column[GRID_HEIGHT];
+  uint16_t column[GRID_HEIGHT_MAX];
   int c = g_trace_column;
 
   if (trace_ready())
@@ -1942,7 +2022,7 @@ static void draw_ac_dc(void)
   if (g_toast_active)
     return;
 
-  lcd_draw_image(54, STATUS_LINE_Y, config.ac_coupling ? &image_ac : &image_dc);
+  lcd_draw_image(54, STATUS_ROW2_Y, config.ac_coupling ? &image_ac : &image_dc);
 }
 
 //-----------------------------------------------------------------------------
@@ -1952,7 +2032,7 @@ static void draw_horizontal_scale(void)
     return;
 
   lcd_set_color(BG_COLOR, HSCALE_COLOR);
-  lcd_puts(82, STATUS_LINE_Y, hs_str[config.horizontal_scale]);
+  lcd_puts(82, STATUS_ROW2_Y, hs_str[config.horizontal_scale]);
 }
 
 //-----------------------------------------------------------------------------
@@ -1997,7 +2077,11 @@ static void draw_horizontal_position(void)
   str = format_time(g_roll_active ? roll_screen_ns() : config.horizontal_position,
       !g_roll_active);
   lcd_set_color(BG_COLOR, HPOS_COLOR);
-  lcd_puts(236, STATUS_LINE_Y, str);
+  // The second reading's slot, so that what stands here reads the same size as
+  // what stands here when the measurements own the line
+  lcd_set_text_scale(BAR_SCALE);
+  lcd_puts(MEASURE_SLOT_1_X, STATUS_LINE_Y, str);
+  lcd_set_text_scale(1);
 }
 
 //-----------------------------------------------------------------------------
@@ -2055,7 +2139,7 @@ static void draw_vertical_scale(void)
   if (g_toast_active)
     return;
 
-  lcd_fill_rect(10, STATUS_LINE_Y, VSCALE_FIELD_W, STATUS_LINE_HEIGHT, BG_COLOR);
+  lcd_fill_rect(10, STATUS_ROW2_Y, VSCALE_FIELD_W, 16, BG_COLOR);
 
   /*
    * With a probe counted in, this field says both things instead of one: the
@@ -2074,16 +2158,16 @@ static void draw_vertical_scale(void)
   {
     lcd_set_font(FONT_SMALL);
     lcd_set_color(BG_COLOR, PROBE_TAG_COLOR);
-    lcd_puts(10, STATUS_LINE_Y, probe_ratio_labels[
+    lcd_puts(10, STATUS_ROW2_Y, probe_ratio_labels[
         ((unsigned)config.probe_ratio < PROBE_RATIO_COUNT) ?
             config.probe_ratio : 0]);
-    lcd_puts(10, STATUS_LINE_Y + 8, vs_label(config.vertical_scale));
+    lcd_puts(10, STATUS_ROW2_Y + 8, vs_label(config.vertical_scale));
     lcd_set_font(FONT_LARGE);
     return;
   }
 
   lcd_set_color(BG_COLOR, VSCALE_COLOR);
-  lcd_puts(10, STATUS_LINE_Y, vs_label(config.vertical_scale));
+  lcd_puts(10, STATUS_ROW2_Y, vs_label(config.vertical_scale));
 }
 
 //-----------------------------------------------------------------------------
@@ -2099,10 +2183,12 @@ static void draw_trigger_level(void)
 
   str = format_voltage(config.trigger_level_mv - config.vertical_position_mv, true);
   lcd_set_color(BG_COLOR, TRIGGER_LEVEL_COLOR);
+  lcd_set_text_scale(BAR_SCALE);
   // The edge icon used to sit at 140 and this readout began after it. With the
   // icon in the top bar the reading starts the field itself, on the same left
   // edge the first measurement slot uses.
   lcd_puts(MEASURE_SLOT_0_X, STATUS_LINE_Y, str);
+  lcd_set_text_scale(1);
 }
 
 //-----------------------------------------------------------------------------
@@ -2146,7 +2232,9 @@ static void draw_trigger_mode(void)
     str = "SNGL";
 
   lcd_set_color(BG_COLOR, TRIGGER_MODE_COLOR);
-  lcd_puts(10, 4, str);
+  lcd_set_text_scale(BAR_SCALE);
+  lcd_puts(10, TOP_TEXT_Y, str);
+  lcd_set_text_scale(1);
 }
 
 //-----------------------------------------------------------------------------
@@ -2546,7 +2634,7 @@ static void mpanel_cell_set(MPanelCell *cell, const char *label,
 // ~10x cheaper than forcing a full 300-column sweep for an overlay change.
 static void overlay_repaint_region(int row0, int rows)
 {
-  uint16_t column[GRID_HEIGHT];
+  uint16_t column[GRID_HEIGHT_MAX];
   int saved = g_trace_column;
 
   for (int c = 0; c < GRID_WIDTH - 1; c++)
@@ -4183,8 +4271,7 @@ static void layout_edit_footer(void)
   // Exactly the rectangle draw_status_line() clears, and no wider: a footer
   // that reached x=0 left its first letters standing in the margin the status
   // line does not own when the editor closed.
-  lcd_fill_rect(GRID_LEFT, GRID_BOTTOM + 1, GRID_WIDTH + 1,
-      STATUS_LINE_HEIGHT, BG_COLOR);
+  lcd_fill_rect(0, GRID_BOTTOM + 1, LCD_WIDTH, STATUS_LINE_HEIGHT, BG_COLOR);
   lcd_set_font(FONT_SMALL);
   lcd_set_color(BG_COLOR, MEASURE_MODE_COLOR);
 
@@ -4378,19 +4465,30 @@ static void measure_slot(int slot, int x, const char *tag, const char *value,
     int color)
 {
   static int prev_w[MEASURE_LINE_SLOTS];
-  int w = text_width(value);
+  int w, h;
 
+  // The tag stays 8x16 while the value doubles, and not out of thrift: a value
+  // is ten characters wide (the formatters pad it so a shorter reading covers
+  // the longer one it replaces), which at 16 px a character is 152, and two of
+  // those plus two 16 px tags is 336 on a 320 px line. An 8 px tag makes it 320
+  // exactly. It is a one-letter hint at which metric this is, not a reading, so
+  // it is the half of the pair that can afford to stay small.
   lcd_set_color(BG_COLOR, MEASURE_MODE_COLOR);
-  lcd_puts(x, STATUS_LINE_Y, tag);
+  lcd_puts(x, STATUS_LINE_Y + (BAR_SCALE > 1 ? 8 : 0), tag);
+
+  lcd_set_text_scale(BAR_SCALE);
+  w = lcd_text_w(value);
+  h = lcd_glyph_h();
 
   lcd_set_color(BG_COLOR, color);
   lcd_puts(x + MEASURE_TAG_W, STATUS_LINE_Y, value);
 
   if (prev_w[slot] > w)
     lcd_fill_rect(x + MEASURE_TAG_W + w, STATUS_LINE_Y, prev_w[slot] - w,
-        STATUS_LINE_HEIGHT, BG_COLOR);
+        h, BG_COLOR);
 
   prev_w[slot] = w;
+  lcd_set_text_scale(1);
 }
 
 //-----------------------------------------------------------------------------
@@ -4405,7 +4503,8 @@ static void fft_format_db(char *buf, int size, float db);
 static void draw_measure(void)
 {
   ScopeMeasure sm;
-  static const int slot_x[MEASURE_LINE_SLOTS] =
+  // Not static: where the two slots are depends on the text size now
+  const int slot_x[MEASURE_LINE_SLOTS] =
       { MEASURE_SLOT_0_X, MEASURE_SLOT_1_X };
   static const int slot_color[MEASURE_LINE_SLOTS] =
       { MEASURE_VOLTAGE_COLOR, MEASURE_FREQ_COLOR };
@@ -4513,7 +4612,12 @@ static void draw_capture_state(void)
   }
 
   lcd_set_color(BG_COLOR, color);
-  lcd_puts(46, 4, str);
+  lcd_set_text_scale(BAR_SCALE);
+  // Straight after the trigger mode, whatever a glyph is worth: four of them at
+  // 8 px start this at 46, at 16 px at 82. The gap scales too - four pixels
+  // between two 32 px words reads as one word.
+  lcd_puts(10 + 4 * lcd_glyph_w() + 4 * BAR_SCALE, TOP_TEXT_Y, str);
+  lcd_set_text_scale(1);
 
   g_state = state;
 }
@@ -4623,24 +4727,24 @@ static void draw_miniview(int trigger_offset, int window_offset, int window_widt
         buf[i * w + k] = col[i];
     }
 
-    lcd_draw_buf(GRID_CENTER_X - MINIVIEW_WIDTH/2 + 1 + base, 7, w,
+    lcd_draw_buf(GRID_CENTER_X - MINIVIEW_WIDTH/2 + 1 + base, MV_Y + 6, w,
         MINIVIEW_ROWS, buf);
   }
 
 #define LEFT   (GRID_CENTER_X - MINIVIEW_WIDTH/2)
 #define RIGHT  (GRID_CENTER_X + MINIVIEW_WIDTH/2)
 
-  lcd_fill_rect(LEFT - image_trigger_mv.width/2, 1, MINIVIEW_WIDTH + image_trigger_mv.width,
+  lcd_fill_rect(LEFT - image_trigger_mv.width/2, MV_Y, MINIVIEW_WIDTH + image_trigger_mv.width,
       image_trigger_mv.height, BG_COLOR);
-  lcd_draw_image(GRID_CENTER_X + trigger_offset, 5, &image_trigger_mv);
+  lcd_draw_image(GRID_CENTER_X + trigger_offset, MV_Y + 4, &image_trigger_mv);
 
-  lcd_vline(LEFT, 6, 15, MV_FRAME_COLOR);
-  lcd_hline(LEFT, LEFT+2, 6, MV_FRAME_COLOR);
-  lcd_hline(LEFT, LEFT+2, 15, MV_FRAME_COLOR);
+  lcd_vline(LEFT, MV_Y + 5, MV_Y + 14, MV_FRAME_COLOR);
+  lcd_hline(LEFT, LEFT+2, MV_Y + 5, MV_FRAME_COLOR);
+  lcd_hline(LEFT, LEFT+2, MV_Y + 14, MV_FRAME_COLOR);
 
-  lcd_vline(RIGHT, 6, 15, MV_FRAME_COLOR);
-  lcd_hline(RIGHT-2, RIGHT, 6, MV_FRAME_COLOR);
-  lcd_hline(RIGHT-2, RIGHT, 15, MV_FRAME_COLOR);
+  lcd_vline(RIGHT, MV_Y + 5, MV_Y + 14, MV_FRAME_COLOR);
+  lcd_hline(RIGHT-2, RIGHT, MV_Y + 5, MV_FRAME_COLOR);
+  lcd_hline(RIGHT-2, RIGHT, MV_Y + 14, MV_FRAME_COLOR);
 
 #undef LEFT
 #undef RIGHT
@@ -4872,6 +4976,58 @@ void scope_probe_changed(void)
   mpanel_invalidate();
   draw_status_line();
   refresh_view();
+}
+
+//-----------------------------------------------------------------------------
+/*
+ * The text size changed, so the screen is divided up differently: see ScopeGeom.
+ *
+ * Everything that is positioned against the grid asks g_geom, so setting it is
+ * most of the work. What is left is the state that CACHES a position: the
+ * per-column shadow of what is on the panel (rows moved), the grid patterns
+ * (fewer rows to rule), the trace's own history (a column's pixel row means a
+ * different voltage now), and the state slot's "nothing has changed" latch.
+ *
+ * The vertical position and the trigger level are in PIXELS from the middle of
+ * the grid, and the middle stays the middle - but a smaller grid puts both
+ * nearer its edge, so they are clamped back inside it here rather than being
+ * quietly off-screen with a marker pinned to the frame.
+ */
+void scope_ui_scale_changed(void)
+{
+  int half;
+
+  g_geom = (UI_SCALE_LARGE == config.ui_scale) ? g_geom_large : g_geom_normal;
+
+  half = GRID_HEIGHT / 2 - 1;
+
+  if (config.vertical_position > half)
+    config.vertical_position = half;
+  else if (config.vertical_position < -half)
+    config.vertical_position = -half;
+
+  if (config.trigger_level > half)
+    config.trigger_level = half;
+  else if (config.trigger_level < -half)
+    config.trigger_level = -half;
+
+  config.vertical_position_mv = config.vertical_position *
+      vs_mv_px(config.vertical_scale);
+  config.trigger_level_mv = config.trigger_level * vs_mv_px(config.vertical_scale);
+
+  capture_set_vertical_parameters();
+  capture_set_trigger_level(config.trigger_level_mv);
+
+  g_state = -1;              // the capture-state slot repaints itself
+  g_vpos_marker.valid = false;
+  g_trig_marker.valid = false;
+  g_shadow_valid = false;
+  memset(g_persist_lvl, 0, sizeof(g_persist_lvl));
+  memset(g_avg_have, 0, sizeof(g_avg_have));
+  grid_init();
+  memset(g_mpanel_cell, 0, sizeof(g_mpanel_cell));
+  g_mpanel_is_text = false;
+  mpanel_invalidate();
 }
 
 //-----------------------------------------------------------------------------
@@ -5135,7 +5291,7 @@ static void cursor_readout(void)
     snprintf(f, sizeof(f), "-");
   }
 
-  lcd_fill_rect(GRID_LEFT, GRID_BOTTOM+1, GRID_WIDTH+1, STATUS_LINE_HEIGHT, BG_COLOR);
+  lcd_fill_rect(0, GRID_BOTTOM+1, LCD_WIDTH, STATUS_LINE_HEIGHT, BG_COLOR);
   lcd_set_color(BG_COLOR, CURSOR_T_COLOR);
   snprintf(buf, sizeof(buf), "%s dT %s 1/dT %s dV %s",
       names[g_cursor_sel], dt, f, dv);
@@ -5256,7 +5412,7 @@ static void trend_readout(void)
   if (g_toast_active)
     return;
 
-  lcd_fill_rect(GRID_LEFT, GRID_BOTTOM+1, GRID_WIDTH+1, STATUS_LINE_HEIGHT, BG_COLOR);
+  lcd_fill_rect(0, GRID_BOTTOM+1, LCD_WIDTH, STATUS_LINE_HEIGHT, BG_COLOR);
   lcd_set_color(BG_COLOR, SR_COLOR);
 
   if (n == 0)
@@ -8914,7 +9070,7 @@ static void draw_status_line(void)
     return;
   }
 
-  lcd_fill_rect(GRID_LEFT, GRID_BOTTOM+1, GRID_WIDTH+1, STATUS_LINE_HEIGHT, BG_COLOR);
+  lcd_fill_rect(0, GRID_BOTTOM+1, LCD_WIDTH, STATUS_LINE_HEIGHT, BG_COLOR);
 
   draw_vertical_scale();
   draw_ac_dc();
@@ -9333,6 +9489,9 @@ void scope_init(bool calibration_mode)
   config.horizontal_period = hs_px_value[config.horizontal_scale];
   config.vertical_mult = config.calib_vs_mult[config.vertical_scale] * config_probe_mult();
 
+  // How the screen is divided up, before anything is laid out against it
+  scope_ui_scale_changed();
+
   grid_init();
   persist_build_ramp();
 
@@ -9406,6 +9565,11 @@ void scope_init(bool calibration_mode)
 // told that what it thinks is on screen is gone.
 void scope_redraw_all(void)
 {
+  // The menu that was up may have been the one that changes the text size, and
+  // that decides how the screen is divided before any of it is drawn
+  if (g_geom.bar_scale != ((UI_SCALE_LARGE == config.ui_scale) ? 2 : 1))
+    scope_ui_scale_changed();
+
   g_shadow_valid = false;
   g_sweep_force = true;
   g_vpos_marker.valid = false;
