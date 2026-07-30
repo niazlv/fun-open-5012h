@@ -209,7 +209,26 @@ SRCS += \
 # bk_video.c are the inner loop and stay at -O3, while the disassembler, the
 # loader and the application around them run once per keystroke and would
 # rather be small.
+#
+# The interface is on the list for the same reason, and it is the biggest single
+# win in the image: 12.8 KB, measured, from the eight files below. Every one of
+# them runs when a KEY IS PRESSED - a menu is laid out and drawn, a settings
+# entry is read or written, a fault dump is formatted - so a hundred cycles
+# either way is invisible next to the LCD bus it is waiting for and next to the
+# human who pressed the key. What is not on the list is anything the trace sweep
+# touches: scope.c and capture.c stay at -O3, because those DO run per column.
+#
+# It was 5.8 KB of headroom that made this necessary; it is the mechanism the
+# next feature should reach for before anything is cut.
 SIZE_OPTIMIZED = \
+  $(BUILD)/scope_menu.o \
+  $(BUILD)/menu_widget.o \
+  $(BUILD)/system_menu.o \
+  $(BUILD)/flash_viewer.o \
+  $(BUILD)/key_remap.o \
+  $(BUILD)/launcher.o \
+  $(BUILD)/config.o \
+  $(BUILD)/debug_coredump.o \
   $(BUILD)/game_gfx.o \
   $(BUILD)/snake_game.o \
   $(BUILD)/flappy_bird.o \

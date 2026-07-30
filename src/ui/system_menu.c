@@ -661,6 +661,14 @@ static void shift_mode_changed(void)
 }
 
 //-----------------------------------------------------------------------------
+// The menus this row is on are drawn at the size this row sets, so they have to
+// be laid out again around it - see menu_relayout()
+static void ui_scale_changed(void)
+{
+  menu_relayout();
+}
+
+//-----------------------------------------------------------------------------
 static void action_key_remap(const void *arg)
 {
   (void)arg;
@@ -692,6 +700,20 @@ static const menu_item_t g_general_items[] =
         STARTUP_APP_COUNT, NULL } },
   { .kind = MI_NUMBER, .label = "Brightness",
     .u.number = { &config.lcd_bl_level, 10, 100, 5, 10, "%", apply_backlight } },
+  // The menus' own text size, and it applies to the menu it is being changed
+  // from: the row grows under the cursor as the value turns, which is the whole
+  // preview this setting needs. It does not touch the oscilloscope's bars -
+  // see UI_SCALE_* in config.h for why those cannot grow, and README for the
+  // readings that can.
+  // "Menu Text" and not "Text Size": it is the menus, the popups and the text
+  // pages. The oscilloscope's two bars are 20 and 16 px tall and full end to
+  // end, so 8x16 is their ceiling whatever this says - what makes the
+  // instrument's own numbers big is the panel's Size (up to 16x32) and the
+  // layout editor. A row that promised "text size" promised the bars too.
+  { .kind = MI_CHOICE, .label = "Menu Text",
+    .desc = "Menus and text pages, not the scope's bars",
+    .u.choice = { &config.ui_scale, ui_scale_labels, UI_SCALE_COUNT,
+        ui_scale_changed } },
   // Dims to a quarter of the brightness above after this long without a key,
   // and comes straight back on the next one. Not while the oscilloscope is on
   // screen - see launcher_app_may_dim.

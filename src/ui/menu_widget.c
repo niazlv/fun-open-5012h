@@ -13,16 +13,15 @@
 #include <string.h>
 #include "lcd.h"
 #include "buttons.h"
+#include "config.h"
 #include "ui.h"
 #include "menu_widget.h"
 
 /*- Definitions -------------------------------------------------------------*/
 #define MENU_MAX_OPEN         6
 
-// Popup style (context/system menu)
-#define POPUP_WIDTH           180
-#define POPUP_SUBMENU_WIDTH   160
-#define POPUP_ITEM_H          20
+// Popup style (context/system menu). The geometry is per text size and lives in
+// g_ui_metrics below; these are the colours and the one margin both sizes share.
 #define POPUP_MARGIN          2
 #define POPUP_EDIT_BG         LCD_COLOR(255, 200, 0)
 #define POPUP_EDIT_TEXT       LCD_COLOR(0, 0, 0)
@@ -73,6 +72,30 @@
 #define FW_LARGE              8 // terminus_8x16 glyph width
 
 /*- Types -------------------------------------------------------------------*/
+/*
+ * Everything about a popup that the text size decides. A table rather than an
+ * arithmetic scale, because none of these numbers scale by the same factor: the
+ * font is 33% wider and 100% taller, the row grows by the font's height and not
+ * by its width, and the width is what the longest LABEL needs rather than a
+ * multiple of anything.
+ *
+ * Widths: 180 is what the menus were drawn at, and 244 is the same rows at 8 px
+ * a character - the longest label in the firmware is "Arrange layout..." at 17,
+ * and a row has to hold a value ("1000x", "Oscilloscope") hard against its right
+ * edge on the same line. Submenus stay narrower than their parent, as before.
+ *
+ * text_dy centres the glyph in the row: (item_h - font height) / 2, written out
+ * so that a row can be nudged without recomputing it.
+ */
+typedef struct
+{
+  const Font *font;
+  uint8_t char_w;
+  uint8_t item_h;
+  uint8_t text_dy;
+  uint16_t width;
+  uint16_t sub_width;
+} UiMetrics;
 typedef struct
 {
   bool used;
@@ -101,21 +124,33 @@ typedef struct
   const info_page_t *page;
   int count;   // text lines, 0 for a page that only has a body()
   int top;     // first visible line
-  int vis;     // lines on one screen
+  int vis;     // DISPLAY rows on one screen - a line may take more than one
   int line_h;
   int y0;      // origin of the first visible line
   int heads;   // section headings in the page, 0 = no sections
+  bool large;  // body in the 8x16 font
+  int cols;    // characters that fit one row, and one continuation row
+  int cols_cont;
+  int rows;    // display rows the whole page takes, wrapping counted
+  int max_top; // the last line that may be at the top: the end of the page
 } info_inst_t;
 
 /*- Variables ---------------------------------------------------------------*/
 static menu_inst_t g_inst[MENU_MAX_OPEN];
 static info_inst_t g_info;
 
+static const UiMetrics g_ui_metrics[UI_SCALE_COUNT] =
+{
+  [UI_SCALE_NORMAL] = { FONT_SMALL, FW_SMALL, 20, 6, 180, 160 },
+  [UI_SCALE_LARGE]  = { FONT_LARGE, FW_LARGE, 26, 5, 244, 224 },
+};
+
 /*- Forward Declarations ----------------------------------------------------*/
 static void menu_leave(void *ctx);
 static void menu_draw(void *ctx, bool full);
 static bool menu_input(void *ctx, int buttons);
 
+//-----------------------------------------------------------------------------
 static const ui_screen_t menu_screen_popup =
 {
   .leave  = menu_leave,
@@ -137,6 +172,17 @@ static const ui_screen_t menu_screen_fs =
 };
 
 /*- Implementations ---------------------------------------------------------*/
+
+//-----------------------------------------------------------------------------
+// The size the menus are being drawn at. Read per draw and not cached: the
+// setting is changed FROM a menu, and the menu it is changed from has to come
+// back at the new size on the redraw that follows the keypress.
+static const UiMetrics *um(void)
+{
+  int s = config.ui_scale;
+
+  return &g_ui_metrics[((unsigned)s < UI_SCALE_COUNT) ? s : UI_SCALE_NORMAL];
+}
 
 //-----------------------------------------------------------------------------
 static menu_inst_t *alloc_inst(void)
@@ -199,9 +245,10 @@ static const char *item_value_str(const menu_item_t *it, char *buf, int size)
 //-----------------------------------------------------------------------------
 static void popup_draw_row(const menu_inst_t *m, int index)
 {
+  const UiMetrics *u = um();
   const menu_item_t *it = &m->items[index];
   int x = m->x + POPUP_MARGIN;
-  int y = m->y + POPUP_MARGIN + (index - m->scroll) * POPUP_ITEM_H;
+  int y = m->y + POPUP_MARGIN + (index - m->scroll) * u->item_h;
   int w = m->w - 2 * POPUP_MARGIN;
   bool selected = (index == m->sel);
   char buf[16];
@@ -211,34 +258,34 @@ static void popup_draw_row(const menu_inst_t *m, int index)
 
   if (MI_SEPARATOR == it->kind)
   {
-    lcd_fill_rect(x, y, w, POPUP_ITEM_H, POPUP_BG);
-    lcd_fill_rect(x + 5, y + POPUP_ITEM_H / 2 - 1, w - 10, 1, POPUP_SEPARATOR);
+    lcd_fill_rect(x, y, w, u->item_h, POPUP_BG);
+    lcd_fill_rect(x + 5, y + u->item_h / 2 - 1, w - 10, 1, POPUP_SEPARATOR);
     return;
   }
 
   uint16_t bg = selected ? POPUP_SEL_BG : POPUP_BG;
   uint16_t fg = selected ? POPUP_SEL_TEXT : POPUP_TEXT;
 
-  lcd_fill_rect(x, y, w, POPUP_ITEM_H, bg);
-  lcd_set_font(FONT_SMALL);
+  lcd_fill_rect(x, y, w, u->item_h, bg);
+  lcd_set_font(u->font);
   lcd_set_color(bg, fg);
-  lcd_puts(x + 8, y + 6, it->label);
+  lcd_puts(x + 8, y + u->text_dy, it->label);
 
   const char *value = item_value_str(it, buf, sizeof(buf));
 
   if (value[0])
   {
-    int vx = x + w - 8 - strlen(value) * FW_SMALL;
+    int vx = x + w - 8 - (int)strlen(value) * u->char_w;
 
     // Edit focus: the VALUE inverts, saying the arrows now belong to it
     if (selected && m->editing)
     {
-      lcd_fill_rect(vx - 3, y + 3, strlen(value) * FW_SMALL + 6,
-          POPUP_ITEM_H - 6, POPUP_EDIT_BG);
+      lcd_fill_rect(vx - 3, y + 3, (int)strlen(value) * u->char_w + 6,
+          u->item_h - 6, POPUP_EDIT_BG);
       lcd_set_color(POPUP_EDIT_BG, POPUP_EDIT_TEXT);
     }
 
-    lcd_puts(vx, y + 6, value);
+    lcd_puts(vx, y + u->text_dy, value);
   }
 }
 
@@ -256,6 +303,8 @@ static void popup_draw(const menu_inst_t *m, bool full)
 
   if (m->count > m->vis)
   {
+    // The arrows keep the small font at both sizes: they mark the edge of the
+    // list rather than being read, and a large one would sit on the values
     lcd_set_font(FONT_SMALL);
     lcd_set_color(POPUP_BG, POPUP_TEXT);
 
@@ -440,33 +489,52 @@ static void choice_adjust(const menu_item_t *it, int dir)
 }
 
 //-----------------------------------------------------------------------------
+// How wide the box is and how many rows fit in it, for the text size in force
+// now. Split out of the open because the size can change while the menu is up -
+// it is changed FROM a menu - and then every open popup has to be laid out
+// again around rows that are suddenly taller. See menu_relayout().
+static void popup_layout(menu_inst_t *m)
+{
+  const UiMetrics *u = um();
+  int max_vis = (LCD_HEIGHT - 2 * POPUP_MARGIN) / u->item_h;
+
+  m->w = m->is_submenu ? u->sub_width : u->width;
+  m->vis = (m->count < max_vis) ? m->count : max_vis;
+  m->h = m->vis * u->item_h + 2 * POPUP_MARGIN;
+
+  // A popup is opened at a point that suits what it belongs to - a status-line
+  // slot, a parent row - and at the large size it is 64 px wider than the point
+  // was chosen for. Pulling it back onto the screen is what keeps a shortcut
+  // from opening half off the right edge; x can go negative doing that, which a
+  // box drawn from x=0 with a shadow beside it would notice.
+  if (m->x + m->w > LCD_WIDTH)
+    m->x = LCD_WIDTH - m->w;
+  if (m->x < 0)
+    m->x = 0;
+  if (m->y + m->h > LCD_HEIGHT)
+    m->y = LCD_HEIGHT - m->h;
+  if (m->y < 0)
+    m->y = 0;
+}
+
+//-----------------------------------------------------------------------------
 static void popup_open_common(const menu_item_t *items, int count, int x, int y,
-    int w, bool is_submenu, bool editing)
+    bool is_submenu, bool editing)
 {
   menu_inst_t *m = alloc_inst();
 
   if (NULL == m)
     return;
 
-  int max_vis = (LCD_HEIGHT - 2 * POPUP_MARGIN) / POPUP_ITEM_H;
-
   m->fullscreen = false;
   m->is_submenu = is_submenu;
   m->items = items;
   m->count = count;
-  m->vis = (count < max_vis) ? count : max_vis;
   m->x = x;
   m->y = y;
-  m->w = w;
-  m->h = m->vis * POPUP_ITEM_H + 2 * POPUP_MARGIN;
   m->sel = 0;
 
-  if (m->x + m->w > LCD_WIDTH)
-    m->x = LCD_WIDTH - m->w;
-  if (m->y + m->h > LCD_HEIGHT)
-    m->y = LCD_HEIGHT - m->h;
-  if (m->y < 0)
-    m->y = 0;
+  popup_layout(m);
 
   m->sel = first_selectable(m);
 
@@ -493,11 +561,10 @@ static void open_submenu(const menu_inst_t *parent, const menu_item_t *it)
   else
   {
     x = parent->x + parent->w - 5;
-    y = parent->y + POPUP_MARGIN + parent->sel * POPUP_ITEM_H;
+    y = parent->y + POPUP_MARGIN + (parent->sel - parent->scroll) * um()->item_h;
   }
 
-  popup_open_common(it->u.submenu.items, it->u.submenu.count, x, y,
-      POPUP_SUBMENU_WIDTH, true, false);
+  popup_open_common(it->u.submenu.items, it->u.submenu.count, x, y, true, false);
 }
 
 //-----------------------------------------------------------------------------
@@ -545,7 +612,7 @@ void menu_open_dialog(const menu_def_t *def)
 //-----------------------------------------------------------------------------
 void menu_open_popup(const menu_def_t *def, int x, int y)
 {
-  popup_open_common(def->items, def->count, x, y, POPUP_WIDTH, false, false);
+  popup_open_common(def->items, def->count, x, y, false, false);
 }
 
 //-----------------------------------------------------------------------------
@@ -554,7 +621,7 @@ void menu_open_popup(const menu_def_t *def, int x, int y)
 // never disagree about what the setting is called or what it may be.
 void menu_open_item_popup(const menu_item_t *item, int x, int y, bool editing)
 {
-  popup_open_common(item, 1, x, y, POPUP_WIDTH, false, editing);
+  popup_open_common(item, 1, x, y, false, editing);
 }
 
 //-----------------------------------------------------------------------------
@@ -599,39 +666,141 @@ static int info_head_at(const info_inst_t *in, int line)
   return -1;
 }
 
-//-----------------------------------------------------------------------------
-static void info_draw_line(const char *line, int y)
-{
-  if (!line)
-    return;
+/*
+ * WRAPPING, which is what makes a large body possible at all.
+ *
+ * The pages are written to the width of the 6x8 font - about 46 characters - and
+ * lcd_puts does not wrap, it drops the glyphs that fall off the panel. So the
+ * first attempt at this only enlarged a page whose every line already fitted the
+ * 8x16 column, and since nothing in the firmware is written that narrow, the
+ * setting did nothing here: every page stayed small. Truncating instead was never
+ * an option - a diagnostic readout cut off mid-number is worse than a small one.
+ *
+ * So a line that does not fit is broken and continued on the next row. That
+ * costs the exact display-row count, which the scrollbar and the end-of-page
+ * clamp both need, so it is walked once at open (see info_measure).
+ */
+#define INFO_CONT_INDENT   8     // continuation rows, so a break reads as one
 
-  if (info_is_head(line))
+//-----------------------------------------------------------------------------
+// How many characters of `s` go on one row: everything, if it fits; otherwise up
+// to the last space at or before the limit, and a hard break at the limit if
+// there is no space to use (a long number, a path, a hex dump).
+static int info_wrap_at(const char *s, int cols)
+{
+  int n = (int)strlen(s);
+
+  if (n <= cols)
+    return n;
+
+  for (int i = cols; i > 0; i--)
   {
-    lcd_fill_rect(INFO_X - 5, y - 1, INFO_TEXT_R - INFO_X + 10, 10,
-        INFO_HEAD_BG);
-    lcd_set_color(INFO_HEAD_BG, INFO_TITLE);
-    lcd_puts(INFO_X, y, line + 1);
-    lcd_set_color(INFO_BG, INFO_FG);
-    return;
+    if (' ' == s[i])
+      return i;
   }
 
-  lcd_puts(INFO_X, y, line);
+  return cols;
+}
+
+//-----------------------------------------------------------------------------
+// Display rows one logical line takes
+static int info_rows_of(const info_inst_t *in, const char *line)
+{
+  int rows = 0;
+
+  if (!line)
+    return 1;
+
+  if (info_is_head(line))
+    line++;
+
+  do
+  {
+    int at = info_wrap_at(line, rows ? in->cols_cont : in->cols);
+
+    line += at;
+
+    while (' ' == *line)
+      line++;
+
+    rows++;
+  } while (*line && rows < 8);   // a runaway line is clipped, not endless
+
+  return rows;
+}
+
+//-----------------------------------------------------------------------------
+// One logical line, wrapped. Returns the rows it TAKES, whether or not they were
+// all drawn: a row whose glyphs would reach past y_max is counted and skipped, so
+// the last line on a screen cannot paint over the key hints under the body, and
+// the caller still walks the page by the right number of rows.
+static int info_draw_line(const info_inst_t *in, const char *line, int y,
+    int y_max)
+{
+  bool head = info_is_head(line);
+  int gh = in->large ? 16 : 8;
+  int rows = 0;
+
+  if (!line)
+    return 1;
+
+  if (head)
+  {
+    line++;
+    lcd_set_color(INFO_HEAD_BG, INFO_TITLE);
+  }
+
+  do
+  {
+    int cols = rows ? in->cols_cont : in->cols;
+    int at = info_wrap_at(line, cols);
+
+    if (y + gh <= y_max)
+    {
+      int x = INFO_X + (rows ? INFO_CONT_INDENT : 0);
+      char buf[64];
+      int n = (at > (int)sizeof(buf) - 1) ? (int)sizeof(buf) - 1 : at;
+
+      memcpy(buf, line, n);
+      buf[n] = 0;
+
+      if (head)
+        lcd_fill_rect(INFO_X - 5, y - 1, INFO_TEXT_R - INFO_X + 10,
+            in->large ? 18 : 10, INFO_HEAD_BG);
+
+      lcd_puts(x, y, buf);
+    }
+
+    line += at;
+
+    while (' ' == *line)
+      line++;
+
+    y += in->line_h;
+    rows++;
+  } while (*line && rows < 8);
+
+  if (head)
+    lcd_set_color(INFO_BG, INFO_FG);
+
+  return rows;
 }
 
 //-----------------------------------------------------------------------------
 // Thumb size is the share of the page on screen, so a 600-line page says so
-// before a single key is pressed
+// before a single key is pressed. In display rows, not lines: on a wrapped page
+// the two are different numbers and it is rows that are on the screen.
 static void info_draw_bar(const info_inst_t *in)
 {
   int y = in->y0 - 2;
   int h = INFO_BODY_BOTTOM + 9 - y;
-  int thumb = h * in->vis / in->count;
+  int thumb = h * in->vis / in->rows;
   int pos;
 
   if (thumb < 8)
     thumb = 8;
 
-  pos = (h - thumb) * in->top / (in->count - in->vis);
+  pos = (h - thumb) * in->top / in->max_top;
 
   lcd_fill_rect(INFO_BAR_X, y, INFO_BAR_W, h, INFO_BAR_BG);
   lcd_fill_rect(INFO_BAR_X, y + pos, INFO_BAR_W, thumb, INFO_BAR_FG);
@@ -654,7 +823,7 @@ static void info_draw_position(const info_inst_t *in)
   lcd_fill_rect(erase_x, INFO_TITLE_Y, INFO_TEXT_R - erase_x, 12, INFO_BG);
   lcd_puts(INFO_TEXT_R - (int)strlen(name) * FW_SMALL, INFO_TITLE_Y + 4, name);
 
-  snprintf(buf, sizeof(buf), "%d%%", 100 * in->top / (in->count - in->vis));
+  snprintf(buf, sizeof(buf), "%d%%", 100 * in->top / in->max_top);
   lcd_fill_rect(INFO_TEXT_R - 26, INFO_FOOTER_Y, 26, 8, INFO_BG);
   lcd_puts(INFO_TEXT_R - (int)strlen(buf) * FW_SMALL, INFO_FOOTER_Y, buf);
 }
@@ -668,13 +837,18 @@ static void info_draw_body(const info_inst_t *in)
 
   lcd_fill_rect(11, y, LCD_WIDTH - 22, INFO_BODY_BOTTOM + 9 - y, INFO_BG);
 
-  lcd_set_font(FONT_SMALL);
+  lcd_set_font(in->large ? FONT_LARGE : FONT_SMALL);
   lcd_set_color(INFO_BG, INFO_FG);
 
-  for (int i = 0; i < in->vis && in->top + i < in->count; i++)
-    info_draw_line(info_line(in->page, in->top + i), in->y0 + i * in->line_h);
+  // Rows, not lines: a wrapped line takes more than one, and the screen holds
+  // what it holds. The line that only half fits at the bottom is drawn - its
+  // tail is clipped by the body's own rectangle, and half a visible line is
+  // what says there is more of the page below.
+  for (int i = in->top, row = 0; i < in->count && row < in->vis; i++)
+    row += info_draw_line(in, info_line(in->page, i),
+        in->y0 + row * in->line_h, INFO_BODY_BOTTOM + 9);
 
-  if (in->count > in->vis)
+  if (in->max_top > 0)
   {
     info_draw_bar(in);
     info_draw_position(in);
@@ -806,6 +980,36 @@ static const ui_screen_t info_screen =
 };
 
 //-----------------------------------------------------------------------------
+// The page's total height in display rows, and the last line that may sit at the
+// top - the scroll end, which is the line from which the remaining ones just fill
+// a screen. Both counted with wrapping, so both are exact rather than a guess
+// that leaves a page scrollable past its own end.
+static void info_measure(info_inst_t *in)
+{
+  int tail = 0;
+
+  in->rows = 0;
+
+  for (int i = 0; i < in->count; i++)
+    in->rows += info_rows_of(in, info_line(in->page, i));
+
+  // Backwards from the end until a screen is full: that line is the last useful
+  // top. Same answer as count - vis on a page where nothing wraps.
+  in->max_top = 0;
+
+  for (int i = in->count - 1; i >= 0; i--)
+  {
+    tail += info_rows_of(in, info_line(in->page, i));
+
+    if (tail > in->vis)
+    {
+      in->max_top = i + 1;
+      break;
+    }
+  }
+}
+
+//-----------------------------------------------------------------------------
 void menu_open_info(const info_page_t *page)
 {
   info_inst_t *in = &g_info;
@@ -815,28 +1019,43 @@ void menu_open_info(const info_page_t *page)
       page->count : 0;
   in->top = 0;
   in->heads = 0;
+  in->large = (UI_SCALE_LARGE == config.ui_scale) && in->count > 0;
+  in->cols = (INFO_TEXT_R - INFO_X) / (in->large ? FW_LARGE : FW_SMALL);
+  in->cols_cont = (INFO_TEXT_R - INFO_X - INFO_CONT_INDENT) /
+      (in->large ? FW_LARGE : FW_SMALL);
   in->y0 = INFO_Y;
-  in->line_h = INFO_LINE_H;
-  in->vis = (INFO_BODY_BOTTOM - in->y0) / in->line_h + 1;
+  in->line_h = in->large ? INFO_LINE_H + 8 : INFO_LINE_H;
+
+  // Whole rows only at the large size: the roomy grid's last row has 11 px of
+  // clearance under it, which an 8 px glyph fits into and a 16 px one does not -
+  // it would land on the key hints, which only a full draw repaints.
+  in->vis = in->large ? (INFO_BODY_BOTTOM + 9 - in->y0) / in->line_h :
+      (INFO_BODY_BOTTOM - in->y0) / in->line_h + 1;
+
+  info_measure(in);
 
   // Longer than one screen: the tighter grid, a scrollbar, and the sections
   // it turns out to have. A page that fits is left exactly as it was, body()
   // pages included - those draw on the roomy grid at their own coordinates.
-  if (in->count > in->vis)
+  if (in->rows > in->vis)
   {
     int avail = INFO_BODY_BOTTOM - INFO_SCROLL_Y;
 
     in->y0 = INFO_SCROLL_Y;
-    in->line_h = INFO_SCROLL_LINE_H;
-    in->vis = avail / in->line_h + 1;
+    in->line_h = in->large ? INFO_SCROLL_LINE_H + 8 : INFO_SCROLL_LINE_H;
+    in->vis = in->large ? (INFO_BODY_BOTTOM + 9 - in->y0) / in->line_h :
+        avail / in->line_h + 1;
 
     // A page a line or two over the grid is squeezed onto it rather than
-    // made to scroll for them; below 9 px the 6x8 font starts to touch
-    if (in->count > in->vis && in->count <= avail / 9 + 1)
+    // made to scroll for them; below 9 px the 6x8 font starts to touch. There
+    // is no equivalent squeeze at 8x16 - 18 px is already the font plus two.
+    if (!in->large && in->rows > in->vis && in->rows <= avail / 9 + 1)
     {
       in->line_h = 9;
-      in->vis = in->count;
+      in->vis = in->rows;
     }
+
+    info_measure(in);   // vis changed, so where the page ends changed with it
 
     for (int i = 0; i < in->count; i++)
     {
@@ -852,6 +1071,32 @@ void menu_open_info(const info_page_t *page)
 void menu_action_info(const void *arg)
 {
   menu_open_info((const info_page_t *)arg);
+}
+
+//-----------------------------------------------------------------------------
+// The text size changed under the menus that are open. Every popup on the stack
+// gets laid out again and the whole visible screen is repainted.
+//
+// Both halves are needed. A popup keeps the geometry it was opened with, so
+// without the re-layout its rows draw 6 px taller inside a box that is still the
+// old height - the last row lands outside its own background, on top of whatever
+// is behind the menu - and the value column is right-aligned to a width the
+// labels no longer fit under. And a box that SHRANK leaves its old edge on the
+// screen unless what it covered is drawn again, which only the stack can do.
+void menu_relayout(void)
+{
+  for (int i = 0; i < MENU_MAX_OPEN; i++)
+  {
+    menu_inst_t *m = &g_inst[i];
+
+    if (!m->used || m->fullscreen)
+      continue;
+
+    popup_layout(m);
+    ensure_visible(m);   // fewer rows fit: the cursor may be off the end now
+  }
+
+  ui_request_full_redraw();
 }
 
 //-----------------------------------------------------------------------------

@@ -142,6 +142,11 @@ void menu_open_item_popup(const menu_item_t *item, int x, int y, bool editing);
 void menu_open_info(const info_page_t *page);
 void menu_close_popups(void);
 
+// config.ui_scale changed: lay the open popups out again at the new text size
+// and repaint. The setting is changed from a menu, so the menu doing the
+// changing is one of the ones that has to be rebuilt.
+void menu_relayout(void);
+
 // MI_ACTION helper: .u.action = { menu_action_info, &some_info_page }
 void menu_action_info(const void *arg);
 

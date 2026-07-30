@@ -601,6 +601,11 @@ static int g_toast_timer = TIMER_DISABLE;
 static int g_state = -1;
 static int g_state_timer = TIMER_DISABLE;
 
+// The rate the acquisition is running at, as the top bar last drew it.
+// update_sample_rate() derives it from the timebase and the record length and
+// nothing kept it afterwards; MEASURE_SRATE needs to be able to ask.
+static int g_sample_rate = 0;
+
 // Not static: the scope's menu toggles it directly (see scope_menu.c). The
 // full calibration UI has been in here since the base project, but nothing
 // could ever reach it — scope_init() is only ever called with false.
@@ -785,7 +790,7 @@ typedef struct
   char text[MPANEL_CHARS_MAX + 1];
   uint8_t len;
   uint8_t label_len;
-  uint8_t large;                   // the 8x16 font rather than the 6x8
+  uint8_t size;                    // 0 = 6x8, 1 = 8x16, 2 = 8x16 doubled
   int16_t x, y;                    // top-left, in trace-area pixels
   uint16_t color;
 } PanelPlaced;
@@ -921,20 +926,41 @@ static int decoder_baud_value(void)
 // strip) has to follow.
 static const Font *mpanel_font(void)
 {
-  return (PANEL_FONT_LARGE == config.measure_panel_font) ?
-      FONT_LARGE : FONT_SMALL;
+  return (PANEL_FONT_SMALL == config.measure_panel_font) ?
+      FONT_SMALL : FONT_LARGE;
+}
+
+// ...and how many times over each of its pixels is drawn. There is no 16x32 font
+// in the image, so the biggest band is the 8x16 one doubled - see PANEL_FONT_HUGE.
+static int mpanel_scale(void)
+{
+  return (PANEL_FONT_HUGE == config.measure_panel_font) ? 2 : 1;
+}
+
+// One glyph cell as drawn, which is what the band measures itself in
+static int mpanel_cell_w(void)
+{
+  return mpanel_font()->width * mpanel_scale();
 }
 
 // How many characters of the chosen font fit across the band: 48 in the 6x8,
-// 36 in the 8x16
+// 36 in the 8x16, 18 doubled
 static int mpanel_chars(void)
 {
-  return (GRID_WIDTH - 2 * MPANEL_PAD_X) / mpanel_font()->width;
+  return (GRID_WIDTH - 2 * MPANEL_PAD_X) / mpanel_cell_w();
 }
 
 static int mpanel_row_h(void)
 {
-  return mpanel_font()->height + MPANEL_GAP_Y;
+  return mpanel_font()->height * mpanel_scale() + MPANEL_GAP_Y;
+}
+
+// Two rows of readings, or one at the doubled size: two would be 72 px of the
+// 200 the trace area has, and a band that owns a third of the screen is not a
+// band any more. One row of 16x32 is 36 px - the same share the 8x16 band has.
+static int mpanel_rows(void)
+{
+  return (PANEL_FONT_HUGE == config.measure_panel_font) ? 1 : MPANEL_ROWS;
 }
 
 // Whether the readings are in the band at the bottom or placed as widgets.
@@ -955,7 +981,7 @@ static int mpanel_h(void)
   if (!mpanel_band_mode())
     return 0;
 
-  return 2 * MPANEL_PAD_Y + MPANEL_ROWS * mpanel_row_h() - MPANEL_GAP_Y;
+  return 2 * MPANEL_PAD_Y + mpanel_rows() * mpanel_row_h() - MPANEL_GAP_Y;
 }
 
 static int mpanel_row0(void)
@@ -1381,9 +1407,91 @@ static void fft_build_gradient(void)
 // trace column falls inside the character. Anything outside the font - the
 // half-space the value formatters use before a unit - paints nothing, which is
 // what a blank is: the layout has already reserved its width.
+/*
+ * The three sizes a placed reading comes in, out of the two bits its flags keep
+ * them in: the 6x8 font, the 8x16 font, and the 8x16 font doubled to 16x32.
+ *
+ * A 16x32 reading is four glyphs' worth of screen for one, and it exists for one
+ * reason: it is bigger than anything the top and bottom bars can hold. Those are
+ * 20 and 16 pixels tall and packed end to end, so 8x16 is their ceiling forever -
+ * and the trace area is 300x200 with a compositor that can put text anywhere in
+ * it. "The bar values are too small" is answered here, not in the bars.
+ */
+static int widget_size_of(uint8_t flags)
+{
+  if (flags & PW_HUGE)
+    return 2;
+
+  return (flags & PW_LARGE) ? 1 : 0;
+}
+
+static const Font *widget_font(int size)
+{
+  return size ? FONT_LARGE : FONT_SMALL;
+}
+
+static int widget_scale(int size)
+{
+  return (size > 1) ? 2 : 1;
+}
+
+//-----------------------------------------------------------------------------
+// Where a stored widget actually IS, given how big its text came out.
+//
+// The stored position is a distance from a CORNER (see PanelWidget), so this is
+// where the two meet: the size is known here and nowhere else, and a right- or
+// bottom-anchored reading is placed by its own right or bottom edge. Which is
+// what keeps a reading that grew from moving, and a reading in the bottom right
+// corner from growing off the screen. Clamped, because a layout arranged at one
+// size and read back at another can name a position that no longer exists.
+static void widget_pos(const PanelWidget *w, int wide, int gh, int *px, int *py)
+{
+  int max_x = GRID_WIDTH - 2 - wide;
+  int max_y = GRID_HEIGHT - 2 - gh;
+  int x = (w->flags & PW_ANCHOR_RIGHT) ?
+      (GRID_WIDTH - 2 - wide - w->x * PANEL_WIDGET_STEP) :
+      (w->x * PANEL_WIDGET_STEP);
+  int y = (w->flags & PW_ANCHOR_BOTTOM) ?
+      (GRID_HEIGHT - 2 - gh - w->y * PANEL_WIDGET_STEP) :
+      (w->y * PANEL_WIDGET_STEP);
+
+  *px = (x < 0) ? 0 : ((x > max_x) ? ((max_x < 0) ? 0 : max_x) : x);
+  *py = (y < 0) ? 0 : ((y > max_y) ? ((max_y < 0) ? 0 : max_y) : y);
+}
+
+//-----------------------------------------------------------------------------
+// ...and the way back: store an absolute top-left, measured from whichever
+// corner the reading is nearest. Nothing asks the user which corner - the corner
+// is where they put it, so it follows from the position on every move.
+static void widget_set_pos(PanelWidget *w, int x, int y, int wide, int gh)
+{
+  bool right  = (x + wide / 2) > GRID_WIDTH / 2;
+  bool bottom = (y + gh / 2) > GRID_HEIGHT / 2;
+  int dx = right ? (GRID_WIDTH - 2 - wide - x) : x;
+  int dy = bottom ? (GRID_HEIGHT - 2 - gh - y) : y;
+
+  if (dx < 0)
+    dx = 0;
+  if (dy < 0)
+    dy = 0;
+
+  w->flags &= (uint8_t)~PW_ANCHOR_MASK;
+  w->flags |= (uint8_t)((right ? PW_ANCHOR_RIGHT : 0) |
+      (bottom ? PW_ANCHOR_BOTTOM : 0));
+  w->x = (uint8_t)(dx / PANEL_WIDGET_STEP);
+  w->y = (uint8_t)(dy / PANEL_WIDGET_STEP);
+}
+
+//-----------------------------------------------------------------------------
+// `scale` repeats each pixel row that many times, which is how a widget gets a
+// 16x32 glyph out of an 8x16 font. Doubling and not a second font: there is no
+// 16x32 font in the image and one would cost 3 KB of flash for the ninety-five
+// characters, where this costs a multiply. It is a chunky glyph read from a
+// bench, not typography - and it is the only size the two bars cannot hold, so
+// it is the whole reason the readings can leave them.
 __attribute__((noinline))
 static void mpanel_glyph_column(uint16_t *column, int row0, const Font *font,
-    char ch, int bit, uint16_t color)
+    char ch, int bit, uint16_t color, int scale)
 {
   const uint8_t *bitmap;
 
@@ -1396,8 +1504,11 @@ static void mpanel_glyph_column(uint16_t *column, int row0, const Font *font,
   {
     int i = y * font->width + bit;
 
-    if ((bitmap[i / 8] >> (i % 8)) & 1)
-      column[row0 + y] = color;
+    if (!((bitmap[i / 8] >> (i % 8)) & 1))
+      continue;
+
+    for (int s = 0; s < scale; s++)
+      column[row0 + y * scale + s] = color;
   }
 }
 
@@ -1419,9 +1530,12 @@ static void widgets_paint_column(int c, uint16_t *column)
   for (int i = 0; i < g_placed_n; i++)
   {
     const PanelPlaced *w = &g_placed[i];
-    const Font *font = w->large ? FONT_LARGE : FONT_SMALL;
+    const Font *font = widget_font(w->size);
+    int sc = widget_scale(w->size);
+    int gw = font->width * sc;      // one glyph cell, as drawn
+    int gh = font->height * sc;
     int at = c - w->x;
-    int wide = w->len * font->width;
+    int wide = w->len * gw;
     bool sel = g_layout_edit && i == g_layout_sel;
     int ch_i, bit;
     uint16_t color;
@@ -1431,7 +1545,7 @@ static void widgets_paint_column(int c, uint16_t *column)
     if (at < -1 || at > wide)
       continue;
 
-    for (int y = w->y - 1; y <= w->y + font->height; y++)
+    for (int y = w->y - 1; y <= w->y + gh; y++)
     {
       if (y < 0 || y >= GRID_HEIGHT - 1)
         continue;
@@ -1447,7 +1561,7 @@ static void widgets_paint_column(int c, uint16_t *column)
     {
       uint16_t edge = g_layout_grab ? MEASURE_VOLTAGE_COLOR : MPANEL_EDGE_COLOR;
       int top = w->y - 1;
-      int bot = w->y + font->height;
+      int bot = w->y + gh;
 
       if (-1 == at || at == wide)
       {
@@ -1470,11 +1584,11 @@ static void widgets_paint_column(int c, uint16_t *column)
     if (at < 0 || at >= wide)
       continue;
 
-    ch_i = at / font->width;
-    bit = at % font->width;
+    ch_i = at / gw;
+    bit = (at % gw) / sc;
     color = (ch_i < w->label_len) ? MPANEL_DIM(w->color) : w->color;
 
-    mpanel_glyph_column(column, w->y, font, w->text[ch_i], bit, color);
+    mpanel_glyph_column(column, w->y, font, w->text[ch_i], bit, color, sc);
   }
 }
 
@@ -1498,15 +1612,17 @@ static void mpanel_paint_column(int c, uint16_t *column)
 
     for (int r = 0; r < 2; r++)
       mpanel_glyph_column(column, row0 + r * (font->height + MPANEL_GAP_Y),
-          font, g_mpanel_text[r][ch_i], bit, LCD_WHITE_COLOR);
+          font, g_mpanel_text[r][ch_i], bit, LCD_WHITE_COLOR, 1);
 
     return;
   }
 
   {
     const Font *font = mpanel_font();
-    int ch_i = x / font->width;
-    int bit = x % font->width;
+    int sc = mpanel_scale();
+    int cw = font->width * sc;
+    int ch_i = x / cw;
+    int bit = (x % cw) / sc;
 
     // At most one pair per row covers this character, and there are never more
     // than a handful of them - a scan is cheaper than a map to look it up in
@@ -1524,7 +1640,7 @@ static void mpanel_paint_column(int c, uint16_t *column)
       color = (at < cell->label_len) ? MPANEL_DIM(cell->color) : cell->color;
 
       mpanel_glyph_column(column, row0 + cell->row * mpanel_row_h(), font,
-          cell->text[at], bit, color);
+          cell->text[at], bit, color, sc);
     }
   }
 }
@@ -2282,6 +2398,41 @@ static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
       value = scratch;
       break;
     }
+
+    /*
+     * The bars' own numbers, so that they can be placed where they can be read.
+     * Formatted exactly as the bar formats them - same helper, same width - and
+     * they come from config, so they have a value with no signal on the probe
+     * and keep it while the acquisition is stopped.
+     */
+    case MEASURE_VDIV:
+      tag = "v"; label = "V/div";
+      value = vs_label(config.vertical_scale);
+      break;
+
+    case MEASURE_TDIV:
+      tag = "t"; label = "s/div"; kind = MK_TIME;
+      value = hs_str[(unsigned)config.horizontal_scale < HS_COUNT ?
+          config.horizontal_scale : 0];
+      break;
+
+    case MEASURE_TRIG:
+      // Referred to the vertical position, like the status line's own readout:
+      // what the bar says and what a widget says have to be the same number
+      tag = "l"; label = "trig";
+      value = format_voltage(config.trigger_level_mv -
+          config.vertical_position_mv, true);
+      break;
+
+    case MEASURE_SRATE:
+      // With the unit spelled out, unlike the top bar's own field: there the
+      // number sits under the rate LIMIT in a corner that says what it is, and
+      // a widget dropped in the middle of the grid has no such neighbour
+      tag = "r"; label = "rate"; kind = MK_TIME;
+      present = g_sample_rate > 0;
+      snprintf(scratch, sizeof(scratch), "%sS/s", format_sps(g_sample_rate));
+      value = scratch;
+      break;
 
     case MEASURE_THD:
       signal_info_update();
@@ -3613,10 +3764,20 @@ static void widgets_update(const ScopeMeasure *sm)
 
     p->len       = (uint8_t)len;
     p->label_len = (uint8_t)strlen(item.label);
-    p->large     = (w->flags & PW_LARGE) ? 1 : 0;
-    p->x         = (int16_t)(w->x * PANEL_WIDGET_STEP);
-    p->y         = (int16_t)(w->y * PANEL_WIDGET_STEP);
+    p->size      = (uint8_t)widget_size_of(w->flags);
     p->color     = measure_item_color(&item);
+
+    // The text's own size decides where a corner-anchored reading starts, and
+    // the text is only known now
+    {
+      const Font *font = widget_font(p->size);
+      int sc = widget_scale(p->size);
+      int x, y;
+
+      widget_pos(w, len * font->width * sc, font->height * sc, &x, &y);
+      p->x = (int16_t)x;
+      p->y = (int16_t)y;
+    }
   }
 
   if (g_placed_n == PANEL_WIDGETS_MAX &&
@@ -3711,7 +3872,7 @@ static void mpanel_update(void)
       // stop when there is no third row to wrap into
       if (x + cell->len > chars)
       {
-        if (++row >= MPANEL_ROWS)
+        if (++row >= mpanel_rows())
           break;
 
         x = 0;
@@ -3734,19 +3895,30 @@ static void mpanel_update(void)
 
       snprintf(more, sizeof(more), "+%d more", hidden);
 
+      // ...but it says it in two characters rather than eating the only reading
+      // on the band. At 16x32 a row is eighteen characters and one reading fills
+      // twelve of them, so "+4 more" does not fit and "+4" does - and a band
+      // showing nothing but "+4 more" (which is what this did) has replaced the
+      // measurement with a note about the measurements.
+      if (x + (int)strlen(more) > chars)
+        snprintf(more, sizeof(more), "+%d", hidden);
+
       if (x + (int)strlen(more) > chars && at > 0)
       {
         at--;                     // no room left: the marker takes its place
         x = next[at].x;
         row = next[at].row;
         hidden++;
+        snprintf(more, sizeof(more), "+%d more", hidden);
+
+        if (x + (int)strlen(more) > chars)
+          snprintf(more, sizeof(more), "+%d", hidden);
       }
       else
       {
         row = (at > 0) ? next[at - 1].row : 0;
       }
 
-      snprintf(more, sizeof(more), "+%d more", hidden);
       mpanel_cell_set(&next[at], "", more, MPANEL_NONE_COLOR);
       next[at].x = (uint8_t)x;
       next[at].row = (uint8_t)row;
@@ -3836,11 +4008,16 @@ static void layout_seed_from_band(void)
   ScopeMeasure sm;
   MeasureItem items[MEASURE_ITEMS_MAX];
   const Font *font = mpanel_font();
-  bool large = (PANEL_FONT_LARGE == config.measure_panel_font);
-  int chars = (GRID_WIDTH - 2 * MPANEL_PAD_X) / font->width;
-  int row_h = font->height + MPANEL_GAP_Y;
-  int band_y = GRID_HEIGHT - 1 - (2 * MPANEL_PAD_Y + MPANEL_ROWS * row_h -
+  int sc = mpanel_scale();
+  int cell = font->width * sc;
+  int gh = font->height * sc;
+  int chars = mpanel_chars();
+  int row_h = mpanel_row_h();
+  int rows = mpanel_rows();
+  int band_y = GRID_HEIGHT - 1 - (2 * MPANEL_PAD_Y + rows * row_h -
       MPANEL_GAP_Y) + MPANEL_PAD_Y;
+  uint8_t size_flags = (PANEL_FONT_HUGE == config.measure_panel_font) ? PW_HUGE :
+      ((PANEL_FONT_LARGE == config.measure_panel_font) ? PW_LARGE : 0);
   int n, placed = 0, x = 0, row = 0;
 
   layout_mock_measure(&sm);
@@ -3855,16 +4032,20 @@ static void layout_seed_from_band(void)
 
     if (x + len > chars)
     {
-      if (++row >= MPANEL_ROWS)
+      if (++row >= rows)
         break;
 
       x = 0;
     }
 
     w->metric = (uint8_t)items[i].metric;
-    w->x = (uint8_t)((MPANEL_PAD_X + x * font->width) / PANEL_WIDGET_STEP);
-    w->y = (uint8_t)((band_y + row * row_h) / PANEL_WIDGET_STEP);
-    w->flags = large ? PW_LARGE : 0;
+    w->flags = size_flags;
+
+    // Through the anchor, so that the row the band put along the bottom stays
+    // along the bottom - and so that a reading in the right half is measured
+    // from the right edge, which is what it will grow towards later
+    widget_set_pos(w, MPANEL_PAD_X + x * cell, band_y + row * row_h,
+        len * cell, gh);
 
     x += len + MPANEL_GUTTER;
     placed++;
@@ -3952,12 +4133,22 @@ static void layout_move(int dx, int dy)
 {
   PanelWidget *w = layout_selected();
   const PanelPlaced *p = &g_placed[g_layout_sel];
-  const Font *font = (w->flags & PW_LARGE) ? FONT_LARGE : FONT_SMALL;
-  int wide = (p->len ? p->len : 8) * font->width;
-  int max_x = (GRID_WIDTH - 2 - wide) / PANEL_WIDGET_STEP;
-  int max_y = (GRID_HEIGHT - 2 - font->height) / PANEL_WIDGET_STEP;
-  int x = w->x + dx;
-  int y = w->y + dy;
+  int size = widget_size_of(w->flags);
+  const Font *font = widget_font(size);
+  int sc = widget_scale(size);
+  int wide = (p->len ? p->len : 8) * font->width * sc;
+  int gh = font->height * sc;
+  int max_x = GRID_WIDTH - 2 - wide;
+  int max_y = GRID_HEIGHT - 2 - gh;
+  int x, y;
+
+  // In screen pixels, not in the stored units: the arrows move a reading across
+  // the screen, and which corner that ends up being measured from is decided
+  // afterwards, by where it lands
+  widget_pos(w, wide, gh, &x, &y);
+
+  x += dx * PANEL_WIDGET_STEP;
+  y += dy * PANEL_WIDGET_STEP;
 
   if (max_x < 0)
     max_x = 0;
@@ -3965,8 +4156,17 @@ static void layout_move(int dx, int dy)
   if (max_y < 0)
     max_y = 0;
 
-  w->x = (uint8_t)((x < 0) ? 0 : ((x > max_x) ? max_x : x));
-  w->y = (uint8_t)((y < 0) ? 0 : ((y > max_y) ? max_y : y));
+  if (x < 0)
+    x = 0;
+  else if (x > max_x)
+    x = max_x;
+
+  if (y < 0)
+    y = 0;
+  else if (y > max_y)
+    y = max_y;
+
+  widget_set_pos(w, x, y, wide, gh);
 }
 
 //-----------------------------------------------------------------------------
@@ -4078,7 +4278,17 @@ static void layout_edit_keys(int buttons)
   }
   else if (buttons & BTN_F1)
   {
-    w->flags ^= PW_LARGE;
+    // 6x8 -> 8x16 -> 16x32 -> 6x8. Three steps where there used to be a toggle,
+    // because the third one is the point of the screen: it is the only size that
+    // is bigger than anything the two bars can hold.
+    int size = (widget_size_of(w->flags) + 1) % 3;
+
+    w->flags &= (uint8_t)~PW_SIZE_MASK;
+    w->flags |= (1 == size) ? PW_LARGE : ((2 == size) ? PW_HUGE : 0);
+
+    // Growing one can push it off the right edge or the bottom; the clamp lives
+    // in the move, so ask for a move of nothing
+    layout_move(0, 0);
   }
   else if (buttons & BTN_EDGE)
   {
@@ -4094,7 +4304,10 @@ static void layout_edit_keys(int buttons)
       config.measure_widget[i].metric = (uint8_t)layout_unused_metric();
       config.measure_widget[i].x = 1;
       config.measure_widget[i].y = 1;
-      config.measure_widget[i].flags = w->flags;
+      // The size of the one it was added from, but never its corner: x and y
+      // here mean the top left one, and inheriting a bottom-right anchor would
+      // put the new reading in the opposite corner from where it says it is
+      config.measure_widget[i].flags = w->flags & PW_SIZE_MASK;
       g_layout_sel = i;
       g_layout_grab = true;
       break;
@@ -4437,6 +4650,10 @@ static void draw_miniview(int trigger_offset, int window_offset, int window_widt
 static void draw_sample_rates(int sample_rate_limit, int sample_rate)
 {
   char *str;
+
+  // Kept for MEASURE_SRATE: the rate is derived here, from the timebase and the
+  // record, and nothing else holds on to it afterwards
+  g_sample_rate = sample_rate;
 
   lcd_set_font(FONT_SMALL);
 

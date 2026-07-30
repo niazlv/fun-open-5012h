@@ -46,6 +46,10 @@ void ui_push(const ui_screen_t *screen, void *ctx);
 void ui_pop(void);
 void ui_pop_to_root(void);
 void ui_request_redraw(void);
+
+// ...and a repaint of every visible screen, for something that changed the
+// LAYOUT rather than a value on it (see config.ui_scale)
+void ui_request_full_redraw(void);
 const ui_screen_t *ui_top_screen(void);
 int ui_depth(void);
 

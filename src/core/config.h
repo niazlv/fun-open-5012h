@@ -81,6 +81,28 @@ enum
   MEASURE_PERIOD,    // time of one whole cycle - what the frequency is 1/x of
   MEASURE_WIDTH_POS, // and how that cycle splits: time above the mid level
   MEASURE_WIDTH_NEG, // and time below it. T+ / T is the duty cycle.
+
+  /*
+   * ...and the four below are not measurements of the signal at all: they are
+   * what the instrument is SET to - the numbers the top and bottom bars carry.
+   *
+   * They are in this list so that they can be PLACED. The bars are 20 and 16
+   * pixels tall and full end to end, which caps their text at the 8x16 font
+   * forever; the trace area is 300x200 and the widget compositor can put text
+   * anywhere in it at any size. So the answer to "the bar values are too small
+   * to read" is to let the bar values leave the bar - see UI_SCALE_* below for
+   * the half of that which the menus get, and PW_HUGE for the size step.
+   *
+   * They read from config rather than from a record, so unlike everything above
+   * they have a value before the first acquisition and keep it while stopped.
+   * The panel BAND does not offer them (measure_build_items has no flag for
+   * them, deliberately - the band is a measurements strip and these are
+   * already on screen a few pixels away); a widget and a status-line slot do.
+   */
+  MEASURE_VDIV,      // volts per division, probe included - the scale field
+  MEASURE_TDIV,      // time per division - the timebase field
+  MEASURE_TRIG,      // trigger level, from the vertical position like the bar's
+  MEASURE_SRATE,     // the sample rate the acquisition is actually running at
   MEASURE_COUNT,
 };
 
@@ -98,6 +120,16 @@ enum
 {
   PANEL_FONT_SMALL = 0,   // 6x8: six readings
   PANEL_FONT_LARGE,       // 8x16: four, readable across a bench
+  // 16x32 - the 8x16 font doubled - and one row instead of two: two rows of it
+  // would be 72 of the trace area's 200 pixels, and a band that owns a third of
+  // the screen is not a band. One row is eighteen characters, so it holds ONE
+  // reading and says how many were left out, as it does at any size. For several
+  // big readings there is the layout editor, which can put one in each corner.
+  //
+  // This is the size the two bars cannot hold: they are 20 and 16 pixels tall
+  // and full end to end, so 8x16 is their ceiling no matter what any setting
+  // says. The band is inside the trace area, which has 200 rows, so it can.
+  PANEL_FONT_HUGE,
   PANEL_FONT_COUNT,
 };
 
@@ -120,7 +152,7 @@ enum
 };
 
 /*
- * One placed reading: which metric, where its top-left corner is, and how big.
+ * One placed reading: which metric, where it is, and how big.
  *
  * Four bytes, and packed on purpose - the layout is ten of these and every byte
  * of Config is resident twice in a TCM that counts them. Coordinates are in
@@ -128,14 +160,39 @@ enum
  * editor snaps to: 300x200 pixels then fits a byte each with room to spare, and
  * a layout is legible in a hex dump.
  *
+ * WHERE FROM is the anchor. The position is measured from one of the trace area's
+ * four corners - the one the widget sits nearest - and from the widget's own
+ * matching corner, so what is stored is a distance from an EDGE rather than a
+ * top-left pixel. Two things follow, and both are why:
+ *
+ *   - A reading that grows stays where it was put. At 6x8 a reading is 60 px
+ *     wide, at 16x32 it is 160; anchored top-left, the difference all appears on
+ *     its right, so a reading in the bottom right corner grew off the screen and
+ *     one in a row grew over its neighbour. Anchored to the corner it is in, it
+ *     grows towards the middle, which is where the room is.
+ *   - The layout survives its own geometry. Nothing measured from the right or
+ *     the bottom edge has to be re-edited when what it is measured against moves.
+ *
+ * TOP_LEFT is zero, so a layout stored before the anchor existed means exactly
+ * what it did: a distance from the top left corner.
+ *
  * metric == MEASURE_NONE is an empty slot. Slots are not kept in any order -
  * the editor places them, and where a reading sits is the whole point.
  */
 #define PANEL_WIDGET_STEP    4
 #define PANEL_WIDGETS_MAX    10
 
-// flags
+// flags. The size is two bits rather than a small integer so that PW_LARGE
+// keeps the value it already has on flash; HUGE wins if both are somehow set.
 #define PW_LARGE             0x01   // the 8x16 font instead of the 6x8
+#define PW_HUGE              0x02   // ...and that font at double size, 16x32
+#define PW_SIZE_MASK         0x03
+
+// ...and which corner the position is measured from. The editor sets these from
+// where the reading is; nothing asks the user to pick a corner.
+#define PW_ANCHOR_RIGHT      0x04   // x is the gap to the right edge
+#define PW_ANCHOR_BOTTOM     0x08   // y is the gap to the bottom edge
+#define PW_ANCHOR_MASK       0x0c
 
 typedef struct
 {
@@ -144,6 +201,30 @@ typedef struct
   uint8_t y;
   uint8_t flags;
 } PanelWidget;
+
+/*
+ * How big the text in the MENUS is - the popups, their submenus and the modal
+ * pages. Zero is the 6x8 grid this has always had, so a config saved before the
+ * setting existed looks the way it did.
+ *
+ * Two steps and not a multiplier, because 320x240 is the whole argument. LARGE
+ * is Terminus 8x16, a font drawn at that size rather than a doubled 6x8, and it
+ * is the last step a menu row has room for: the widest label here is seventeen
+ * characters and a popup has to hold a value to its right on the same row.
+ * Doubling instead (12x16) would cost 50% more width for the same height and
+ * read blockier; 16x32 does not fit a row at all.
+ *
+ * It does not touch the oscilloscope's own two bars. Those are 20 and 16 pixels
+ * tall and full end to end - there is no larger font that fits them, whatever
+ * this says. What answers that is MEASURE_VDIV..MEASURE_SRATE with PW_HUGE:
+ * the bar's numbers, on the grid, at 16x32.
+ */
+enum
+{
+  UI_SCALE_NORMAL = 0,    // 6x8 rows, 20 px: eleven of them on a screen
+  UI_SCALE_LARGE,         // 8x16 rows, 26 px: nine, and they scroll
+  UI_SCALE_COUNT,
+};
 
 // What to draw between samples once the screen has more pixels than the
 // record has samples. Straight lines are the default because they invent
@@ -495,14 +576,20 @@ typedef struct
   // before, which is the more urgent thing to be shown.
   int      startup_app_mode;
 
+  // How big the menus draw their text: UI_SCALE_*. Zero is the size they have
+  // always been, which is what a config saved before this existed reads as.
+  // This is a display preference and nothing in the instrument reads it, so
+  // there is no on_change - the next menu drawn is drawn at the new size.
+  int      ui_scale;
+
   /*
    * The reserve. A new field is carved out of HERE, shrinking the array by
    * exactly what it takes so that sizeof(Config) and every offset below stay
    * put - an entry whose size does not match is not read, and the padding is
    * what keeps that from being every entry on the flash after every change.
    *
-   * Two words - version 3 started with four, and probe_ratio and
-   * startup_app_mode above have each taken one. Two things bound the rest, and
+   * One word - version 3 started with four, and probe_ratio, startup_app_mode
+   * and ui_scale above have each taken one. Two things bound the rest, and
    * neither is generous:
    *
    * The flash. crc has to be the last word of the struct and the struct has to
@@ -521,7 +608,7 @@ typedef struct
    * a layout forward now, so another version costs a row in g_old_layouts, a
    * static assert, and nothing else.
    */
-  uint32_t padding[2];
+  uint32_t padding[1];
 
   // The calibration block. Contiguous, and last before crc, on purpose:
   // calib_crc covers exactly the bytes from calib_channel_delta up to crc. A
@@ -547,6 +634,9 @@ extern const char *const probe_ratio_labels[PROBE_RATIO_COUNT];
 
 // What config.probe_ratio names, whatever is stored there
 int config_probe_ratio(void);
+
+// The two text sizes the menus offer, in UI_SCALE_* order
+extern const char *const ui_scale_labels[UI_SCALE_COUNT];
 
 /*- Implementations ---------------------------------------------------------*/
 /*

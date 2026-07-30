@@ -105,6 +105,15 @@ void ui_request_redraw(void)
 }
 
 //-----------------------------------------------------------------------------
+// Everything visible, from the ground up, exactly as a pop repaints what it
+// uncovers. For a screen that has changed SIZE rather than contents: a redraw of
+// the top alone leaves whatever it used to cover standing where it was.
+void ui_request_full_redraw(void)
+{
+  schedule_redraw(base_visible_index());
+}
+
+//-----------------------------------------------------------------------------
 const ui_screen_t *ui_top_screen(void)
 {
   return g_depth ? g_stack[g_depth - 1].scr : NULL;

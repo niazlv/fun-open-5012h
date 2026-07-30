@@ -86,7 +86,7 @@ static const char *const g_panel_layout_labels[] = { "Band", "Widgets" };
 _Static_assert(ARRAY_SIZE(g_panel_layout_labels) == PANEL_LAYOUT_COUNT,
     "one label per PANEL_LAYOUT_* value");
 
-static const char *const g_panel_font_labels[] = { "Small", "Large" };
+static const char *const g_panel_font_labels[] = { "Small", "Large", "Huge" };
 static const char *const g_panel_bg_labels[] = { "Dim", "Solid", "None" };
 
 _Static_assert(ARRAY_SIZE(g_panel_font_labels) == PANEL_FONT_COUNT,
@@ -103,6 +103,9 @@ static const char *const g_measure_slot_labels[] =
   "f (spectrum)", "? (above nyquist)",
   "Vp (from 0 V)", "Vmax", "Vmin", "Vamp (top-base)",
   "T (period)", "T+ (high)", "T- (low)",
+  // Not measurements: the settings the two bars carry. Here so that a bar's
+  // own number can be put in a widget, at a size the bar has no room for.
+  "V/div (setting)", "s/div (setting)", "Trigger level", "Sample rate",
 };
 
 // The slot choice cycles through MEASURE_COUNT entries, so this array MUST
@@ -1197,7 +1200,7 @@ static const menu_item_t g_panel_items[] =
     .desc = "Move the readings around on a mock trace",
     .u.action = { action_layout_edit, NULL } },
   { .kind = MI_CHOICE, .label = "Size",
-    .desc = "6x8: six readings. 8x16: four, bigger",
+    .desc = "6x8: six readings. 8x16: four. 16x32: two",
     .u.choice = { &config.measure_panel_font, g_panel_font_labels,
         PANEL_FONT_COUNT, panel_look_changed } },
   { .kind = MI_CHOICE, .label = "Background",

@@ -402,6 +402,14 @@ static const int g_probe_ratio_values[PROBE_RATIO_COUNT] =
 {
   1, 2, 5, 10, 20, 25, 50, 100, 200, 500, 1000,
 };
+
+// In UI_SCALE_* order. "Normal" first because index 0 is what a config saved
+// before the setting existed reads as, and it is the size those menus were
+// drawn at - a firmware update is not a reason for the interface to change size.
+const char *const ui_scale_labels[UI_SCALE_COUNT] =
+{
+  "Normal", "Large",
+};
 static int g_config_timer = 0;
 static int g_entry_offset;
 static Config g_config_copy;
@@ -1859,6 +1867,7 @@ static const struct
   FIELD(grid_mode, FT_INT),
   FIELD(roll_from, FT_INT),
   FIELD(startup_app_mode, FT_INT),
+  FIELD(ui_scale, FT_INT),
 
   FIELD(snake_high_score, FT_INT),
   FIELD(flappy_high_score, FT_INT),
@@ -2097,8 +2106,11 @@ void config_reset(void)
   // The band, and an empty layout behind it: the editor fills that in from
   // whatever the band is showing the first time it is opened
   config.measure_layout_mode    = PANEL_LAYOUT_BAND;
-  config.probe_ratio            = 0;   // 10x, the one nearly everybody has
+  config.probe_ratio            = 0;   // 1x: no scaling until a probe is named
   memset(config.measure_widget, 0, sizeof(config.measure_widget));
+
+  // The menus at the size they have always been drawn at
+  config.ui_scale               = UI_SCALE_NORMAL;
 
   // Straight into the instrument when the device is switched on. The reset
   // combo means "I have made a mess of the settings", and the stock answer to
