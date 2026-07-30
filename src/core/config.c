@@ -42,8 +42,43 @@
 #include "debug_coredump.h"
 
 /*- Definitions -------------------------------------------------------------*/
-#define MAGIC              0x78656c41
-#define VERSION            1
+/*
+ * "NIAZ", the same way "Alex" was written: the four bytes read out of flash in
+ * order spell it, so a hex dump of the store says whose layout it is without
+ * anything having to be decoded.
+ *
+ * The magic changes with the version on purpose. The two together are what
+ * tells an entry of this layout from one of the previous, and either alone
+ * would have done - but a store the size of a sector is read by eye often
+ * enough (the flash viewer, `spiflash.py dump`) that "which firmware wrote
+ * this" being legible at a glance is worth the four bytes it already costs.
+ */
+#define MAGIC              0x5A41494E
+#define VERSION            2
+
+// ...and what version 1 wrote there: Alex Taradov's, this project's origin
+#define V1_MAGIC           0x78656c41
+
+/*
+ * Version 1, as it is on the flash of every unit that has not run this
+ * firmware yet. These numbers describe a layout that is finished being edited
+ * - they are not offsetof() into anything, because the struct they belong to
+ * no longer exists in this build - and adopt_v1_entry() reads an old entry
+ * with them.
+ *
+ * What makes that a memcpy rather than a copy list: version 2 appended its
+ * fields and left every version 1 field exactly where it was, so an old entry
+ * IS a valid version 2 entry for its first V1_PREFIX_LENGTH bytes. Only the
+ * calibration block moved, because it has to stay last, and it moved whole.
+ *
+ * The asserts below are what keep that true. Break one and the migration is
+ * silently reading the wrong bytes into this unit's calibration.
+ */
+#define V1_VERSION         1
+#define V1_SIZE            416
+#define V1_PREFIX_LENGTH   336   // magic .. draw_mode
+#define V1_CALIB_OFFSET    336
+#define V1_CRC_LENGTH      408   // what version 1's crc covered = offsetof(crc)
 
 /*
  * Where the store lives. Two backends, picked at build time:
@@ -99,8 +134,11 @@
 /*
  * On the serial part: 128 slots of 512 bytes in the 64 KB at FLASH_STORE_BASE,
  * eight to an erase sector. The same rotation count as the internal store, at
- * an eighth of the entry size - sizeof(Config) is 416, and the internal 1 KB
- * slot was chosen against a 128 KB erase unit that no longer applies.
+ * an eighth of the entry size - sizeof(Config) is 440, padding[] included, and
+ * the internal 1 KB slot was chosen against a 128 KB erase unit that no longer
+ * applies. The slot bounds how far the struct may ever grow: into 512 bytes and
+ * no further without halving the rotation. What bounds it in practice is the
+ * TCM, long before that - see padding[] in config.h.
  *
  * Address 0x7E0000 is above everything an asset image may touch and below the
  * page that was already on the chip. Both the loader application and its host
@@ -153,8 +191,22 @@ _Static_assert(CRC_LENGTH + sizeof(uint32_t) <= sizeof(Config),
 // out of padding[] / decoder_reserved[] instead, and verify with a host
 // build that these numbers did not move.
 _Static_assert(offsetof(Config, measure_line) == 248, "layout shifted: measure_line");
-_Static_assert(offsetof(Config, calib_channel_delta) == 336, "layout shifted: calibration block");
-_Static_assert(offsetof(Config, crc) == 408, "layout shifted: crc / CRC_LENGTH");
+_Static_assert(offsetof(Config, calib_channel_delta) == 360, "layout shifted: calibration block");
+_Static_assert(offsetof(Config, crc) == 432, "layout shifted: crc / CRC_LENGTH");
+
+// ...and the half of it a version 1 store is read with. The prefix must stay
+// byte-identical or adopt_v1_entry() copies the wrong fields into the wrong
+// places, quietly: the entry it builds would still checksum, so nothing later
+// would notice. A field inserted anywhere above show_vp fires one of these.
+_Static_assert(offsetof(Config, show_vp) == V1_PREFIX_LENGTH,
+    "version 1's fields must keep their offsets: the migration copies them "
+    "as one block, ending where version 2's own fields begin");
+_Static_assert(offsetof(Config, draw_mode) == V1_PREFIX_LENGTH - sizeof(int),
+    "draw_mode was the last field version 1 had");
+_Static_assert(offsetof(Config, calib_crc) < V1_PREFIX_LENGTH,
+    "calib_crc is read from a version 1 entry at the same offset as its own");
+_Static_assert(sizeof(Config) > V1_SIZE,
+    "version 2 is version 1 plus fields; it cannot be smaller");
 
 /*
  * The calibration block, sealed on its own by config.calib_crc.
@@ -183,6 +235,13 @@ _Static_assert(offsetof(Config, calib_crc) + sizeof(uint32_t) <= CALIB_OFFSET,
 _Static_assert(CALIB_OFFSET + CALIB_LENGTH == CRC_LENGTH,
     "the calibration block must run to the end of the CRC region: a field "
     "appended after it would be sealed by calib_crc without meaning to be");
+
+// The block itself did not change between the two versions, only where it
+// sits. That is what lets a migrated entry keep its calib_crc untouched: the
+// seal is a checksum of these bytes, and they are the same bytes.
+_Static_assert(CALIB_LENGTH == V1_CRC_LENGTH - V1_CALIB_OFFSET,
+    "version 1's calibration block was a different size: it cannot be moved "
+    "with one memcpy, and its seal would not carry over");
 
 #define TIMER_INTERVAL     1000
 
@@ -428,50 +487,43 @@ static bool important_changed(void)
   return false;
 }
 
-//-----------------------------------------------------------------------------
-// An entry, wherever the store is.
-//
-// Internal flash is memory mapped, so this is a cast and every caller may hold
-// the pointer for as long as it likes. The serial part is not: an entry has to
-// be fetched over the bus into a buffer, and the pointer handed back is that
-// buffer. One entry deep is enough - nothing here compares two at once, they
-// are all "look at entry i, decide, move on" - but it is a real constraint on
-// anything written later, so it is worth stating: the pointer is valid until
-// the next call.
+/*
+ * An entry, wherever the store is, into storage the CALLER owns.
+ *
+ * It used to hand back a pointer into a static buffer one entry deep, and that
+ * buffer was a third resident copy of Config in a TCM with nothing to spare -
+ * 440 bytes of the ~500 that stood between this firmware and the linker's
+ * stack reserve. Nothing needed it to outlive the call that read it: every
+ * caller here is "look at entry i, decide, move on", and the two that want a
+ * whole entry (the boot-time load and the flash viewer) can put it on a stack
+ * that has 16 KB reserved. So they do, and the settings struct got room to
+ * grow again.
+ *
+ * Internal flash is memory mapped, so this is a copy out of it; the serial part
+ * is a bus transfer. A read that fails leaves `out` filled with something that
+ * cannot pass is_entry_valid(), rather than whatever was in it before - a stale
+ * entry that validates would be adopted as this one.
+ */
 #if STORE_INTERNAL
 
-static inline const Config *get_entry(int index)
+static bool read_entry(int index, Config *out)
 {
-  return (const Config *)(STORAGE_START + index * ENTRY_SIZE);
-}
+  memcpy(out, (const void *)(STORAGE_START + index * ENTRY_SIZE), sizeof(Config));
 
-static inline void entry_cache_drop(void) { }
+  return true;
+}
 
 #else
 
-static Config g_entry_cache;
-static int g_entry_cached = -1;
-
-static const Config *get_entry(int index)
+static bool read_entry(int index, Config *out)
 {
-  if (index != g_entry_cached)
-  {
-    // A read that does not happen leaves the buffer holding the previous
-    // entry, which would validate and be adopted as this one. Fill it with
-    // something that cannot pass is_entry_valid instead.
-    if (!flash_read(STORAGE_START + index * ENTRY_SIZE,
-          (uint8_t *)&g_entry_cache, sizeof(Config)))
-      memset(&g_entry_cache, 0, sizeof(Config));
+  if (flash_read(STORAGE_START + index * ENTRY_SIZE, (uint8_t *)out,
+        sizeof(Config)))
+    return true;
 
-    g_entry_cached = index;
-  }
+  memset(out, 0, sizeof(Config));
 
-  return &g_entry_cache;
-}
-
-static void entry_cache_drop(void)
-{
-  g_entry_cached = -1;
+  return false;
 }
 
 #endif
@@ -646,9 +698,11 @@ static void store_entry(void);
 // that went nowhere, which is what the store used to do.
 static void write_verify(void)
 {
-  const Config *entry = get_entry(g_entry_offset / ENTRY_SIZE);
+  Config entry;
 
-  if (is_entry_valid(entry))
+  read_entry(g_entry_offset / ENTRY_SIZE, &entry);
+
+  if (is_entry_valid(&entry))
   {
     g_status = CONFIG_STORE_OK;
     g_saves_ok++;
@@ -661,7 +715,7 @@ static void write_verify(void)
   // finished, so it always reads back zero. ffffffff means nothing was
   // programmed, MAGIC means the entry landed and the checksum is what
   // disagrees, anything else means the data is wrong.
-  g_last_entry_word = *(const uint32_t *)entry;
+  g_last_entry_word = *(const uint32_t *)&entry;
 
   // The entry did not read back. One bad slot should not cost the user their
   // settings, so rewrite the same snapshot into the next one.
@@ -752,10 +806,12 @@ static void fmc_unlock(void) { }
 #endif // STORE_INTERNAL
 
 //-----------------------------------------------------------------------------
-// The seal over the calibration block alone, see CALIB_OFFSET
-static uint32_t calib_crc_calc(const Config *cfg)
+// The seal over the calibration block alone, see CALIB_OFFSET. `at` is where
+// the block sits in the entry being read, which is not the same in a version 1
+// entry as in one of ours - the block is identical, it just moved.
+static uint32_t calib_crc_calc_at(const Config *cfg, unsigned at)
 {
-  return crc32_calc((uint32_t *)((uint8_t *)cfg + CALIB_OFFSET), CALIB_LENGTH);
+  return crc32_calc((uint32_t *)((uint8_t *)cfg + at), CALIB_LENGTH);
 }
 
 //-----------------------------------------------------------------------------
@@ -763,22 +819,39 @@ static uint32_t calib_crc_calc(const Config *cfg)
 // The two rejected constants are the two ways of holding no calibration at
 // all: a blank slot reads 0xffffffff throughout, and an entry saved before
 // calib_crc was carved out of padding reads 0 there.
-static bool calib_is_valid(const Config *entry)
+//
+// calib_crc itself is at the same offset in both layouts (a static assert says
+// so), so one field read serves either: what differs is only which bytes it is
+// the seal OF, and both are tried. A version 1 entry that has outlived its
+// preferences still has this unit's calibration in it, and the whole reason
+// the second seal exists is to be able to take it.
+static unsigned calib_offset_in(const Config *entry)
 {
   if (0 == entry->calib_crc || 0xffffffff == entry->calib_crc)
-    return false;
+    return 0;
 
-  return calib_crc_calc(entry) == entry->calib_crc;
+  if (calib_crc_calc_at(entry, CALIB_OFFSET) == entry->calib_crc)
+    return CALIB_OFFSET;
+
+  if (calib_crc_calc_at(entry, V1_CALIB_OFFSET) == entry->calib_crc)
+    return V1_CALIB_OFFSET;
+
+  return 0;
+}
+
+static bool calib_is_valid(const Config *entry)
+{
+  return calib_offset_in(entry) != 0;
 }
 
 //-----------------------------------------------------------------------------
 // Copies the calibration block out of an entry, leaving the rest of config
 // alone. The block is contiguous by construction (see the static asserts), so
 // this is one memcpy and not a field-by-field list that could go stale.
-static void calib_adopt(const Config *entry)
+static void calib_adopt_at(const Config *entry, unsigned at)
 {
   memcpy((uint8_t *)&config + CALIB_OFFSET,
-      (const uint8_t *)entry + CALIB_OFFSET, CALIB_LENGTH);
+      (const uint8_t *)entry + at, CALIB_LENGTH);
 }
 
 //-----------------------------------------------------------------------------
@@ -802,20 +875,19 @@ static bool is_entry_valid(const Config *entry)
 //-----------------------------------------------------------------------------
 static int find_last_entry(void)
 {
+  Config entry;
   int max_count = -1;
   int index = -1;
 
   for (int i = 0; i < ENTRIES_COUNT; i++)
   {
-    const Config *entry = get_entry(i);
-
-    if (!is_entry_valid(entry))
+    if (!read_entry(i, &entry) || !is_entry_valid(&entry))
       continue;
 
-    if (entry->count > max_count)
+    if (entry.count > max_count)
     {
       index = i;
-      max_count = entry->count;
+      max_count = entry.count;
     }
   }
 
@@ -837,18 +909,46 @@ static int find_last_entry(void)
 // nearly as good as the newest anyway.
 static bool calib_recover(void)
 {
+  Config entry;
   int found = -1;
+  unsigned at = 0;
 
   for (int i = 0; i < ENTRIES_COUNT; i++)
   {
-    if (calib_is_valid(get_entry(i)))
+    unsigned off;
+
+    if (!read_entry(i, &entry))
+      continue;
+
+    off = calib_offset_in(&entry);
+
+    if (off != 0)
+    {
       found = i;
+      at = off;
+    }
   }
 
   if (found < 0)
     return false;
 
-  calib_adopt(get_entry(found));
+  // Read again rather than kept from the sweep: `entry` above is a scratch
+  // buffer that every later slot has been read into since. Cheap - it happens
+  // once, on a boot that had nothing else left.
+  if (!read_entry(found, &entry))
+    return false;
+
+  // Zero is "no seal matched", and it is also a legal memcpy source: adopting
+  // it would copy the head of the entry - magic, size, the trigger settings -
+  // into this unit's calibration and then save it as if it had been measured.
+  // The sweep just said otherwise, so this only fires if the re-read differs
+  // from it, and then the honest answer is that there is nothing to recover.
+  at = calib_offset_in(&entry);
+
+  if (0 == at)
+    return false;
+
+  calib_adopt_at(&entry, at);
 
   return true;
 }
@@ -864,7 +964,11 @@ static bool config_changed(void)
 // only ones that have to be blank
 static bool entry_is_blank(int index)
 {
-  const uint32_t *p = (const uint32_t *)get_entry(index);
+  Config entry;
+  const uint32_t *p = (const uint32_t *)&entry;
+
+  if (!read_entry(index, &entry))
+    return false;   // a slot that cannot be read is not a slot to write into
 
   for (unsigned i = 0; i < sizeof(Config) / sizeof(uint32_t); i++)
   {
@@ -926,16 +1030,12 @@ static void store_entry(void)
     uint32_t sector = STORAGE_START +
         (g_entry_offset & ~(FLASH_SECTOR_SIZE - 1));
 
-    entry_cache_drop();
-
     if (!flash_erase_sector(sector))
     {
       flash_fail(CONFIG_STORE_ERASE_ERROR);
       return;
     }
   }
-
-  entry_cache_drop();
 
   if (!flash_write(STORAGE_START + g_entry_offset,
         (const uint8_t *)&g_config_copy, sizeof(Config)))
@@ -945,8 +1045,9 @@ static void store_entry(void)
   }
 
   // The read-back is the whole point of the exercise, and on this backend it
-  // can happen right here rather than three main-loop passes later
-  entry_cache_drop();
+  // can happen right here rather than three main-loop passes later. Nothing to
+  // invalidate first any more: reads go to the flash, not to a buffer that
+  // might still be holding what this slot said a moment ago.
   write_verify();
 #endif
 }
@@ -997,7 +1098,7 @@ static void config_save(bool lazy)
 
   // The calibration seal first: it lies inside CRC_LENGTH, so the entry's own
   // checksum has to be taken over the sealed value, not the stale one
-  config.calib_crc = calib_crc_calc(&config);
+  config.calib_crc = calib_crc_calc_at(&config, CALIB_OFFSET);
   config.crc = crc32_calc((uint32_t *)&config, CRC_LENGTH);
 
   g_config_copy = config;
@@ -1064,6 +1165,150 @@ static bool migrate_from_internal(void)
 }
 #endif
 
+/*
+ * Version 1 -> version 2, the other migration this store has to do.
+ *
+ * The entries version 1 wrote are rejected by is_entry_valid() on their version
+ * and their size, so without this the first boot of this firmware would find an
+ * empty store, erase it, and start from defaults - taking the CALIBRATION with
+ * it, since that is the one thing in there that cannot be typed back in. That
+ * is the failure this function exists to prevent; the preferences riding along
+ * are a bonus.
+ *
+ * Reads the newest version 1 entry in slot order and converts it in place:
+ * everything up to draw_mode is copied as one block (version 2 kept that
+ * layout), the calibration block is moved to where it now lives, and the fields
+ * version 2 added stay zero - which for every one of them is the setting a
+ * version 1 config effectively had. Nothing is written or erased here. `config`
+ * simply does not match what is on the flash any more, so the ordinary save
+ * path lays it down as a version 2 entry a second later, and until it does the
+ * old entries are still there to be read again on the next boot.
+ *
+ * Returns whether it found one.
+ */
+
+//-----------------------------------------------------------------------------
+// Whether a slot holds an intact version 1 entry. Its own checks, because
+// is_entry_valid() answers a different question and answers it about a struct
+// this entry is not: different magic, different size, crc somewhere else.
+static bool v1_entry_valid(const Config *entry)
+{
+  uint32_t crc;
+
+  // magic, version and size are the first three words of both layouts
+  if (entry->magic != V1_MAGIC || entry->version != V1_VERSION ||
+      entry->size != V1_SIZE)
+    return false;
+
+  // ...but the checksum is not where ours is, and it covered less
+  memcpy(&crc, (const uint8_t *)entry + V1_CRC_LENGTH, sizeof(crc));
+
+  return crc32_calc((uint32_t *)entry, V1_CRC_LENGTH) == crc;
+}
+
+//-----------------------------------------------------------------------------
+// The newest version 1 entry in one of the two stores, by save count, or -1.
+// Both are swept because the store moved chips in version 1's own lifetime:
+// a unit that has run the SPI-store firmware has its old entries there, one
+// upgraded straight from an older build still has them in the MCU sector.
+static int v1_find_last(bool internal)
+{
+  Config buf;
+  int best = -1;
+  int max_count = -1;
+  int count = internal ? INT_ENTRIES_COUNT : ENTRIES_COUNT;
+
+  for (int i = 0; i < count; i++)
+  {
+    const Config *entry;
+
+    if (internal)
+    {
+      entry = internal_entry(i);   // memory mapped: no copy needed
+    }
+    else
+    {
+      if (!read_entry(i, &buf))
+        continue;
+
+      entry = &buf;
+    }
+
+    if (!v1_entry_valid(entry))
+      continue;
+
+    if (entry->count > max_count)
+    {
+      max_count = entry->count;
+      best = i;
+    }
+  }
+
+  return best;
+}
+
+//-----------------------------------------------------------------------------
+static bool adopt_v1_entry(void)
+{
+  bool internal = STORE_INTERNAL;
+  int best = v1_find_last(internal);
+
+  if (best < 0 && !internal)
+  {
+    internal = true;
+    best = v1_find_last(internal);
+  }
+
+  if (best < 0)
+    return false;
+
+  {
+    Config buf;
+    const Config *entry;
+
+    if (internal)
+    {
+      entry = internal_entry(best);
+    }
+    else
+    {
+      if (!read_entry(best, &buf))
+        return false;
+
+      entry = &buf;
+    }
+
+    memset(&config, 0, sizeof(config));
+    memcpy(&config, entry, V1_PREFIX_LENGTH);
+    calib_adopt_at(entry, V1_CALIB_OFFSET);
+  }
+
+  config.version = VERSION;
+  config.size    = sizeof(Config);
+  config.magic   = MAGIC;
+
+  // calib_crc came across inside the prefix and still seals: the bytes it is a
+  // checksum of are the same bytes, at a different offset (see the assert on
+  // CALIB_LENGTH). config.crc, on the other hand, is left at the zero the
+  // memset above put there - version 1's own crc lives past the prefix and is
+  // not copied - and a zero matches no checksum, which is exactly what makes
+  // config_changed() true and gets this entry written out a second from now.
+
+  // Where the rotation is, so the save lands in the slot after the entry it
+  // came from and the version 1 entries behind it are left intact. An entry
+  // read out of the OTHER chip says nothing about this store's rotation, so
+  // that case starts at the end and lets store_entry() wrap and erase, exactly
+  // as migrate_from_internal() does.
+  g_entry_offset = (internal && !STORE_INTERNAL) ?
+      (STORAGE_SIZE - ENTRY_SIZE) : (best * ENTRY_SIZE);
+
+  // Nothing on the flash to compare against: this must go out on the next
+  // config_task() tick and not wait for the lazy deadline
+  g_have_copy = false;
+
+  return true;
+}
+
 //-----------------------------------------------------------------------------
 void config_init(void)
 {
@@ -1079,7 +1324,16 @@ void config_init(void)
   }
 #endif
 
-  if (index == -1)
+  // Nothing of this layout, but something of the previous one: take it, and
+  // skip both branches below - there is neither an entry to load nor a reason
+  // to erase. See adopt_v1_entry(); it leaves the struct needing a save.
+  if (index < 0 && adopt_v1_entry())
+  {
+    g_migrated = true;
+    g_calib_source = CONFIG_CALIB_LOADED;
+    g_status = CONFIG_STORE_LOADED;
+  }
+  else if (index == -1)
   {
     // Before the erase, and before config_reset() fills the struct: the only
     // copy of this unit's calibration is in the entries that are about to be
@@ -1090,7 +1344,6 @@ void config_init(void)
 #if STORE_INTERNAL
     fmc_erase(SECTOR_0_INDEX);
 #else
-    entry_cache_drop();
     flash_erase_sector(STORAGE_START);
 #endif
 
@@ -1117,8 +1370,9 @@ void config_init(void)
   }
   else
   {
-    const Config *entry = get_entry(index);
-    config = *entry;
+    // Straight into the live struct: this is the one caller that wants a whole
+    // entry and has somewhere to put it
+    read_entry(index, &config);
     g_entry_offset = index * ENTRY_SIZE;
 
     // What is in flash, which is what the tier comparison measures against.
@@ -1262,12 +1516,15 @@ int config_store_entries(void)
 }
 
 //-----------------------------------------------------------------------------
-const Config *config_store_entry(int index)
+// Into the caller's buffer, because there is no longer one here to lend out -
+// see read_entry(). The viewer reads an entry once into a local and then
+// describes it line by line, which is what it wanted anyway.
+bool config_store_read_entry(int index, Config *out)
 {
-  if (index < 0 || index >= ENTRIES_COUNT)
-    return NULL;
+  if (!out || index < 0 || index >= ENTRIES_COUNT)
+    return false;
 
-  return get_entry(index);
+  return read_entry(index, out);
 }
 
 //-----------------------------------------------------------------------------
@@ -1297,8 +1554,17 @@ bool config_store_is_external(void)
 //-----------------------------------------------------------------------------
 bool config_store_entry_calib_ok(int index)
 {
-  const Config *entry = config_store_entry(index);
+  Config entry;
 
+  if (!config_store_read_entry(index, &entry))
+    return false;
+
+  return calib_is_valid(&entry);
+}
+
+//-----------------------------------------------------------------------------
+bool config_entry_calib_ok(const Config *entry)
+{
   return entry ? calib_is_valid(entry) : false;
 }
 
@@ -1307,15 +1573,46 @@ bool config_store_entry_calib_ok(int index)
 // failed is the useful part: BAD_MAGIC is a slot nothing ever wrote, BAD_CRC
 // is one that was written and did not survive, and BAD_SIZE/BAD_VERSION mean
 // the entry belongs to a different firmware.
+//
+// A version 1 entry fails on the magic, since the two versions do not share
+// one - so it is named before that verdict is reached. "BAD MAGIC" over a slot
+// holding a perfectly good older config, with this unit's calibration in it,
+// would be the store's most alarming line about its least alarming state.
 ConfigEntryState config_store_entry_state(int index)
 {
-  const Config *entry = config_store_entry(index);
+  Config entry;
+
+  if (!config_store_read_entry(index, &entry))
+    return CONFIG_ENTRY_BLANK;
+
+  return config_entry_state_of(&entry);
+}
+
+//-----------------------------------------------------------------------------
+// The same verdict on an entry the caller already has in hand, so the viewer
+// does not read every slot twice: once for its state and once for its fields.
+ConfigEntryState config_entry_state_of(const Config *entry)
+{
+  const uint32_t *p = (const uint32_t *)entry;
+  bool blank = true;
 
   if (!entry)
     return CONFIG_ENTRY_BLANK;
 
-  if (entry_is_blank(index))
+  for (unsigned i = 0; i < sizeof(Config) / sizeof(uint32_t); i++)
+  {
+    if (0xffffffff != p[i])
+    {
+      blank = false;
+      break;
+    }
+  }
+
+  if (blank)
     return CONFIG_ENTRY_BLANK;
+
+  if (v1_entry_valid(entry))
+    return CONFIG_ENTRY_V1;
 
   if (entry->magic != MAGIC)
     return CONFIG_ENTRY_BAD_MAGIC;
@@ -1406,6 +1703,8 @@ static const struct
 
   FIELD(measure_display, FT_BOOL),
   FIELD(measure_panel_mode, FT_INT),
+  FIELD(measure_panel_font, FT_INT),
+  FIELD(measure_panel_bg, FT_INT),
   FIELD(show_vpp, FT_BOOL),
   FIELD(show_freq, FT_BOOL),
   FIELD(show_duty, FT_BOOL),
@@ -1416,6 +1715,13 @@ static const struct
   FIELD(show_jitter, FT_BOOL),
   FIELD(show_fft_freq, FT_BOOL),
   FIELD(show_alias, FT_BOOL),
+  FIELD(show_vp, FT_BOOL),
+  FIELD(show_vmax, FT_BOOL),
+  FIELD(show_vmin, FT_BOOL),
+  FIELD(show_vamp, FT_BOOL),
+  FIELD(show_period, FT_BOOL),
+  FIELD(show_width_pos, FT_BOOL),
+  FIELD(show_width_neg, FT_BOOL),
   FIELD(measure_line_set, FT_BOOL),
   FIELD_N(measure_line, FT_IARR, MEASURE_LINE_SLOTS),
 
@@ -1439,6 +1745,7 @@ static const struct
   FIELD(persist_mode, FT_INT),
   FIELD(average_mode, FT_INT),
   FIELD(draw_mode, FT_INT),
+  FIELD(grid_mode, FT_INT),
   FIELD(roll_from, FT_INT),
 
   FIELD(snake_high_score, FT_INT),
@@ -1495,6 +1802,7 @@ bool config_describe(const Config *cfg, int index, char *buf, int size)
         snprintf(buf, size, "%-24s%08lX", name,
             (unsigned long)*(const uint32_t *)p);
         break;
+
 
       case FT_I64:
       {
@@ -1628,6 +1936,8 @@ void config_reset(void)
   config.measure_display        = true;
 
   config.measure_panel_mode     = 0; // panel on
+  config.measure_panel_font     = PANEL_FONT_SMALL;
+  config.measure_panel_bg       = PANEL_BG_DIM;
   config.show_vpp               = true;
   config.show_freq              = true;
   config.show_duty              = true;
@@ -1648,9 +1958,21 @@ void config_reset(void)
   config.show_fft_freq          = false;
   config.show_alias             = false;
 
+  // The amplitude and timing set: off by default, like every metric added
+  // after the first four. The panel has room for about seven readings across
+  // its two lines and the default set already spends four of them.
+  config.show_vp                = false;
+  config.show_vmax              = false;
+  config.show_vmin              = false;
+  config.show_vamp              = false;
+  config.show_period            = false;
+  config.show_width_pos         = false;
+  config.show_width_neg         = false;
+
   config.persist_mode           = 0; // 0 = off, 1 = infinite, 2 = decay
   config.average_mode           = 0;
   config.draw_mode              = DRAW_LINEAR;
+  config.grid_mode              = 0; // graticule behind the trace
   config.decoder_baud           = 0; // auto-detect
   config.decoder_fit_mode       = 0; // fit the timebase to the rate
   config.decoder_bits_mode      = 0; // bit grid over the trace

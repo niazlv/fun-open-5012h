@@ -1554,8 +1554,39 @@ static bool get_measurements_ex(ScopeMeasure *out, bool fresh)
   // (equals the rail midpoint) and for bursts (percentiles would put the
   // "midpoint" at the baseline)
   out->vmid_mv   = (int)((int64_t)((m.pk_hi + m.pk_lo) / 2 - ZERO_POINT) * mult / CALIB_MULTIPLIER);
+
+  // ...and the same conversion with the vertical position taken back out, so
+  // these read the input and not the screen. ZERO_POINT is the code the offset
+  // DAC was told to put config.vertical_position_mv at (capture_set_vertical_
+  // parameters), which is why subtracting it is what makes a peak absolute:
+  // move the trace two divisions up and vmax_mv does not budge.
+  //
+  // The live vertical position rather than the one the record was taken with,
+  // for the same reason the multiplier above is the live one: a frozen record
+  // measured under settings that have since changed is already telling the
+  // user about a screen they are no longer looking at, and mixing the two
+  // conventions in one panel would be worse than either.
+  {
+    int vpos = config.vertical_position_mv;
+    int hi = (int)((int64_t)(m.vmax - ZERO_POINT) * mult / CALIB_MULTIPLIER) - vpos;
+    int lo = (int)((int64_t)(m.vmin - ZERO_POINT) * mult / CALIB_MULTIPLIER) - vpos;
+
+    out->vmax_mv = hi;
+    out->vmin_mv = lo;
+
+    if (hi < 0)
+      hi = -hi;
+
+    if (lo < 0)
+      lo = -lo;
+
+    out->vp_mv = (hi > lo) ? hi : lo;
+  }
+
   out->frequency = m.frequency;
   out->duty_x10  = m.duty_x10;
+  out->width_pos_ns = m.width_pos_ns;
+  out->width_neg_ns = m.width_neg_ns;
   out->period_med_ns = m.period_med_ns;
   out->period_min_ns = m.period_min_ns;
   out->period_max_ns = m.period_max_ns;

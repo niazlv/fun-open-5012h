@@ -212,6 +212,8 @@ void measure_run(const uint8_t *data, int size, int offset,
 
   m->frequency = 0;
   m->duty_x10  = -1;
+  m->width_pos_ns = -1;
+  m->width_neg_ns = -1;
   m->periods   = 0;
   m->period_good_pct = 0;
   m->level_pct = 0;
@@ -556,6 +558,15 @@ void measure_run(const uint8_t *data, int size, int offset,
       high_in_span = span;
 
     m->duty_x10 = high_in_span * 1000 / span;
+
+    // How long a period spends high and low. Both come out of the duty cycle
+    // and the period rather than being timed on their own: the duty above is
+    // already an average over every period in the span, and splitting the
+    // period by it keeps T+ + T- == T and T+ / T == duty. Measuring the two
+    // half-periods separately would be one more crossing pass for three
+    // numbers that could then contradict each other on the same screen.
+    m->width_pos_ns = (int)(((int64_t)m->period_med_ns * m->duty_x10 + 500) / 1000);
+    m->width_neg_ns = m->period_med_ns - m->width_pos_ns;
   }
 }
 

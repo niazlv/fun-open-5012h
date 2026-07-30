@@ -99,6 +99,13 @@ void scope_swd_clock_capture(void);
 // every pan/zoom/scale change
 void scope_display_settings_changed(void);
 
+// The measurements panel's font or background changed. The cells hold text
+// composed to the width of the font that was current when they were built, so
+// they have to be dropped rather than re-measured a tick later at the wrong
+// width - and the band's height moves with the font, which the trace area
+// underneath has to be told about.
+void scope_measure_panel_changed(void);
+
 // Live state of the measurements panel, for the System Info page: this is
 // the path that has gone blank after an auto-setup, and the flags below say
 // which stage of it stopped (see scope_get_panel_state)

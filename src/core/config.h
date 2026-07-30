@@ -68,10 +68,46 @@ enum
   // question does not arise. Never a second opinion on a frequency; the only
   // claim it makes is "could equally be this".
   MEASURE_ALIAS,
+
+  // New metrics MUST be appended at the end of this enum and never inserted:
+  // config.measure_line[] stores these numbers on flash, so an inserted value
+  // silently re-points a status line slot the user set up at whatever moved
+  // into its number.
+  MEASURE_VP,        // peak from 0 V: max(|Vmax|, |Vmin|)
+  MEASURE_VMAX,      // the two extremes on their own, also from 0 V
+  MEASURE_VMIN,
+  MEASURE_VAMP,      // Vtop - Vbase: the swing between the flat levels, with
+                     // overshoot and ringing left out (see measure.h)
+  MEASURE_PERIOD,    // time of one whole cycle - what the frequency is 1/x of
+  MEASURE_WIDTH_POS, // and how that cycle splits: time above the mid level
+  MEASURE_WIDTH_NEG, // and time below it. T+ / T is the duty cycle.
   MEASURE_COUNT,
 };
 
 #define MEASURE_LINE_SLOTS 2
+
+// The measurements panel's own look. Both are zero-is-default, so a config
+// saved before they existed - or migrated from store version 1 - comes back
+// with the panel it already had.
+//
+// The font decides how much fits, not just how big it reads: the band is two
+// rows either way, three cells to a row in the 6x8 font and two in the 8x16.
+// Enabling more metrics than that shows the first of them and says how many
+// were left out; it does not shrink the text to fit.
+enum
+{
+  PANEL_FONT_SMALL = 0,   // 6x8: six readings
+  PANEL_FONT_LARGE,       // 8x16: four, readable across a bench
+  PANEL_FONT_COUNT,
+};
+
+enum
+{
+  PANEL_BG_DIM = 0,       // the trace behind the text at half brightness
+  PANEL_BG_SOLID,         // an opaque band with a hairline along its top
+  PANEL_BG_OFF,           // nothing: the text sits straight over the trace
+  PANEL_BG_COUNT,
+};
 
 // What to draw between samples once the screen has more pixels than the
 // record has samples. Straight lines are the default because they invent
@@ -138,7 +174,11 @@ typedef struct
   // the whole calibration block included - and the store drops an entry whose
   // sizeof does not match, erasing calibration with it. Same reasoning as
   // show_jitter and show_fft_freq, which is why neither of those is beside its
-  // siblings either. sizeof(Config) stays 416 and no offset moves.
+  // siblings either: no offset moves, and version 1's did not.
+  //
+  // Its later siblings (show_vp and the rest) DO sit together, further down -
+  // that is what the version 2 reserve bought. This one stays where it is:
+  // moving it now would break the prefix a version 1 store is migrated by.
   bool     show_alias;
 
   // General settings
@@ -204,7 +244,7 @@ typedef struct
   // show_jitter lives in what used to be decoder_reserved[0] - NOT appended
   // to the show_* run above: a ninth bool there pushes 3 alignment bytes in
   // front of measure_line, shifts every later field (crc included) by 4 while
-  // sizeof stays 416, and the store then rejects and ERASES every saved
+  // sizeof does not move, and the store then rejects and ERASES every saved
   // entry, calibration included. That is not a theory; it happened.
   bool     show_jitter;
   // Narrow stop-on-decode to records that caught the line at rest first, so
@@ -322,9 +362,74 @@ typedef struct
   // past one sample per pixel: DRAW_LINEAR joins them with a straight line,
   // DRAW_SINC reconstructs the band-limited curve that actually passes
   // through them. Zero-is-default, so a config saved before this existed
-  // keeps the straight lines. The LAST word of padding[] - a field added
-  // after this one has nowhere to go but a new store version.
+  // keeps the straight lines. This was the LAST word of version 1's padding[]
+  // - which is why there is a version 2, and why the reserve below exists.
   int      draw_mode;
+
+  /*
+   * ---- Everything above this line is the VERSION 1 layout, byte for byte ----
+   *
+   * Version 2 grew the struct instead of hunting for another alignment hole to
+   * hide a bool in, and it can carry a version 1 store forward because it kept
+   * that layout as its own prefix: config.c migrates an old entry with two
+   * memcpys (the prefix, then the calibration block to its new offset) rather
+   * than a sixty-field copy list with one field quietly missing from it.
+   *
+   * So the rule for a field added from here on is the same rule as before, and
+   * for the same reason - NEVER insert one above this line or between the ones
+   * below; take the space out of padding[] - only now there is padding to take
+   * it out of, and running out of it again means a version 3, not a hole hunt.
+   */
+
+  // The panel flags for the metrics MEASURE_VP..MEASURE_WIDTH_NEG. Plain bools
+  // again, in the same order as the enum, because there is finally room for
+  // them; false in a migrated config, which is the panel it already had.
+  bool     show_vp;
+  bool     show_vmax;
+  bool     show_vmin;
+  bool     show_vamp;
+  bool     show_period;
+  bool     show_width_pos;
+  bool     show_width_neg;
+
+  // The graticule behind the trace: 0 = on, 1 = off. Zero-is-default like
+  // measure_panel_mode, so a config saved before this field existed - or
+  // migrated from version 1 - comes back with the ruling it had rather than a
+  // blank screen. "Off" empties the trace area only; the frame around it is
+  // the edge of the window and not part of the ruling, so it stays.
+  int      grid_mode;
+
+  // How the measurements panel looks: PANEL_FONT_* and PANEL_BG_*. Two words
+  // out of the reserve below, and worth it - the panel is on screen whenever
+  // the instrument is, and until now its size and its background were
+  // decisions the user had no say in.
+  int      measure_panel_font;
+  int      measure_panel_bg;
+
+  /*
+   * The reserve. A new field is carved out of HERE, shrinking the array by
+   * exactly what it takes so that sizeof(Config) and every offset below stay
+   * put - an entry whose size does not match is not read, and the padding is
+   * what keeps that from being every entry on the flash after every change.
+   *
+   * One word. Version 2 started with four; grid_mode took one and the panel's
+   * font and background two. The limit is not the flash: the 512-byte entry slot
+   * would
+   * take another 68 bytes happily. What cannot take them is the TCM, where this
+   * struct is resident THREE times over - config itself, the snapshot config.c
+   * compares against to decide whether a save is due, and its one-entry read
+   * cache - against a linker assert that keeps 16 KB of the 64 clear for stack
+   * and heap. That assert had about 100 bytes of slack left before version 2,
+   * and 24 bytes of struct is 72 bytes of TCM.
+   *
+   * So this is what fits rather than what would be comfortable, and the way to
+   * make it comfortable is to free TCM (the read cache is the obvious 500
+   * bytes: nothing needs it to outlive the call that reads it), not to trim the
+   * flash side. Running out is also no longer the dead end it was in version 1:
+   * config.c can carry a layout forward now, so a version 3 costs a prefix
+   * constant, a static assert and one more branch in adopt_v1_entry().
+   */
+  uint32_t padding[1];
 
   // The calibration block. Contiguous, and last before crc, on purpose:
   // calib_crc covers exactly the bytes from calib_channel_delta up to crc. A
@@ -389,11 +494,25 @@ typedef enum
   CONFIG_ENTRY_BAD_VERSION,  // written by another firmware
   CONFIG_ENTRY_BAD_SIZE,     // ...one whose Config was a different size
   CONFIG_ENTRY_BAD_CRC,      // written, and did not survive
+  CONFIG_ENTRY_V1,           // the layout before this one, and intact. What
+                             // the store looks like on the first boot after
+                             // the update, and not a fault: config.c reads it
+                             // (calibration included) and writes it back as
+                             // one of ours.
 } ConfigEntryState;
 
 int config_store_entries(void);
-const Config *config_store_entry(int index);
+
+// One entry into the caller's buffer - a `Config` on the stack is what this is
+// for. There is no buffer inside config.c to hand a pointer to any more: it was
+// a third resident copy of this struct in a TCM that had ~100 bytes of slack,
+// and nothing ever needed an entry to outlive the call that read it.
+bool config_store_read_entry(int index, Config *out);
+
 ConfigEntryState config_store_entry_state(int index);
+// ...and the same verdict on an entry already in hand, so a caller that has
+// just read one does not pay for reading it again
+ConfigEntryState config_entry_state_of(const Config *entry);
 const char *config_entry_state_name(ConfigEntryState state);
 
 // Which slot config was loaded from / is being written to, -1 if neither
@@ -410,6 +529,8 @@ bool config_store_is_external(void);
 
 // Whether an entry's calibration block seals, independently of the entry
 bool config_store_entry_calib_ok(int index);
+// ...and on an entry already read, for the same reason as config_entry_state_of
+bool config_entry_calib_ok(const Config *entry);
 
 // One line of a Config rendered as "name  value", for both the store viewer
 // and the page that shows what is in RAM. cfg may be any entry or &config.

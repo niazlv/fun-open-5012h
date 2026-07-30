@@ -72,6 +72,19 @@
 
 #define MINIVIEW_WIDTH         160
 
+// Top bar, right of the record map and left of the sample rates. Nine free
+// columns, 243..251: the map's own clear reaches 242 (its trigger marker
+// overhangs the frame by two), and the rates start at 252. The icon is 8x16
+// with a blank first column, so its ink lands 244..250.
+//
+// The rates cannot move over to give it more room. They are 27 px wide (three
+// digits, a half space and the unit) and end at 278, and input.c puts the
+// shift arrow at 280 - between that and the battery frame at 289 there is
+// nothing to take.
+#define TRIGGER_EDGE_X         243
+#define TRIGGER_EDGE_Y         2
+#define SAMPLE_RATE_X          252
+
 #define CALIB_AREA_LEFT        140
 #define CALIB_AREA_WIDTH       (LCD_WIDTH - CALIB_AREA_LEFT)
 
@@ -191,6 +204,12 @@ enum
 #define MEASURE_SLOT_1_X       228
 #define MEASURE_TAG_W          8     // one glyph of the large font
 
+// "There is no reading", at the width format_time() and format_voltage() come
+// out at, so it covers the number it replaces instead of leaving its tail on
+// screen. A time metric prints this rather than a zero: a period of 0 ns is
+// not a measurement of anything.
+#define PERIOD_NONE            "   --.--  "
+
 // The decode panel is a hole in the trace area: columns it covers only
 // paint their part BELOW it, so neither grid nor trace ever touches the
 // panel pixels and it needs no repainting while it is on screen.
@@ -204,11 +223,53 @@ enum
 
 // Translucent measurements panel: composited INTO the trace columns (trace
 // dimmed to 50%, text overlaid), sitting just above the status line
-#define MPANEL_H               26
-#define MPANEL_ROW0            (GRID_HEIGHT - 1 - MPANEL_H)
+/*
+ * The measurements panel: a band along the bottom of the trace area holding
+ * the selected readings, two rows deep.
+ *
+ * What made the old band hard to read was not where the readings sat but that
+ * they MOVED: it packed them into two lines of text, and a value free to change
+ * width - a jitter figure going from "31ps~1.2ns" to "1.2ns~15ns", a signal type
+ * from "Sine" to "Square" - shoved everything behind it along the line. So every
+ * value is formatted to a constant width for its metric now (see format_ps and
+ * MEASURE_TYPE), which is what actually holds the band still.
+ *
+ * With that fixed the packing can be tight, and tight is what reads: a name, one
+ * space, its number, and two spaces before the next pair. A cell whose value was
+ * right-aligned in a fixed column instead put five blanks between "duty" and
+ * "50.0%", and a name that far from its number stops looking like it belongs to
+ * it - which is worse than the problem it was solving.
+ *
+ * A reading therefore only ever changes its own digits. Where the pairs sit
+ * changes when the SET changes, never because a number did.
+ */
+#define MPANEL_PAD_X           4
+#define MPANEL_PAD_Y           3
+#define MPANEL_ROWS            2
+#define MPANEL_GAP_Y           2     // between the two rows
+#define MPANEL_GUTTER          2     // characters between one pair and the next
+
+// Room for the longest pair there is: a four-character name, its space, and a
+// jitter reading (two five-character times and a tilde)
+#define MPANEL_CHARS_MAX       20
+#define MPANEL_CELLS_MAX       8
+
+// Free text (the calibration hints, the auto-calibration's running commentary)
+// is sentences rather than readings, so it keeps the small font and the full
+// width of the band whatever the panel is set to.
 #define MPANEL_TEXT_MAX        50    // chars per line at 6 px/char
 #define MPANEL_HEARTBEAT       4     // forced repaints: every 4th update (~2 s)
 #define MPANEL_DIM(p)          (((p) >> 1) & 0x7BEF) // RGB565 half brightness
+
+// The hairline along the top of a solid band, so it reads as a panel over the
+// trace rather than as a hole in it
+#define MPANEL_EDGE_COLOR      LCD_COLOR(70, 70, 70)
+
+// A reading that has nothing to report: grey, name and all. THD with no
+// spectrum behind it, jitter with no periods - the cell stays where it is so
+// the ones that DO have a number do not move, and the grey says which is which
+// without having to read the dashes.
+#define MPANEL_NONE_COLOR      LCD_COLOR(130, 130, 130)
 
 // Small dim "rec <span>" tag in the top-right trace corner while the frozen
 // record is only the 24K storage snapshot (capture_stopped_on_snapshot):
@@ -306,15 +367,31 @@ typedef struct
   uint8_t  flags[GRID_WIDTH];
 } DisplayBuffer;
 
-// One selected metric, rendered for both views at once: the panel prints
-// `panel` in the small font after its own spelled-out label, the status line
-// prints `tag` and `value` in the large font, where a single character is all
-// the room there is for a name
+// What a reading is OF, which is how the panel colours it: the same yellow the
+// vertical scale and the first status slot use for volts, the same white the
+// second uses for frequency. A panel where every number is white is a panel
+// you have to read the labels of to know what you are looking at.
+typedef enum
+{
+  MK_VOLT = 0,  // volts
+  MK_TIME,      // periods, widths, frequencies - anything the timebase decides
+  MK_OTHER,     // ratios, the signal type, the alias candidate
+} MeasureKind;
+
+// One selected metric, rendered for both views at once: the panel puts `label`
+// and `value` in a cell of its grid, the status line prints `tag` and `value`
+// in the large font, where a single character is all the room there is for a
+// name. `present` is false when the metric has nothing to report right now -
+// no spectrum for a THD, no periods for a jitter - and the panel greys the
+// whole cell rather than dropping it, so the layout does not move under the
+// reading that is still there.
 typedef struct
 {
-  char panel[22];
+  char label[6];
   char tag[2];
   char value[16];
+  uint8_t kind;
+  bool present;
 } MeasureItem;
 
 /*- Constants ---------------------------------------------------------------*/
@@ -620,13 +697,38 @@ static int g_alias_hz = 0;
 static FftAnalysis g_alias_an;
 static AliasAnalysis g_alias_res;
 
-// Measurements panel state: 1bpp text mask, one bit per trace-area pixel
+/*
+ * Measurements panel state: what the band SAYS, as characters.
+ *
+ * It used to be a 1bpp mask of the whole band - one bit per trace-area pixel,
+ * ~1 KB of it - rebuilt whenever the text changed and read a bit at a time by
+ * the column sweep. Storing the text instead and picking the glyph column out
+ * of the font while compositing costs the same arithmetic per column, drops the
+ * kilobyte, and takes the panel's height out of a struct size: a taller band
+ * for the 8x16 font is free, where a taller mask was not (see the linker
+ * script's TCM assert).
+ */
+typedef struct
+{
+  char text[MPANEL_CHARS_MAX + 1]; // "name value", nothing else
+  uint8_t len;
+  uint8_t label_len;               // leading characters drawn dimmer: the name
+  uint8_t x;                       // first character column of the band's row
+  uint8_t row;
+  uint16_t color;
+} MPanelCell;
+
 static bool g_mpanel_active = false;
 static bool g_mpanel_force = false;   // rebuild the panel text on the next tick
 static uint32_t g_mpanel_builds = 0;  // texts built / bands repainted, for
 static uint32_t g_mpanel_paints = 0;  // the System Info diagnostic
-static uint8_t g_mpanel_mask[MPANEL_H][(GRID_WIDTH + 7) / 8];
-static char g_mpanel_line[2][MPANEL_TEXT_MAX + 2];
+static MPanelCell g_mpanel_cell[MPANEL_CELLS_MAX];
+static int g_mpanel_cells = 0;
+// ...or two lines of free text instead of the grid, for the things the band is
+// borrowed to SAY rather than to measure (calibration hints, the
+// auto-calibration's report). Sentences, so they keep the small font.
+static char g_mpanel_text[2][MPANEL_TEXT_MAX + 2];
+static bool g_mpanel_is_text = false;
 
 // Logic decoder view; the run tables live in the spare main-SRAM block
 static bool g_decode_mode = false;
@@ -741,6 +843,41 @@ static int decoder_baud_value(void)
   return decoder_baud_values[i];
 }
 
+//-----------------------------------------------------------------------------
+// The panel's font and the geometry that follows from it. Everything that
+// touches the band asks these rather than reading a constant: the band is
+// taller in the 8x16 font, and what stacks on top of it (the decoder's byte
+// strip) has to follow.
+static const Font *mpanel_font(void)
+{
+  return (PANEL_FONT_LARGE == config.measure_panel_font) ?
+      FONT_LARGE : FONT_SMALL;
+}
+
+// How many characters of the chosen font fit across the band: 48 in the 6x8,
+// 36 in the 8x16
+static int mpanel_chars(void)
+{
+  return (GRID_WIDTH - 2 * MPANEL_PAD_X) / mpanel_font()->width;
+}
+
+static int mpanel_row_h(void)
+{
+  return mpanel_font()->height + MPANEL_GAP_Y;
+}
+
+// 24 px in the small font, 40 in the large: two rows of glyphs, the gap between
+// them, and a margin above and below
+static int mpanel_h(void)
+{
+  return 2 * MPANEL_PAD_Y + MPANEL_ROWS * mpanel_row_h() - MPANEL_GAP_Y;
+}
+
+static int mpanel_row0(void)
+{
+  return GRID_HEIGHT - 1 - mpanel_h();
+}
+
 // Last miniview geometry so it can repaint without a full update_sample_rate
 static int g_mv_trigger_px = 0;
 static int g_mv_window_px = -1;
@@ -771,7 +908,7 @@ _Static_assert(sizeof(LogicScratch) <= CAPTURE_SPARE_RAM_SIZE,
 // where the bytes are too narrow to name, none at all where they are too
 // narrow even for the number. A band of empty pixels is trace it has taken
 // away for nothing.
-#define DBAND_BOTTOM   MPANEL_ROW0
+#define DBAND_BOTTOM   mpanel_row0()
 #define DBAND_H1       11   // tint, boundary ticks and one row of text
 #define DBAND_H2       20   // ...and the character under it
 // ...and a third for what the bytes add up to, where several of them do. The
@@ -814,7 +951,10 @@ _Static_assert(sizeof(LogicScratch) <= CAPTURE_SPARE_RAM_SIZE,
 #define DBIT_MIN_PX            4
 
 static int g_dband_rows = 0;             // 0 = no band; bottom stays put
-static int g_dband_row0 = DBAND_BOTTOM;
+// Where the band starts, set with its height in decode_band_build(). Not
+// DBAND_BOTTOM here: that follows the measurements panel, whose height is a
+// setting now and not a constant an initializer could use.
+static int g_dband_row0 = 0;
 // The character the selection is inside, so its bytes light up together on
 // the trace exactly as they do in the panel
 static int g_dband_sel_start = 0;
@@ -1151,6 +1291,88 @@ static void fft_build_gradient(void)
 }
 
 //-----------------------------------------------------------------------------
+// One character column of one glyph into the column buffer: `bit` says which of
+// the glyph's columns this is, and the caller has already worked out that this
+// trace column falls inside the character. Anything outside the font - the
+// half-space the value formatters use before a unit - paints nothing, which is
+// what a blank is: the layout has already reserved its width.
+__attribute__((noinline))
+static void mpanel_glyph_column(uint16_t *column, int row0, const Font *font,
+    char ch, int bit, uint16_t color)
+{
+  const uint8_t *bitmap;
+
+  if (ch < FONT_FIRST_CHAR || ch > FONT_LAST_CHAR)
+    return;
+
+  bitmap = font->data + (ch - FONT_FIRST_CHAR) * font->pitch;
+
+  for (int y = 0; y < font->height; y++)
+  {
+    int i = y * font->width + bit;
+
+    if ((bitmap[i / 8] >> (i % 8)) & 1)
+      column[row0 + y] = color;
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Everything the band says, for ONE trace column. Two shapes: the grid of
+// reading cells, or two lines of free text. Both are stored as characters and
+// turned into pixels here, inside the column buffer, so the panel is composed
+// by the same sweep that draws the trace and can never flicker against it.
+__attribute__((noinline))
+static void mpanel_paint_column(int c, uint16_t *column)
+{
+  int row0 = mpanel_row0() + MPANEL_PAD_Y;
+  int x = c - MPANEL_PAD_X;
+
+  if (x < 0)
+    return;
+
+  if (g_mpanel_is_text)
+  {
+    const Font *font = FONT_SMALL;
+    int ch_i = x / font->width;
+    int bit = x % font->width;
+
+    if (ch_i >= MPANEL_TEXT_MAX)
+      return;
+
+    for (int r = 0; r < 2; r++)
+      mpanel_glyph_column(column, row0 + r * (font->height + MPANEL_GAP_Y),
+          font, g_mpanel_text[r][ch_i], bit, LCD_WHITE_COLOR);
+
+    return;
+  }
+
+  {
+    const Font *font = mpanel_font();
+    int ch_i = x / font->width;
+    int bit = x % font->width;
+
+    // At most one pair per row covers this character, and there are never more
+    // than a handful of them - a scan is cheaper than a map to look it up in
+    for (int i = 0; i < g_mpanel_cells; i++)
+    {
+      const MPanelCell *cell = &g_mpanel_cell[i];
+      int at = ch_i - cell->x;
+      uint16_t color;
+
+      if (at < 0 || at >= cell->len)
+        continue;
+
+      // The name dimmer than the number it names: the reading is what the eye
+      // should land on, and a label at full brightness competes with it
+      color = (at < cell->label_len) ? MPANEL_DIM(cell->color) : cell->color;
+
+      mpanel_glyph_column(column, row0 + cell->row * mpanel_row_h(), font,
+          cell->text[at], bit, color);
+    }
+  }
+}
+
+//-----------------------------------------------------------------------------
 // Spectrum column: connected curve (min..max span, like the waveform trace)
 // over the gradient fill. Peaks and the cursor ride the flags bits (set in
 // fft_update), so the dirty-column compare repaints exactly the columns
@@ -1195,8 +1417,15 @@ static void update_from_spectrum(uint16_t *column, DisplayBuffer *db)
 // measurements panel and the decoder byte strip
 static void build_trace_column(int c, uint16_t *column)
 {
+  // The background the rest of this composites over: this column's share of
+  // the graticule, or pattern 0 - the one with no ruling in it, which every
+  // column between the divisions already uses - when the grid is switched off.
+  // Nothing below has to know which it got, and a blank screen costs exactly
+  // what a ruled one does.
+  const uint16_t *grid = g_grid_columns[config.grid_mode ? 0 : g_grid_index[c]];
+
   for (int i = 0; i < GRID_HEIGHT; i++)
-    column[i] = g_grid_columns[g_grid_index[c]][i];
+    column[i] = grid[i];
 
   if (g_fft_mode)
     update_from_spectrum(column, &g_display_buffer);
@@ -1339,22 +1568,32 @@ static void build_trace_column(int c, uint16_t *column)
     }
   }
 
-  // Translucent measurements panel: dim the trace pixels and overlay the
-  // text mask, all inside the column buffer, so the panel is part of the
-  // normal sweep and can never flicker or be painted over
+  // The measurements panel: its background, then its text, all inside the
+  // column buffer, so the panel is part of the normal sweep and can never
+  // flicker or be painted over.
+  //
+  // Which background is the user's call. Dimming the trace keeps the waveform
+  // visible through the readings and is what this has always done; a solid band
+  // is the one that stays legible over a bright, busy trace, which is exactly
+  // when the numbers matter; and nothing at all is for reading the waveform
+  // under them with the numbers still there.
   if (g_mpanel_active)
   {
-    for (int y = 0; y < MPANEL_H; y++)
+    int h = mpanel_h();
+    int row0 = mpanel_row0();
+
+    for (int y = 0; y < h; y++)
     {
-      int row = MPANEL_ROW0 + y;
+      uint16_t *px = &column[row0 + y];
 
-      column[row] = MPANEL_DIM(column[row]);
-
-      if (g_mpanel_mask[y][c / 8] & (1 << (c % 8)))
-        column[row] = LCD_WHITE_COLOR;
+      if (PANEL_BG_SOLID == config.measure_panel_bg)
+        *px = (0 == y) ? MPANEL_EDGE_COLOR : BG_COLOR;
+      else if (PANEL_BG_OFF != config.measure_panel_bg)
+        *px = MPANEL_DIM(*px);
     }
-  }
 
+    mpanel_paint_column(c, column);
+  }
 }
 
 //-----------------------------------------------------------------------------
@@ -1553,21 +1792,38 @@ static void draw_trigger_level(void)
 
   str = format_voltage(config.trigger_level_mv - config.vertical_position_mv, true);
   lcd_set_color(BG_COLOR, TRIGGER_LEVEL_COLOR);
-  lcd_puts(148, STATUS_LINE_Y, str);
+  // The edge icon used to sit at 140 and this readout began after it. With the
+  // icon in the top bar the reading starts the field itself, on the same left
+  // edge the first measurement slot uses.
+  lcd_puts(MEASURE_SLOT_0_X, STATUS_LINE_Y, str);
 }
 
 //-----------------------------------------------------------------------------
+// The icon lives in the top bar, not on the status line. On the status line it
+// shared the space from x=140 with the measurements, the toasts and the
+// calibration readout, so the setting the EDGE key changes was invisible for
+// as long as any of them were up - which, with the measurements panel on, is
+// all the time. Nothing else claims the top bar, so here it is always on.
+//
+// Calibration is the one exception, and not because of space: it drives the
+// trigger itself (rise, auto, zero level) and leaves config.trigger_edge
+// alone, so the icon would be naming an edge the hardware is not using. It
+// clears the cell instead of lying about it.
 static void draw_trigger_edge(void)
 {
-  if (g_toast_active || scope_calibration_mode || measure_owns_status_line())
+  if (scope_calibration_mode)
+  {
+    lcd_fill_rect(TRIGGER_EDGE_X, TRIGGER_EDGE_Y, image_trigger_edge_both.width,
+        image_trigger_edge_both.height, BG_COLOR);
     return;
+  }
 
   if (TRIGGER_EDGE_RISE == config.trigger_edge)
-    lcd_draw_image(140, STATUS_LINE_Y, &image_trigger_edge_rise);
+    lcd_draw_image(TRIGGER_EDGE_X, TRIGGER_EDGE_Y, &image_trigger_edge_rise);
   else if (TRIGGER_EDGE_FALL == config.trigger_edge)
-    lcd_draw_image(140, STATUS_LINE_Y, &image_trigger_edge_fall);
+    lcd_draw_image(TRIGGER_EDGE_X, TRIGGER_EDGE_Y, &image_trigger_edge_fall);
   else
-    lcd_draw_image(140, STATUS_LINE_Y, &image_trigger_edge_both);
+    lcd_draw_image(TRIGGER_EDGE_X, TRIGGER_EDGE_Y, &image_trigger_edge_both);
 }
 
 //-----------------------------------------------------------------------------
@@ -1606,20 +1862,32 @@ static char *format_duty(int duty_x10)
 // Picoseconds into the shortest sensible unit. Jitter spans six orders of
 // magnitude here: 31 ps resolution at the fast end, milliseconds of spread
 // on a noisy slow record.
+// Five characters, always: two of these and a tilde are the jitter reading,
+// and a figure that changes width as the signal settles used to drag the rest
+// of the panel sideways with it. Three significant digits fit in five
+// characters at every scale except one - 10..99 ns loses its tenth, which at
+// that magnitude is under the record's own resolution anyway.
+#define FORMAT_PS_W  5
 static void format_ps(int ps, char *out, int size)
 {
+  char buf[12];
+
   if (ps < 0)
-    snprintf(out, size, "--");
+    snprintf(buf, sizeof(buf), "--");
   else if (ps < 1000)
-    snprintf(out, size, "%dps", ps);
-  else if (ps < 100000)
-    snprintf(out, size, "%d.%dns", ps / 1000, (ps % 1000) / 100);
+    snprintf(buf, sizeof(buf), "%dps", ps);
+  else if (ps < 10000)
+    snprintf(buf, sizeof(buf), "%d.%dns", ps / 1000, (ps % 1000) / 100);
   else if (ps < 1000000)
-    snprintf(out, size, "%dns", ps / 1000);
+    snprintf(buf, sizeof(buf), "%dns", ps / 1000);
   else if (ps < 1000000000)
-    snprintf(out, size, "%dus", ps / 1000000);
+    snprintf(buf, sizeof(buf), "%dus", ps / 1000000);
   else
-    snprintf(out, size, "%dms", ps / 1000000000);
+    snprintf(buf, sizeof(buf), "%dms", ps / 1000000000);
+
+  // An int of picoseconds runs out at 2.1 ms, so the widest this can be is
+  // "999ps" / "999ns" / "999us" - five characters, which is the width above
+  snprintf(out, size, "%*s", FORMAT_PS_W, buf);
 }
 
 //-----------------------------------------------------------------------------
@@ -1679,10 +1947,15 @@ static void signal_info_update(void)
 }
 
 //-----------------------------------------------------------------------------
-// One metric, formatted for both views at once: the panel prints `panel` in
-// the small font after its own spelled-out label, the status line prints `tag`
-// and `value` in the large one. Every metric formats to a constant width, so a
-// shorter reading always covers the longer one it replaces.
+// One metric, formatted for both views at once: the panel puts `label` and
+// `value` in a cell of its grid, the status line prints `tag` and `value` in
+// the large one. Every metric formats to a constant width, so a shorter
+// reading always covers the longer one it replaces - and in the panel, so a
+// changing reading cannot move the ones beside it.
+//
+// `kind` and `present` are for the panel's colours: what the number measures,
+// and whether there is a number at all. Both default to the common case here
+// (a voltage that is being reported) and each metric overrides what differs.
 //
 // format_*() all hand back the same static buffer, so the value is copied into
 // the item before anything else is formatted.
@@ -1691,6 +1964,8 @@ static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
   const char *tag = "";
   const char *label = "";
   const char *value = NULL;
+  MeasureKind kind = MK_VOLT;
+  bool present = true;
   char scratch[16];
 
   switch (metric)
@@ -1700,7 +1975,9 @@ static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
       break;
 
     case MEASURE_FREQ:
-      tag = "f"; label = "f "; value = format_frequency(sm->frequency);
+      tag = "f"; label = "f"; kind = MK_TIME;
+      value = format_frequency(sm->frequency);
+      present = sm->frequency > 0;
       break;
 
     case MEASURE_FFT_FREQ:
@@ -1708,8 +1985,9 @@ static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
       // showing this one: they are independent instruments, and the record
       // where they disagree is the record worth looking at twice
       signal_info_update();
-      tag = "F"; label = "fft";
+      tag = "F"; label = "fft"; kind = MK_TIME;
       value = g_spectrum_hz > 0 ? format_frequency(g_spectrum_hz) : "  --.--  ";
+      present = g_spectrum_hz > 0;
       break;
 
     case MEASURE_ALIAS:
@@ -1719,16 +1997,63 @@ static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
       // the time, and that blank is the normal state - see MEASURE_ALIAS in
       // config.h for what it means.
       signal_info_update();
-      tag = "?"; label = "?";
+      tag = "?"; label = "?"; kind = MK_OTHER;
       value = g_alias_hz > 0 ? format_frequency(g_alias_hz) : "  --.--  ";
+      present = g_alias_hz > 0;
       break;
 
     case MEASURE_DUTY:
-      tag = "d"; label = "d"; value = format_duty(sm->duty_x10);
+      tag = "d"; label = "duty"; kind = MK_OTHER;
+      value = format_duty(sm->duty_x10);
+      present = sm->duty_x10 >= 0;
       break;
 
     case MEASURE_VRMS:
       tag = "R"; label = "rms"; value = format_voltage(sm->vrms_mv, false);
+      break;
+
+    case MEASURE_VP:
+      // Peak from GROUND, not half of Vpp: on a 0..3.3 V logic line the two
+      // differ by a factor of two, and the one that answers "how much voltage
+      // is on this wire" is this one. See vp_mv in capture.h.
+      tag = "p"; label = "Vp"; value = format_voltage(sm->vp_mv, false);
+      break;
+
+    case MEASURE_VMAX:
+      tag = "M"; label = "max"; value = format_voltage(sm->vmax_mv, true);
+      break;
+
+    case MEASURE_VMIN:
+      // Both extremes carry their sign - which side of ground a peak is on is
+      // half of what they are for
+      tag = "m"; label = "min"; value = format_voltage(sm->vmin_mv, true);
+      break;
+
+    case MEASURE_VAMP:
+      // The swing between the flat levels, which is the amplitude of a square
+      // wave: overshoot and ringing live in Vpp and are left out of this
+      tag = "a"; label = "amp"; value = format_voltage(sm->vamp_mv, false);
+      break;
+
+    case MEASURE_PERIOD:
+      // What the frequency reading is 1/x of, and the number a datasheet
+      // timing diagram is written in. Blank rather than "0.00ns" when there is
+      // no periodic signal: a period of zero is not a measurement.
+      tag = "P"; label = "T"; kind = MK_TIME;
+      present = sm->period_med_ns > 0;
+      value = present ? format_time(sm->period_med_ns, false) : PERIOD_NONE;
+      break;
+
+    case MEASURE_WIDTH_POS:
+      tag = "H"; label = "T+"; kind = MK_TIME;
+      present = sm->width_pos_ns >= 0;
+      value = present ? format_time(sm->width_pos_ns, false) : PERIOD_NONE;
+      break;
+
+    case MEASURE_WIDTH_NEG:
+      tag = "L"; label = "T-"; kind = MK_TIME;
+      present = sm->width_neg_ns >= 0;
+      value = present ? format_time(sm->width_neg_ns, false) : PERIOD_NONE;
       break;
 
     case MEASURE_VAVG:
@@ -1737,19 +2062,27 @@ static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
 
     case MEASURE_TYPE:
       signal_info_update();
-      tag = "S"; label = ""; value = classify_name(g_signal_class.type);
+      tag = "S"; label = "type"; kind = MK_OTHER;
+      // Padded to the longest name there is ("Sawtooth"), because a value that
+      // changes width is a value that moves whatever the panel put after it
+      snprintf(scratch, sizeof(scratch), "%-8s", classify_name(g_signal_class.type));
+      value = scratch;
+      present = SIG_UNKNOWN != g_signal_class.type;
       break;
 
     case MEASURE_JITTER:
     {
-      char sig[10], pp[10];
+      char sig[FORMAT_PS_W + 4], pp[FORMAT_PS_W + 4];
 
       // sigma answers "how stable", p-p answers "how bad was the worst one";
-      // a runt cycle lives in p-p and would be invisible in sigma alone
+      // a runt cycle lives in p-p and would be invisible in sigma alone. Both
+      // come out five characters wide whatever the scale, so the pair is
+      // eleven and the panel's widest cell holds it without wobbling.
       format_ps(sm->jitter_rms_ps, sig, sizeof(sig));
       format_ps(sm->jitter_pp_ps, pp, sizeof(pp));
 
-      tag = "J"; label = "jit";
+      tag = "J"; label = "jit"; kind = MK_TIME;
+      present = sm->jitter_rms_ps >= 0;
       snprintf(scratch, sizeof(scratch), "%s~%s", sig, pp);
       value = scratch;
       break;
@@ -1757,11 +2090,14 @@ static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
 
     case MEASURE_THD:
       signal_info_update();
-      tag = "T"; label = "t";
+      // "THD", not the lone "t" it used to be. A one-letter name over a field
+      // that is blank most of the time is a puzzle, not a label.
+      tag = "T"; label = "THD"; kind = MK_OTHER;
+      present = g_signal_class.thd_x10 >= 0;
 
       // A spectrum is not always there to take it from, and a slot the user
       // asked for says so rather than going blank or keeping a stale number
-      if (g_signal_class.thd_x10 < 0)
+      if (!present)
         snprintf(scratch, sizeof(scratch), " --.-%%");
       else
         snprintf(scratch, sizeof(scratch), "%3d.%d%%",
@@ -1774,9 +2110,11 @@ static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
       return false;
   }
 
-  snprintf(it->panel, sizeof(it->panel), "%s%s", label, value);
+  snprintf(it->label, sizeof(it->label), "%s", label);
   snprintf(it->tag, sizeof(it->tag), "%s", tag);
   snprintf(it->value, sizeof(it->value), "%s", value);
+  it->kind = (uint8_t)kind;
+  it->present = present;
 
   return true;
 }
@@ -1788,7 +2126,10 @@ static int measure_build_items(const ScopeMeasure *sm, MeasureItem *it)
   // A config saved before these flags existed reads all-false: default set
   bool any = config.show_vpp || config.show_freq || config.show_duty ||
       config.show_vrms || config.show_vavg || config.show_type || config.show_thd || config.show_jitter ||
-      config.show_fft_freq || config.show_alias;
+      config.show_fft_freq || config.show_alias ||
+      config.show_vp || config.show_vmax || config.show_vmin ||
+      config.show_vamp || config.show_period || config.show_width_pos ||
+      config.show_width_neg;
 
   const bool shown[MEASURE_COUNT] =
   {
@@ -1802,6 +2143,13 @@ static int measure_build_items(const ScopeMeasure *sm, MeasureItem *it)
     [MEASURE_JITTER] = any && config.show_jitter,
     [MEASURE_FFT_FREQ] = any && config.show_fft_freq,
     [MEASURE_ALIAS] = any && config.show_alias,
+    [MEASURE_VP] = any && config.show_vp,
+    [MEASURE_VMAX] = any && config.show_vmax,
+    [MEASURE_VMIN] = any && config.show_vmin,
+    [MEASURE_VAMP] = any && config.show_vamp,
+    [MEASURE_PERIOD] = any && config.show_period,
+    [MEASURE_WIDTH_POS] = any && config.show_width_pos,
+    [MEASURE_WIDTH_NEG] = any && config.show_width_neg,
   };
 
   int n = 0;
@@ -1812,10 +2160,9 @@ static int measure_build_items(const ScopeMeasure *sm, MeasureItem *it)
       n++;
   }
 
-  // Never end up with nothing to draw: an empty panel text renders an empty
-  // mask, a blank band that compares equal to itself and is therefore never
-  // repainted again, and it is what a blank panel would look like for any
-  // other reason.
+  // Never end up with nothing to draw: an empty band compares equal to itself
+  // and is therefore never repainted again, and it is what a blank panel would
+  // look like for any other reason.
   if (n == 0 && measure_format(MEASURE_VPP, sm, &it[0]))
     n = 1;
 
@@ -1823,40 +2170,26 @@ static int measure_build_items(const ScopeMeasure *sm, MeasureItem *it)
 }
 
 //-----------------------------------------------------------------------------
-// Render a text line into the measurements panel mask (1 bit per pixel)
-static void mpanel_render_text(int row, const char *str)
+// Compose one pair: the name, one space, the value. The value keeps the leading
+// spaces its formatter padded it with - that padding is what holds a metric's
+// width constant, and a constant width is why nothing in the band moves when a
+// reading changes.
+static void mpanel_cell_set(MPanelCell *cell, const char *label,
+    const char *value, uint16_t color)
 {
-  const Font *font = FONT_SMALL;
-  int x = 4;
-  int y = 3 + row * 10;
+  int n = snprintf(cell->text, sizeof(cell->text), "%s%s%s",
+      label, label[0] ? " " : "", value);
 
-  for (; *str; str++)
-  {
-    char ch = *str;
+  if (n < 0)
+    n = 0;
+  else if (n > (int)sizeof(cell->text) - 1)
+    n = (int)sizeof(cell->text) - 1;
 
-    if (ch < FONT_FIRST_CHAR || ch > FONT_LAST_CHAR)
-      ch = ' ';
-
-    const uint8_t *bitmap = font->data + (ch - FONT_FIRST_CHAR) * font->pitch;
-    int size = font->width * font->height;
-
-    for (int i = 0; i < size; i++)
-    {
-      if ((bitmap[i / 8] >> (i % 8)) & 1)
-      {
-        int px = x + i % font->width;
-        int py = y + i / font->width;
-
-        if (px < GRID_WIDTH && py < MPANEL_H)
-          g_mpanel_mask[py][px / 8] |= (uint8_t)(1 << (px % 8));
-      }
-    }
-
-    x += font->width;
-
-    if (x > GRID_WIDTH - font->width)
-      break;
-  }
+  cell->len = (uint8_t)n;
+  cell->label_len = (uint8_t)strlen(label);
+  cell->color = color;
+  cell->x = 0;
+  cell->row = 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -2919,8 +3252,9 @@ static void decode_band_build(void)
 // cleared by something else would otherwise stay blank indefinitely.
 static void mpanel_invalidate(void)
 {
-  g_mpanel_line[0][0] = '\x01'; // never matches a freshly built line
-  g_mpanel_line[1][0] = 0;
+  g_mpanel_cells = -1;          // matches neither a grid nor free text
+  g_mpanel_text[0][0] = '\x01'; // ...and never a freshly built line either
+  g_mpanel_text[1][0] = 0;
   g_mpanel_force = true;        // and do it on the next tick, not in 500 ms
 
   if (config.measure_display)
@@ -2954,41 +3288,45 @@ static void mpanel_set_active(bool active)
 
   g_mpanel_active = active;
   mpanel_invalidate();
-  overlay_repaint_region(MPANEL_ROW0, MPANEL_H);
+  overlay_repaint_region(mpanel_row0(), mpanel_h());
 }
 
 //-----------------------------------------------------------------------------
-// Put fixed text in the panel. mpanel_update() derives its two lines from the
-// measurements; this is for text that is chosen rather than measured, like
-// the calibration hint, and it rebuilds only when the text actually changes.
+// Put fixed text in the panel instead of the reading grid. mpanel_update()
+// builds cells out of what was measured; this is for text that is chosen rather
+// than measured, like the calibration hint, and it rebuilds only when the text
+// actually changes.
 static void mpanel_set_lines(const char *l0, const char *l1)
 {
-  if (0 == strcmp(l0, g_mpanel_line[0]) && 0 == strcmp(l1, g_mpanel_line[1]))
+  if (g_mpanel_is_text &&
+      0 == strcmp(l0, g_mpanel_text[0]) && 0 == strcmp(l1, g_mpanel_text[1]))
     return;
 
-  strncpy(g_mpanel_line[0], l0, MPANEL_TEXT_MAX);
-  strncpy(g_mpanel_line[1], l1, MPANEL_TEXT_MAX);
-  g_mpanel_line[0][MPANEL_TEXT_MAX] = 0;
-  g_mpanel_line[1][MPANEL_TEXT_MAX] = 0;
-
-  memset(g_mpanel_mask, 0, sizeof(g_mpanel_mask));
-  mpanel_render_text(0, g_mpanel_line[0]);
-  mpanel_render_text(1, g_mpanel_line[1]);
+  strncpy(g_mpanel_text[0], l0, MPANEL_TEXT_MAX);
+  strncpy(g_mpanel_text[1], l1, MPANEL_TEXT_MAX);
+  g_mpanel_text[0][MPANEL_TEXT_MAX] = 0;
+  g_mpanel_text[1][MPANEL_TEXT_MAX] = 0;
+  g_mpanel_is_text = true;
 
   g_mpanel_builds++;
   g_mpanel_paints++;
-  overlay_repaint_region(MPANEL_ROW0, MPANEL_H);
+  overlay_repaint_region(mpanel_row0(), mpanel_h());
 }
 
 //-----------------------------------------------------------------------------
-// Rebuild the panel text from the selected metrics; on change, re-render the
-// mask and invalidate the affected columns
+// Rebuild the panel's cells from the selected metrics; on change, invalidate
+// the columns they cover.
+//
+// noinline deliberately: it is called once per scope tick from one place, and
+// welded into scope_task() -O3 unrolls the metric scan and the cell building
+// into three kilobytes of straight-line code. A call costs nothing at 2 Hz.
+__attribute__((noinline))
 static void mpanel_update(void)
 {
   ScopeMeasure sm;
   MeasureItem items[MEASURE_ITEMS_MAX];
-  char line[2][MPANEL_TEXT_MAX + 2];
-  int n;
+  MPanelCell next[MPANEL_CELLS_MAX];
+  int n, cells = 0;
   static int throttle = 0;
   static int heartbeat = 0;
 
@@ -3013,28 +3351,84 @@ static void mpanel_update(void)
 
   n = measure_build_items(&sm, items);
 
-  // Flow the items across the two lines
-  line[0][0] = 0;
-  line[1][0] = 0;
+  // memcmp decides below whether anything changed, so the holes the compiler
+  // leaves between these fields have to be a known value
+  memset(next, 0, sizeof(next));
 
-  for (int i = 0, li = 0; i < n && li < 2; i++)
+  // Everything that fits - and if something does not, the last cell says how
+  // many were left out instead of the band simply ending. Running out of room
+  // silently reads exactly like "there is nothing more to show".
   {
-    if (strlen(line[li]) + strlen(items[i].panel) + 2 > MPANEL_TEXT_MAX)
+    static const uint16_t kind_color[] =
     {
-      if (++li >= 2)
-        break;
+      [MK_VOLT]  = MEASURE_VOLTAGE_COLOR,
+      [MK_TIME]  = MEASURE_FREQ_COLOR,
+      [MK_OTHER] = MEASURE_MODE_COLOR,
+    };
+
+    int chars = mpanel_chars();
+    int x = 0, row = 0;
+
+    for (int i = 0; i < n && cells < MPANEL_CELLS_MAX; i++)
+    {
+      MPanelCell *cell = &next[cells];
+      uint16_t color = items[i].present ?
+          kind_color[items[i].kind < ARRAY_SIZE(kind_color) ? items[i].kind : MK_OTHER] :
+          MPANEL_NONE_COLOR;
+
+      mpanel_cell_set(cell, items[i].label, items[i].value, color);
+
+      // Wrap to the second row when this pair would run off the first, and
+      // stop when there is no third row to wrap into
+      if (x + cell->len > chars)
+      {
+        if (++row >= MPANEL_ROWS)
+          break;
+
+        x = 0;
+      }
+
+      cell->x = (uint8_t)x;
+      cell->row = (uint8_t)row;
+      x += cell->len + MPANEL_GUTTER;
+      cells++;
     }
 
-    if (line[li][0])
-      strcat(line[li], "  ");
+    // What did not fit says so, rather than the band simply ending: running out
+    // of room silently reads exactly like "there is nothing more to show". The
+    // marker needs room of its own, so the last pair placed gives way to it.
+    if (cells < n)
+    {
+      char more[12];
+      int hidden = n - cells;
+      int at = cells;
 
-    strcat(line[li], items[i].panel);
+      snprintf(more, sizeof(more), "+%d more", hidden);
+
+      if (x + (int)strlen(more) > chars && at > 0)
+      {
+        at--;                     // no room left: the marker takes its place
+        x = next[at].x;
+        row = next[at].row;
+        hidden++;
+      }
+      else
+      {
+        row = (at > 0) ? next[at - 1].row : 0;
+      }
+
+      snprintf(more, sizeof(more), "+%d more", hidden);
+      mpanel_cell_set(&next[at], "", more, MPANEL_NONE_COLOR);
+      next[at].x = (uint8_t)x;
+      next[at].row = (uint8_t)row;
+      cells = at + 1;
+    }
   }
 
-  if (0 == strcmp(line[0], g_mpanel_line[0]) &&
-      0 == strcmp(line[1], g_mpanel_line[1]))
+  if (!g_mpanel_is_text && cells == g_mpanel_cells &&
+      0 == memcmp(next, g_mpanel_cell, sizeof(next)))
   {
-    // Same text, so the mask is still right — but repaint it every few
+    // Same readings, so the band is still right — but repaint it every few
     // seconds anyway. The band lives inside the trace area, and anything
     // that paints there without going through build_trace_column() leaves a
     // hole the sweep will not heal (it skips columns whose trace data has
@@ -3044,21 +3438,18 @@ static void mpanel_update(void)
 
     heartbeat = 0;
     g_mpanel_paints++;
-    overlay_repaint_region(MPANEL_ROW0, MPANEL_H);
+    overlay_repaint_region(mpanel_row0(), mpanel_h());
     return;
   }
 
   heartbeat = 0;
   g_mpanel_builds++;
-  strcpy(g_mpanel_line[0], line[0]);
-  strcpy(g_mpanel_line[1], line[1]);
-
-  memset(g_mpanel_mask, 0, sizeof(g_mpanel_mask));
-  mpanel_render_text(0, line[0]);
-  mpanel_render_text(1, line[1]);
+  memcpy(g_mpanel_cell, next, sizeof(next));
+  g_mpanel_cells = cells;
+  g_mpanel_is_text = false;
 
   g_mpanel_paints++;
-  overlay_repaint_region(MPANEL_ROW0, MPANEL_H);
+  overlay_repaint_region(mpanel_row0(), mpanel_h());
 }
 
 //-----------------------------------------------------------------------------
@@ -3361,11 +3752,11 @@ static void draw_sample_rates(int sample_rate_limit, int sample_rate)
 
   str = format_sps(sample_rate_limit);
   lcd_set_color(BG_COLOR, SR_LIMIT_COLOR);
-  lcd_puts(252, 2, str);
+  lcd_puts(SAMPLE_RATE_X, 2, str);
 
   str = format_sps(sample_rate);
   lcd_set_color(BG_COLOR, SR_COLOR);
-  lcd_puts(252, 10, str);
+  lcd_puts(SAMPLE_RATE_X, 10, str);
 
   lcd_set_font(FONT_LARGE);
 }
@@ -3549,6 +3940,18 @@ void scope_display_settings_changed(void)
   g_persist_stamp = timer_ms();
   memset(g_avg_have, 0, sizeof(g_avg_have));
   g_shadow_valid = false;
+}
+
+//-----------------------------------------------------------------------------
+void scope_measure_panel_changed(void)
+{
+  // The cells were composed to the old font's cell width, so they go; the band
+  // rebuilds at the new one on the scope's next tick. The trace area itself is
+  // repainted in full when the menu closes over it, which is what covers the
+  // rows the band gives back when it shrinks.
+  memset(g_mpanel_cell, 0, sizeof(g_mpanel_cell));
+  g_mpanel_is_text = false;
+  mpanel_invalidate();
 }
 
 //-----------------------------------------------------------------------------
@@ -7578,7 +7981,6 @@ static void draw_status_line(void)
   draw_horizontal_scale();
   draw_horizontal_position();
   draw_trigger_level();
-  draw_trigger_edge();
   draw_measure();
 }
 
@@ -7956,16 +8358,18 @@ void scope_init(bool calibration_mode)
   // Settle the panel before anything paints. It decides who owns the status
   // line, and it is a static that outlives the application: entering the scope
   // a second time painted that line for the panel state of the previous
-  // session. The mask goes with it - the text in it is the old session's
-  // reading, and it would be composited into the first sweep.
+  // session. The cells go with it - the readings in them are the old session's,
+  // and they would be composited into the first sweep.
   g_mpanel_active = mpanel_wanted();
   g_line_owner = measure_owns_status_line();
-  memset(g_mpanel_mask, 0, sizeof(g_mpanel_mask));
+  memset(g_mpanel_cell, 0, sizeof(g_mpanel_cell));
+  g_mpanel_is_text = false;
   mpanel_invalidate();
 
   draw_grid_frame();
   draw_vertical_position(false);
   draw_trigger_mode();
+  draw_trigger_edge();
   draw_capture_state();
   draw_status_line();
   redraw_trace();
@@ -8028,6 +8432,7 @@ void scope_redraw_all(void)
   draw_grid_frame();
   draw_vertical_position(false);
   draw_trigger_mode();
+  draw_trigger_edge();
   draw_capture_state();
   draw_status_line();
   battery_redraw();
@@ -8051,14 +8456,15 @@ int scope_get_fps(void)
 // Why the measurements panel is (or is not) on screen. Read this straight
 // after the panel goes blank: `act` says whether the sweep composites it at
 // all, `bld`/`pnt` say whether it is still being rebuilt and repainted, and
-// `len` is the length of the text it last rendered.
+// `cell` is how many readings it last composed - zero with `act1` is the
+// combination that means "the band is being drawn, and it is empty".
 void scope_get_panel_state(char *buf, int size)
 {
-  snprintf(buf, (size_t)size, "d%d m%d act%d fft%d t%d bld%u pnt%u len%d",
+  snprintf(buf, (size_t)size, "d%d m%d act%d fft%d t%d bld%u pnt%u cell%d%s",
       config.measure_display ? 1 : 0, config.measure_panel_mode,
       g_mpanel_active ? 1 : 0, g_fft_mode ? 1 : 0, g_measure_timer,
       (unsigned)g_mpanel_builds, (unsigned)g_mpanel_paints,
-      (int)strlen(g_mpanel_line[0]));
+      g_mpanel_cells, g_mpanel_is_text ? " text" : "");
 }
 
 //-----------------------------------------------------------------------------

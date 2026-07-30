@@ -29,6 +29,12 @@ typedef struct
   int  rms_c100;   // RMS of (sample - zero_point), in counts * 100
   int  frequency;  // Hz; 0 when no periodic signal was found
   int  duty_x10;   // duty cycle in 0.1% units (0..1000); -1 when n/a
+  int  width_pos_ns;    // mean time per period spent above the mid level and
+  int  width_neg_ns;    // below it; -1 when n/a. Derived from the duty cycle
+                        // and period_med_ns below rather than measured on
+                        // their own, so the three can never disagree:
+                        // width_pos + width_neg == period_med exactly, and
+                        // width_pos / period_med IS the duty reading.
   int  periods;    // number of full periods seen
   int  slope_pos;  // samples where the signal was rising (beyond noise)
   int  slope_neg;  // samples where the signal was falling (beyond noise)

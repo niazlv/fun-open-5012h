@@ -835,8 +835,14 @@ static void draw_config_list(void)
 
     clear_body();
 
+    // One read per slot, and the verdict taken off the copy in hand: reading
+    // 128 entries over the SPI bus twice per repaint is a quarter of a second
+    // of this screen doing nothing visible
     for (int i = 0; i < count; i++) {
-        if (CONFIG_ENTRY_VALID == config_store_entry_state(i))
+        Config e;
+
+        if (config_store_read_entry(i, &e) &&
+            CONFIG_ENTRY_VALID == config_entry_state_of(&e))
             valid++;
     }
 
@@ -854,8 +860,10 @@ static void draw_config_list(void)
 
     for (int row = 0; row < rows && g_cfg_scroll + row < count; row++) {
         int i = g_cfg_scroll + row;
-        ConfigEntryState state = config_store_entry_state(i);
-        const Config *entry = config_store_entry(i);
+        Config buf_entry;
+        const Config *entry = config_store_read_entry(i, &buf_entry) ?
+            &buf_entry : NULL;
+        ConfigEntryState state = config_entry_state_of(entry);
         bool sel = (i == g_cfg_index);
 
         if (sel)
@@ -870,12 +878,12 @@ static void draw_config_list(void)
             snprintf(buf, sizeof(buf), "%c%3d  %-11s cnt %-7d %s",
                 (i == live) ? '>' : ' ', i,
                 config_entry_state_name(state), entry->count,
-                config_store_entry_calib_ok(i) ? "cal ok" : "cal --");
+                config_entry_calib_ok(entry) ? "cal ok" : "cal --");
         else
             snprintf(buf, sizeof(buf), "%c%3d  %-11s         %s",
                 (i == live) ? '>' : ' ', i,
                 config_entry_state_name(state),
-                config_store_entry_calib_ok(i) ? "cal ok" : "");
+                config_entry_calib_ok(entry) ? "cal ok" : "");
 
         lcd_puts(5, y, buf);
         y += LINE_H;
@@ -894,8 +902,10 @@ static void draw_config_list(void)
 static void draw_config_detail(void)
 {
     char buf[64];
-    const Config *entry = config_store_entry(g_cfg_index);
-    ConfigEntryState state = config_store_entry_state(g_cfg_index);
+    Config buf_entry;
+    const Config *entry = config_store_read_entry(g_cfg_index, &buf_entry) ?
+        &buf_entry : NULL;
+    ConfigEntryState state = config_entry_state_of(entry);
     int rows = LINES_PER_PAGE - 1;
     int y = BODY_Y;
 
@@ -937,9 +947,13 @@ static void draw_config_view(void)
 static int config_detail_lines(void)
 {
     char buf[64];
+    Config entry;
     int n = 0;
 
-    while (config_describe(config_store_entry(g_cfg_index), n, buf, sizeof(buf)))
+    if (!config_store_read_entry(g_cfg_index, &entry))
+        return 0;
+
+    while (config_describe(&entry, n, buf, sizeof(buf)))
         n++;
 
     return n;

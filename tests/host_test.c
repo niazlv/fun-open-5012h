@@ -1846,6 +1846,34 @@ int main(void)
   check_near("frequency", m.frequency, 12340, 0.5);
   check_near("duty x10", m.duty_x10, 300, 4);
   check_near("rms c100", m.rms_c100, 8000, 2);
+  // The period and how it splits: 81.04 us at 12.34 kHz, 30% of it high. The
+  // three are one measurement seen three ways, so the check that matters is
+  // that they still add up - a T+ that drifted off the duty reading would put
+  // two numbers on the same panel contradicting each other.
+  check_near("period ns", m.period_med_ns, 81037, 0.5);
+  check_near("T+ ns", m.width_pos_ns, 81037 * 0.30, 4);
+  check_near("T- ns", m.width_neg_ns, 81037 * 0.70, 4);
+  check_near("T+ and T- make the period",
+      m.width_pos_ns + m.width_neg_ns, m.period_med_ns, 0);
+
+  // --- ...and the same waveform inverted: T+ and T- swap, nothing else does.
+  // A duty measured off one edge only would report 30% for both.
+  printf("square 12.34 kHz duty=70%% amp=80:\n");
+  duty = 0.70;
+  synth(buf, SIZE, 777, fn_square, &duty, 12340.0, 1000.0, 80.0, ZERO_POINT);
+  measure_run(buf, SIZE, 777, 1000, ZERO_POINT, &m);
+  check_near("duty x10", m.duty_x10, 700, 4);
+  check_near("T+ ns", m.width_pos_ns, 81037 * 0.70, 4);
+  check_near("T- ns", m.width_neg_ns, 81037 * 0.30, 4);
+
+  // --- flat line: no period, so no half-periods either. -1 and not 0: a
+  // reading of zero nanoseconds is a measurement, and there is none here.
+  printf("flat line, timing:\n");
+  memset(buf, ZERO_POINT + 3, SIZE);
+  measure_run(buf, SIZE, 0, 1000, ZERO_POINT, &m);
+  check_near("period (none)", m.period_med_ns, 0, 0);
+  check_near("T+ (n/a)", m.width_pos_ns, -1, 0);
+  check_near("T- (n/a)", m.width_neg_ns, -1, 0);
 
   // --- triangle 250 Hz: mean 0, rms = a/sqrt(3) ---
   printf("triangle 250 Hz amp=90:\n");

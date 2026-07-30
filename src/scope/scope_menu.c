@@ -64,6 +64,22 @@ static const char *const g_trigger_edge_labels[] = { "Rise", "Fall", "Both" };
 
 static const char *const g_measure_panel_labels[] = { "On", "Off" };
 
+// In PANEL_FONT_* and PANEL_BG_* order, so the index the config stores IS the
+// setting. Index 0 of each is what the panel looked like before either was a
+// choice, which is what a config saved back then reads as.
+static void panel_look_changed(void)
+{
+  scope_measure_panel_changed();
+}
+
+static const char *const g_panel_font_labels[] = { "Small", "Large" };
+static const char *const g_panel_bg_labels[] = { "Dim", "Solid", "None" };
+
+_Static_assert(ARRAY_SIZE(g_panel_font_labels) == PANEL_FONT_COUNT,
+    "one label per PANEL_FONT_* value");
+_Static_assert(ARRAY_SIZE(g_panel_bg_labels) == PANEL_BG_COUNT,
+    "one label per PANEL_BG_* value");
+
 // What a status-line slot shows. Indexed by the MEASURE_* metric numbers, so
 // the order here is the order in config.h. "Off" hands the space back to the
 // trigger readouts, which is what an empty slot means.
@@ -71,6 +87,8 @@ static const char *const g_measure_slot_labels[] =
 {
   "Off", "Vpp", "Frequency", "Duty", "Vrms", "Vavg", "Type", "THD", "Jitter",
   "f (spectrum)", "? (above nyquist)",
+  "Vp (from 0 V)", "Vmax", "Vmin", "Vamp (top-base)",
+  "T (period)", "T+ (high)", "T- (low)",
 };
 
 // The slot choice cycles through MEASURE_COUNT entries, so this array MUST
@@ -1150,11 +1168,21 @@ static const menu_item_t g_trigger_items[] =
     .u.action = { action_trigger_50p, NULL } },
 };
 
-// The panel: a set of metrics in a small font, composited over the trace
+// The panel: a grid of readings composited over the trace, two rows deep. How
+// many fit is what the font decides, so the two settings belong together at the
+// top of this list rather than in Display with the trace's own look.
 static const menu_item_t g_panel_items[] =
 {
   { .kind = MI_CHOICE, .label = "Panel",
     .u.choice = { &config.measure_panel_mode, g_measure_panel_labels, 2, NULL } },
+  { .kind = MI_CHOICE, .label = "Size",
+    .desc = "6x8: six readings. 8x16: four, bigger",
+    .u.choice = { &config.measure_panel_font, g_panel_font_labels,
+        PANEL_FONT_COUNT, panel_look_changed } },
+  { .kind = MI_CHOICE, .label = "Background",
+    .desc = "Solid stays readable over a busy trace",
+    .u.choice = { &config.measure_panel_bg, g_panel_bg_labels,
+        PANEL_BG_COUNT, panel_look_changed } },
   { .kind = MI_SEPARATOR },
   { .kind = MI_TOGGLE, .label = "Vpp",
     .u.toggle = { &config.show_vpp, NULL } },
@@ -1179,6 +1207,31 @@ static const menu_item_t g_panel_items[] =
   { .kind = MI_TOGGLE, .label = "? (above nyquist)",
     .desc = "What it could be if the reading is a fold",
     .u.toggle = { &config.show_alias, NULL } },
+  { .kind = MI_SEPARATOR },
+  // The amplitudes, in the order the enum lists them - which is the order the
+  // panel flows them across its two lines
+  { .kind = MI_TOGGLE, .label = "Vp (from 0 V)",
+    .desc = "Peak from ground, not half of Vpp",
+    .u.toggle = { &config.show_vp, NULL } },
+  { .kind = MI_TOGGLE, .label = "Vmax",
+    .desc = "Highest sample, signed, from ground",
+    .u.toggle = { &config.show_vmax, NULL } },
+  { .kind = MI_TOGGLE, .label = "Vmin",
+    .desc = "Lowest sample, the same way",
+    .u.toggle = { &config.show_vmin, NULL } },
+  { .kind = MI_TOGGLE, .label = "Vamp (top-base)",
+    .desc = "The flat levels only: no overshoot, no ringing",
+    .u.toggle = { &config.show_vamp, NULL } },
+  { .kind = MI_SEPARATOR },
+  { .kind = MI_TOGGLE, .label = "T (period)",
+    .desc = "One whole cycle, in time",
+    .u.toggle = { &config.show_period, NULL } },
+  { .kind = MI_TOGGLE, .label = "T+ (high)",
+    .desc = "Time per period above the mid level",
+    .u.toggle = { &config.show_width_pos, NULL } },
+  { .kind = MI_TOGGLE, .label = "T- (low)",
+    .desc = "...and below it. T+ / T is the duty cycle.",
+    .u.toggle = { &config.show_width_neg, NULL } },
 };
 
 // The status line: exactly two values in the large font, and the user says
@@ -1296,8 +1349,19 @@ static const char *const g_draw_labels[] =
   "Lines", "sin(x)/x",
 };
 
+// The graticule behind the trace. On is index 0 - see the note on
+// config.grid_mode for why that is not a choice either.
+static const char *const g_grid_labels[] = { "On", "Off" };
+
 static const menu_item_t g_display_items[] =
 {
+  // No callback: the graticule is composited into every column from
+  // config.grid_mode itself, and the scope repaints in full when the menu
+  // closes over it - there is no cached copy of it to drop
+  { .kind = MI_CHOICE, .label = "Grid",
+    .desc = "Divisions behind the trace",
+    .u.choice = { &config.grid_mode, g_grid_labels,
+        ARRAY_SIZE(g_grid_labels), NULL } },
   { .kind = MI_CHOICE, .label = "Between samples",
     .desc = "sin(x)/x: true curve, only below nyquist",
     .u.choice = { &config.draw_mode, g_draw_labels,

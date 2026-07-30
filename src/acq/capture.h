@@ -87,8 +87,20 @@ typedef struct
   int      vrms_mv;
   int      vavg_mv;
   int      vmid_mv;    // (vmax + vmin) / 2 in mV: the 50% trigger level
+  // The absolute extremes and the larger of the two in magnitude - peak
+  // voltage as an instrument means it, measured from GROUND rather than from
+  // the middle of the screen. Everything above is either a difference (vpp,
+  // vamp, vrms) or deliberately screen-relative (vavg, vmid, which the
+  // trigger and the auto-setup steer by), so these are the only fields in
+  // here that the vertical position has been taken out of.
+  int      vmax_mv;
+  int      vmin_mv;
+  int      vp_mv;      // max(|vmax_mv|, |vmin_mv|), always >= 0
   int      frequency;  // Hz, 0 when not measurable
   int      duty_x10;   // 0.1% units, -1 when n/a
+  int      width_pos_ns; // time per period above / below the mid level, ns;
+  int      width_neg_ns; // -1 when n/a. See measure.h - they are cut from the
+                         // duty cycle, so they cannot disagree with it.
   // How much the frequency above can be trusted: noise crosses the mid
   // level constantly and would otherwise read as a signal
   int      period_med_ns;   // median period and its extremes over the record
