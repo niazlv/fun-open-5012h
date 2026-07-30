@@ -1573,6 +1573,34 @@ static int widget_scale(int size)
   return (size > 1) ? 2 : 1;
 }
 
+/*
+ * Vertical distances are stored against the BIGGEST trace area there is, not
+ * against whatever one is on screen, and these two are the conversion.
+ *
+ * The area is 200 px at the normal text size and 175 at the large one, so a
+ * distance kept in plain pixels means a different fraction of the screen in each
+ * - and a layout arranged in one of them arrives in the other with its spacing
+ * wrong. What that looks like is two readings, one measured from the top and one
+ * from the bottom, closing 25 px on each other and ending up on top of one
+ * another: the pair did not move WITH the area, so the area moved through them.
+ *
+ * Normalised, the pair keeps its share of the height and its shape. Layouts
+ * saved before this need no migration: they were written on the 200 px area,
+ * which is exactly what they are now read against.
+ *
+ * Horizontally there is nothing to do - the trace area is 300 px wide at every
+ * size, and the bars stretch rather than the graticule.
+ */
+static int widget_y_px(int stored)
+{
+  return stored * PANEL_WIDGET_STEP * GRID_HEIGHT / GRID_HEIGHT_MAX;
+}
+
+static int widget_y_store(int px)
+{
+  return px * GRID_HEIGHT_MAX / GRID_HEIGHT / PANEL_WIDGET_STEP;
+}
+
 //-----------------------------------------------------------------------------
 // Where a stored widget actually IS, given how big its text came out.
 //
@@ -1590,8 +1618,8 @@ static void widget_pos(const PanelWidget *w, int wide, int gh, int *px, int *py)
       (GRID_WIDTH - 2 - wide - w->x * PANEL_WIDGET_STEP) :
       (w->x * PANEL_WIDGET_STEP);
   int y = (w->flags & PW_ANCHOR_BOTTOM) ?
-      (GRID_HEIGHT - 2 - gh - w->y * PANEL_WIDGET_STEP) :
-      (w->y * PANEL_WIDGET_STEP);
+      (GRID_HEIGHT - 2 - gh - widget_y_px(w->y)) :
+      widget_y_px(w->y);
 
   *px = (x < 0) ? 0 : ((x > max_x) ? ((max_x < 0) ? 0 : max_x) : x);
   *py = (y < 0) ? 0 : ((y > max_y) ? ((max_y < 0) ? 0 : max_y) : y);
@@ -1617,7 +1645,7 @@ static void widget_set_pos(PanelWidget *w, int x, int y, int wide, int gh)
   w->flags |= (uint8_t)((right ? PW_ANCHOR_RIGHT : 0) |
       (bottom ? PW_ANCHOR_BOTTOM : 0));
   w->x = (uint8_t)(dx / PANEL_WIDGET_STEP);
-  w->y = (uint8_t)(dy / PANEL_WIDGET_STEP);
+  w->y = (uint8_t)widget_y_store(dy);
 }
 
 //-----------------------------------------------------------------------------
@@ -4612,9 +4640,23 @@ static void measure_slot(int slot, int x, const char *tag, const char *value,
   lcd_set_text_scale(2);
   lcd_set_color(BG_COLOR, color);
   lcd_puts(x + name_w, STATUS_LINE_Y, digits);
-  w = lcd_text_w(digits);
+  w = name_w + lcd_text_w(digits);
   h = lcd_glyph_h();
   lcd_set_text_scale(1);
+
+  /*
+   * Everything to the right of the digits goes, and only then does the unit go
+   * back on it.
+   *
+   * The order matters, and getting it wrong is visible: the number is trimmed
+   * rather than padded now, so losing a digit (105.00 mV -> 81.00 mV) slides the
+   * unit one 16 px glyph to the left. Erasing after the unit - which is what a
+   * fixed-width value needed - left the four pixels between the digits and the
+   * unit holding the left edge of the digit that used to be there, and a sliver
+   * of a figure beside "mV" reads as an extra zero.
+   */
+  if (prev_w[slot] > w)
+    lcd_fill_rect(x + w, STATUS_LINE_Y, prev_w[slot] - w, h, BG_COLOR);
 
   // The unit sits on the digits' baseline, not their top: it is read as part of
   // the number below it, and a unit floating level with the tops of the figures
@@ -4622,16 +4664,9 @@ static void measure_slot(int slot, int x, const char *tag, const char *value,
   if (unit && unit[1])
   {
     lcd_set_color(BG_COLOR, MEASURE_MODE_COLOR);
-    lcd_puts(x + name_w + w + 4, STATUS_LINE_Y + STATUS_ROW2_Y_OFS, unit + 1);
+    lcd_puts(x + w + 4, STATUS_LINE_Y + STATUS_ROW2_Y_OFS, unit + 1);
     w += 4 + text_width(unit + 1);
   }
-
-  // The name is part of the width the next reading has to be clear of, so the
-  // erase starts where the name did
-  w += name_w;
-
-  if (prev_w[slot] > w)
-    lcd_fill_rect(x + w, STATUS_LINE_Y, prev_w[slot] - w, h, BG_COLOR);
 
   prev_w[slot] = w;
 }
