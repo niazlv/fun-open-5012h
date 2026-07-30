@@ -103,43 +103,101 @@
 #define STATUS_LINE_Y          (g_geom.status_y)
 #define STATUS_LINE_HEIGHT     (g_geom.status_h)
 
-// Second row of the bottom bar at the large size; the same row at the normal
-// one, where there is only the one
-#define STATUS_ROW2_Y          (g_geom.status_y + g_geom.status_row2)
+// Inside a reading: how far below the digits' top the name and the unit sit, so
+// that they line up with the figures' baseline rather than their tops. Zero at
+// the normal size, where a reading is one row of one font.
+#define STATUS_ROW2_Y_OFS      (g_geom.status_row2)
 
 typedef struct
 {
   int16_t grid_top;
   int16_t grid_h;
-  int16_t status_y;
-  int16_t status_h;
+  int16_t status_y;      // the readings' row: the digits' own origin
+  int16_t status_h;      // ...and the whole bottom bar, which is what is cleared
   int16_t status_row2;   // offset of the second row, 0 when there is not one
-  int16_t top_text_y;    // the top bar's word row (trigger mode, capture state)
-  int16_t mv_y;          // ...and the record map's block, under it
-  int16_t slot0_x;       // the two big readings on the status line
+  int16_t slot0_x;       // the two readings, and how much room each one has
   int16_t slot1_x;
-  int8_t  bar_scale;     // glyph scale for the bars: 1, or 2 at the large size
+  int16_t slot_w;
+  int16_t vscale_x;      // volts per division, and the probe ratio beside it
+  int16_t vscale_y;
+  int16_t acdc_x;        // the coupling glyph
+  int16_t acdc_y;
+  int16_t hscale_x;      // time per division
+  int16_t hscale_y;
+  int16_t mode_x;        // AUTO / NORM / SNGL
+  int16_t mode_y;
+  int16_t state_x;       // STOP / WAIT / TRIG / ROLL
+  int16_t state_y;
+  int16_t mv_y;          // the record map, or -1 where there is no room for it
+  int8_t  bar_scale;     // glyph scale for the readings: 1, or 2 at Large
 } ScopeGeom;
 
 /*
- * Normal: what this instrument has always looked like. 8 divisions down, both
- * bars one row of 8x16.
+ * Normal: what this instrument has always looked like. 8 divisions down; the
+ * settings and the two readings share the bottom bar, the trigger mode and the
+ * capture state sit in the top one beside the record map.
  *
- * Large: the top bar's words and the two readings at 16x32, which needs 32 rows
- * where 16 were, twice. The record map keeps its full width and moves under the
- * words; the settings row keeps 8x16, because doubling it too would cost a
- * fifth division. Six divisions instead of eight - a quarter of the vertical
- * RANGE, at the same 25 px and therefore the same volts to a division.
+ * Large: what only the READINGS being big looks like, which is the arrangement
+ * the stock firmware uses and the reason it is legible at arm's length:
+ *
+ *   - every SETTING moves into the top bar as its own compact field: the probe
+ *     ratio, volts per division, the capture state, time per division, the
+ *     coupling, the trigger mode. Still 8x16. They are what you set, not what
+ *     you read, and a word like AUTO does not become more informative at 32 px -
+ *     it just eats the room the numbers need. (That was the first attempt: the
+ *     state words were doubled and the settings left small. It read as a size
+ *     applied to whatever happened to have room.)
+ *   - the bottom bar holds nothing but the two readings, and inside a reading
+ *     only the DIGITS are doubled - the name before them and the unit after
+ *     stay 8x16, exactly as "UPP 7.84 U" does on the stock display. A padded
+ *     unit at 16 px costs 24 px that the number wants.
+ *   - which leaves the graticule 175 px, seven divisions instead of eight. ONE
+ *     division, where doubling everything cost two.
+ *
+ * The record map is the one thing that does not fit: the settings row needs the
+ * width it was using. mv_y = -1 turns it off, and draw_miniview returns.
  */
-static const ScopeGeom g_geom_normal = { 20, 200, 223, 16,  0, 4,  1, 140, 228, 1 };
-static const ScopeGeom g_geom_large  = { 41, 150, 192, 48, 32, 0, 26,   0, 160, 2 };
+static const ScopeGeom g_geom_normal =
+{
+  .grid_top = 20, .grid_h = 200, .status_y = 223, .status_h = 16,
+  .status_row2 = 0,
+  .slot0_x = 140, .slot1_x = 228, .slot_w = 88,
+  .vscale_x = 10, .vscale_y = 223,
+  .acdc_x = 54, .acdc_y = 223,
+  .hscale_x = 82, .hscale_y = 223,
+  .mode_x = 10, .mode_y = 4,
+  .state_x = 46, .state_y = 4,
+  .mv_y = 1, .bar_scale = 1,
+};
 
-static ScopeGeom g_geom = { 20, 200, 223, 16, 0, 4, 1, 140, 228, 1 };
+static const ScopeGeom g_geom_large =
+{
+  .grid_top = 20, .grid_h = 175, .status_y = 202, .status_h = 44,
+  .status_row2 = 16,
+  .slot0_x = 2, .slot1_x = 162, .slot_w = 158,
+  .vscale_x = 30, .vscale_y = 2,
+  .acdc_x = 176, .acdc_y = 2,
+  .hscale_x = 126, .hscale_y = 2,
+  .mode_x = 208, .mode_y = 2,
+  .state_x = 88, .state_y = 2,
+  .mv_y = -1, .bar_scale = 2,
+};
 
-// Glyph scale for the bars, and the font that goes with it. One place, because
-// every field on both bars has to agree about how big the row is.
+static ScopeGeom g_geom =
+{
+  .grid_top = 20, .grid_h = 200, .status_y = 223, .status_h = 16,
+  .slot0_x = 140, .slot1_x = 228, .slot_w = 88,
+  .vscale_x = 10, .vscale_y = 223,
+  .acdc_x = 54, .acdc_y = 223,
+  .hscale_x = 82, .hscale_y = 223,
+  .mode_x = 10, .mode_y = 4,
+  .state_x = 46, .state_y = 4,
+  .mv_y = 1, .bar_scale = 1,
+};
+
+// Glyph scale for the readings. One place, because every field on the bar has
+// to agree about how tall the row is.
 #define BAR_SCALE              (g_geom.bar_scale)
-#define TOP_TEXT_Y             (g_geom.top_text_y)
 #define MV_Y                   (g_geom.mv_y)
 
 #define MINIVIEW_WIDTH         160
@@ -2022,7 +2080,7 @@ static void draw_ac_dc(void)
   if (g_toast_active)
     return;
 
-  lcd_draw_image(54, STATUS_ROW2_Y, config.ac_coupling ? &image_ac : &image_dc);
+  lcd_draw_image(g_geom.acdc_x, g_geom.acdc_y, config.ac_coupling ? &image_ac : &image_dc);
 }
 
 //-----------------------------------------------------------------------------
@@ -2032,7 +2090,7 @@ static void draw_horizontal_scale(void)
     return;
 
   lcd_set_color(BG_COLOR, HSCALE_COLOR);
-  lcd_puts(82, STATUS_ROW2_Y, hs_str[config.horizontal_scale]);
+  lcd_puts(g_geom.hscale_x, g_geom.hscale_y, hs_str[config.horizontal_scale]);
 }
 
 //-----------------------------------------------------------------------------
@@ -2051,7 +2109,19 @@ static bool measure_owns_status_line(void)
   if (g_fft_mode)
     return true; // the spectrum readout lives there
 
-  if (!config.measure_display || scope_calibration_mode)
+  /*
+   * MODE is not asked about here, and that is the point of the base view: with
+   * the overlay off, this screen IS the instrument - the settings along the top,
+   * two readings along the bottom, nothing over the trace. Asking MODE would
+   * empty the bottom bar of the only two numbers on it and hand the space to the
+   * trigger readouts, so the cleanest view was the one that said least.
+   *
+   * MODE means the OVERLAY - the band or the placed widgets, the thing that
+   * covers the trace (mpanel_wanted). A slot that should say nothing is set to
+   * Off in the menu; both of them Off hands the space back to the trigger level
+   * and the horizontal position, exactly as before.
+   */
+  if (scope_calibration_mode)
     return false;
 
   for (int i = 0; i < MEASURE_LINE_SLOTS; i++)
@@ -2062,6 +2132,11 @@ static bool measure_owns_status_line(void)
 
   return false;
 }
+
+//-----------------------------------------------------------------------------
+// One reading of the status line: see the definition for the two forms it takes
+static void measure_slot(int slot, int x, const char *tag, const char *value,
+    int color);
 
 //-----------------------------------------------------------------------------
 static void draw_horizontal_position(void)
@@ -2076,12 +2151,10 @@ static void draw_horizontal_position(void)
   // chart has to be read against.
   str = format_time(g_roll_active ? roll_screen_ns() : config.horizontal_position,
       !g_roll_active);
-  lcd_set_color(BG_COLOR, HPOS_COLOR);
-  // The second reading's slot, so that what stands here reads the same size as
-  // what stands here when the measurements own the line
-  lcd_set_text_scale(BAR_SCALE);
-  lcd_puts(MEASURE_SLOT_1_X, STATUS_LINE_Y, str);
-  lcd_set_text_scale(1);
+  // Through the reading painter, in the second reading's slot: what stands here
+  // when the measurements are off has to read the same as what stands here when
+  // they are on
+  measure_slot(1, MEASURE_SLOT_1_X, " ", str, HPOS_COLOR);
 }
 
 //-----------------------------------------------------------------------------
@@ -2136,38 +2209,55 @@ static void draw_vertical_position(bool toast)
 //-----------------------------------------------------------------------------
 static void draw_vertical_scale(void)
 {
+  const char *ratio = probe_ratio_labels[
+      ((unsigned)config.probe_ratio < PROBE_RATIO_COUNT) ? config.probe_ratio : 0];
+
   if (g_toast_active)
     return;
 
-  lcd_fill_rect(10, STATUS_ROW2_Y, VSCALE_FIELD_W, 16, BG_COLOR);
-
   /*
-   * With a probe counted in, this field says both things instead of one: the
-   * ratio above, what a division is now worth below, in the small font and in
-   * orange. Two rows of 6x8 fit the sixteen pixels the status line has and the
-   * forty-four this field owns, which is the only unclaimed space on the line -
-   * the top bar has none at all (the trigger mode ends at 41, the capture state
-   * runs 46..77, the record map starts at 81) and the two slots to the right are
-   * the measurements, or the trigger readouts when those are off.
+   * It matters that the probe ratio is on screen and not just in the menu: the
+   * label alone cannot distinguish 5 V/div from 500 mV/div through a 10x probe,
+   * and with 25x and 100x probes in the list the difference is not guessable.
    *
-   * It matters that the ratio is on screen and not just in the menu: the label
-   * alone cannot distinguish 5 V/div from 500 mV/div through a 10x probe, and
-   * with 25x and 100x probes in the list the difference is not guessable.
+   * Where it goes is the one thing the two layouts disagree about. At the large
+   * size this field is in the TOP bar with the other settings, and the ratio is
+   * a field of its own to the left of it - the arrangement the stock firmware
+   * uses, and there is room for it there. At the normal size the top bar has
+   * none at all (the trigger mode ends at 41, the capture state runs 46..77, the
+   * record map starts at 81), so the ratio goes above the label in the small
+   * font, two rows of 6x8 in the sixteen pixels the status line has.
    */
+  if (g_geom.bar_scale > 1)
+  {
+    lcd_fill_rect(g_geom.vscale_x - 26, g_geom.vscale_y, VSCALE_FIELD_W + 26,
+        16, BG_COLOR);
+
+    if (config.x10)
+    {
+      lcd_set_color(BG_COLOR, PROBE_TAG_COLOR);
+      lcd_puts(g_geom.vscale_x - 26, g_geom.vscale_y, ratio);
+    }
+
+    lcd_set_color(BG_COLOR, VSCALE_COLOR);
+    lcd_puts(g_geom.vscale_x, g_geom.vscale_y, vs_label(config.vertical_scale));
+    return;
+  }
+
+  lcd_fill_rect(g_geom.vscale_x, g_geom.vscale_y, VSCALE_FIELD_W, 16, BG_COLOR);
+
   if (config.x10)
   {
     lcd_set_font(FONT_SMALL);
     lcd_set_color(BG_COLOR, PROBE_TAG_COLOR);
-    lcd_puts(10, STATUS_ROW2_Y, probe_ratio_labels[
-        ((unsigned)config.probe_ratio < PROBE_RATIO_COUNT) ?
-            config.probe_ratio : 0]);
-    lcd_puts(10, STATUS_ROW2_Y + 8, vs_label(config.vertical_scale));
+    lcd_puts(g_geom.vscale_x, g_geom.vscale_y, ratio);
+    lcd_puts(g_geom.vscale_x, g_geom.vscale_y + 8, vs_label(config.vertical_scale));
     lcd_set_font(FONT_LARGE);
     return;
   }
 
   lcd_set_color(BG_COLOR, VSCALE_COLOR);
-  lcd_puts(10, STATUS_ROW2_Y, vs_label(config.vertical_scale));
+  lcd_puts(g_geom.vscale_x, g_geom.vscale_y, vs_label(config.vertical_scale));
 }
 
 //-----------------------------------------------------------------------------
@@ -2182,13 +2272,10 @@ static void draw_trigger_level(void)
     return;
 
   str = format_voltage(config.trigger_level_mv - config.vertical_position_mv, true);
-  lcd_set_color(BG_COLOR, TRIGGER_LEVEL_COLOR);
-  lcd_set_text_scale(BAR_SCALE);
   // The edge icon used to sit at 140 and this readout began after it. With the
   // icon in the top bar the reading starts the field itself, on the same left
   // edge the first measurement slot uses.
-  lcd_puts(MEASURE_SLOT_0_X, STATUS_LINE_Y, str);
-  lcd_set_text_scale(1);
+  measure_slot(0, MEASURE_SLOT_0_X, " ", str, TRIGGER_LEVEL_COLOR);
 }
 
 //-----------------------------------------------------------------------------
@@ -2232,9 +2319,7 @@ static void draw_trigger_mode(void)
     str = "SNGL";
 
   lcd_set_color(BG_COLOR, TRIGGER_MODE_COLOR);
-  lcd_set_text_scale(BAR_SCALE);
-  lcd_puts(10, TOP_TEXT_Y, str);
-  lcd_set_text_scale(1);
+  lcd_puts(g_geom.mode_x, g_geom.mode_y, str);
 }
 
 //-----------------------------------------------------------------------------
@@ -4467,28 +4552,88 @@ static void measure_slot(int slot, int x, const char *tag, const char *value,
   static int prev_w[MEASURE_LINE_SLOTS];
   int w, h;
 
-  // The tag stays 8x16 while the value doubles, and not out of thrift: a value
-  // is ten characters wide (the formatters pad it so a shorter reading covers
-  // the longer one it replaces), which at 16 px a character is 152, and two of
-  // those plus two 16 px tags is 336 on a 320 px line. An 8 px tag makes it 320
-  // exactly. It is a one-letter hint at which metric this is, not a reading, so
-  // it is the half of the pair that can afford to stay small.
+  if (1 == BAR_SCALE)
+  {
+    lcd_set_color(BG_COLOR, MEASURE_MODE_COLOR);
+    lcd_puts(x, STATUS_LINE_Y, tag);
+
+    lcd_set_color(BG_COLOR, color);
+    lcd_puts(x + MEASURE_TAG_W, STATUS_LINE_Y, value);
+
+    w = text_width(value);
+
+    if (prev_w[slot] > w)
+      lcd_fill_rect(x + MEASURE_TAG_W + w, STATUS_LINE_Y, prev_w[slot] - w,
+          STATUS_LINE_HEIGHT, BG_COLOR);
+
+    prev_w[slot] = w;
+    return;
+  }
+
+  /*
+   * The large form, which is the stock display's and is the whole point of the
+   * setting: the NAME small, the DIGITS at 16x32, the UNIT small again -
+   * "UPP 7.84 U". Doubling the unit and the padding with the number would cost
+   * 40 px a reading and buy nothing: nobody squints at "mV", they read the
+   * figure and glance at what it is in.
+   *
+   * Every formatter here writes [padded number][half space][unit] - see
+   * format_number() - so the half space is the split, and a value that has none
+   * (a duty cycle, a signal type) is all number, which is also right.
+   *
+   * The number is left-trimmed rather than padded, because at 16 px a character
+   * the padding IS the layout: a seven-character field is 112 px of a 158 px
+   * slot. What the padding was for - a shorter reading covering the longer one
+   * it replaces - is done by erasing the tail instead (prev_w).
+   */
+  const char *unit = strchr(value, FONT_HALF_SPACE);
+  const char *num = value;
+  char digits[16];
+  int n = 0;
+
+  while (' ' == *num)
+    num++;
+
+  while (num[n] && (!unit || num + n < unit) && n < (int)sizeof(digits) - 1)
+  {
+    digits[n] = num[n];
+    n++;
+  }
+
+  digits[n] = 0;
+
+  // The name is as wide as it is - one character for the trigger readouts, three
+  // or four for a metric - and the digits start after it
+  int name_w = text_width(tag) + 4;
+
   lcd_set_color(BG_COLOR, MEASURE_MODE_COLOR);
-  lcd_puts(x, STATUS_LINE_Y + (BAR_SCALE > 1 ? 8 : 0), tag);
+  lcd_puts(x, STATUS_LINE_Y + STATUS_ROW2_Y_OFS, tag);
 
-  lcd_set_text_scale(BAR_SCALE);
-  w = lcd_text_w(value);
-  h = lcd_glyph_h();
-
+  lcd_set_text_scale(2);
   lcd_set_color(BG_COLOR, color);
-  lcd_puts(x + MEASURE_TAG_W, STATUS_LINE_Y, value);
+  lcd_puts(x + name_w, STATUS_LINE_Y, digits);
+  w = lcd_text_w(digits);
+  h = lcd_glyph_h();
+  lcd_set_text_scale(1);
+
+  // The unit sits on the digits' baseline, not their top: it is read as part of
+  // the number below it, and a unit floating level with the tops of the figures
+  // reads as a separate word
+  if (unit && unit[1])
+  {
+    lcd_set_color(BG_COLOR, MEASURE_MODE_COLOR);
+    lcd_puts(x + name_w + w + 4, STATUS_LINE_Y + STATUS_ROW2_Y_OFS, unit + 1);
+    w += 4 + text_width(unit + 1);
+  }
+
+  // The name is part of the width the next reading has to be clear of, so the
+  // erase starts where the name did
+  w += name_w;
 
   if (prev_w[slot] > w)
-    lcd_fill_rect(x + MEASURE_TAG_W + w, STATUS_LINE_Y, prev_w[slot] - w,
-        h, BG_COLOR);
+    lcd_fill_rect(x + w, STATUS_LINE_Y, prev_w[slot] - w, h, BG_COLOR);
 
   prev_w[slot] = w;
-  lcd_set_text_scale(1);
 }
 
 //-----------------------------------------------------------------------------
@@ -4567,8 +4712,13 @@ static void draw_measure(void)
     // A slot set to Off draws itself blank: the trigger readouts do not move
     // in to share the space, so leaving the old glyphs there would be a
     // reading that quietly stopped updating
+    // The metric's NAME at the large size, its one-character tag at the normal
+    // one: "Vpp 2.03 V" is what the stock display puts there and there is room
+    // for it once the unit and the padding stop being 16 px wide, where at 8 px
+    // a character the same name would take a third of the slot.
     if (measure_format(config.measure_line[i], &sm, &item))
-      measure_slot(i, slot_x[i], item.tag, item.value, slot_color[i]);
+      measure_slot(i, slot_x[i], (BAR_SCALE > 1) ? item.label : item.tag,
+          item.value, slot_color[i]);
     else
       measure_slot(i, slot_x[i], " ", "", slot_color[i]);
   }
@@ -4612,12 +4762,7 @@ static void draw_capture_state(void)
   }
 
   lcd_set_color(BG_COLOR, color);
-  lcd_set_text_scale(BAR_SCALE);
-  // Straight after the trigger mode, whatever a glyph is worth: four of them at
-  // 8 px start this at 46, at 16 px at 82. The gap scales too - four pixels
-  // between two 32 px words reads as one word.
-  lcd_puts(10 + 4 * lcd_glyph_w() + 4 * BAR_SCALE, TOP_TEXT_Y, str);
-  lcd_set_text_scale(1);
+  lcd_puts(g_geom.state_x, g_geom.state_y, str);
 
   g_state = state;
 }
@@ -4657,6 +4802,12 @@ static int miniview_byte_at(int x)
 static void draw_miniview(int trigger_offset, int window_offset, int window_width)
 {
   static const uint8_t wave_pattern[8] = { 1, 0, 0, 1, 2, 3, 3, 2 };
+
+  // No row for it at the large size: the settings the stock layout puts in the
+  // top bar need the width this was using. See ScopeGeom.
+  if (MV_Y < 0)
+    return;
+
   // Rendered row-major in column chunks, one blit each.
   //
   // It started as 158 separate one-pixel-wide lcd_draw_buf calls, each paying
