@@ -5,6 +5,17 @@
  * Application launcher
  */
 
+/*
+ * Whether DOOM is in the image at all. The Makefile passes -DDOOM_APP=0 for
+ * builds that are handed to other people - the asset pack is made from a real
+ * IWAD and cannot be published, so a public image would otherwise carry an
+ * application whose only function is to say so. The default is on: a local
+ * build is a build for someone who can make the pack.
+ */
+#ifndef DOOM_APP
+#define DOOM_APP 1
+#endif
+
 /*- Includes ----------------------------------------------------------------*/
 #include <stddef.h>
 #include <stdint.h>
@@ -26,7 +37,9 @@
 #include "snake_game.h"
 #include "game2048.h"
 #include "tetris.h"
+#if DOOM_APP
 #include "doom_port.h"
+#endif
 #include "bk_port.h"
 #include "debug_coredump.h"
 #include "flash_viewer.h"
@@ -140,10 +153,12 @@ static const app_desc_t g_apps[] =
   { "Tetris", "Ten by twenty, with next, hold and a ghost",
     tetris_init, tetris_task, tetris_buttons_handler,
     tetris_cleanup, tetris_redraw, &tetris_menu, &tetris_help_menu, true },
+#if DOOM_APP
   { "DOOM", "id Software's renderer on a real WAD level",
     doom_port_init, doom_port_task, doom_port_buttons_handler,
     doom_port_cleanup, doom_port_redraw, &doom_port_menu, &doom_port_help_menu,
     false },
+#endif
   { "BK-0010-01", "Electronika BK-0010-01, a PDP-11 from 1985",
     bk_port_init, bk_port_task, bk_port_buttons_handler,
     bk_port_cleanup, bk_port_redraw, &bk_port_menu, &bk_port_help_menu,

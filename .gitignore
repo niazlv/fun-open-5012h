@@ -25,3 +25,10 @@ doom/doom_assets_tex.bin
 
 # Python bytecode from importing tools/ as a module
 __pycache__/
+
+# Dumps taken off a real device - the factory firmware and whatever the stock
+# firmware left on the serial part. Both are FNIRSI's, not ours to publish.
+# These are the names doc/flashing.md tells people to use; a dump under any
+# other name is on you.
+stock*.bin
+cal.bin

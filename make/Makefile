@@ -176,7 +176,6 @@ SRCS += \
   ../src/apps/snake_game.c \
   ../src/apps/snake_assets.c \
   ../src/apps/spi_tool.c \
-  ../src/apps/doom_port.c \
   ../src/apps/bk_port.c \
 
 # Электроника БК-0010-01: a PDP-11 and the five registers around it. Every
@@ -227,8 +226,21 @@ $(SIZE_OPTIMIZED): CFLAGS += -Os
 SRCS += \
   ../src/debug/debug_coredump.c \
 
+# Whether DOOM is in the image at all. DOOM (below) picks which asset pack is
+# linked; this one decides whether the application, the engine and the
+# launcher entry are built in the first place.
+#
+# It is for images that are handed to other people. The pack is made from a
+# real IWAD by tools/wadpack.py and cannot be published, so a public build
+# would carry an application whose only function is to say the data is
+# missing - and pay flash for it. The CI build passes DOOM_APP=0; a local
+# build is a build for someone who can make the pack, so the default is on.
+DOOM_APP ?= 1
+
 # Vendored: the DOOM engine, under its own COPYING
+ifeq ($(DOOM_APP),1)
 SRCS += \
+  ../src/apps/doom_port.c \
   ../doom/w_assets.c \
   ../doom/w_stream.c \
   ../doom/r_main.c \
@@ -240,11 +252,20 @@ SRCS += \
   ../doom/p_player.c \
   ../doom/p_doors.c \
 
+endif
+
 # Get build information
 BUILD_DATE := $(shell date '+%Y-%m-%d')
 BUILD_TIME := $(shell date '+%H:%M:%S')
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+# Wrapped in single quotes in DEFINES below, not backslash-escaped like the
+# rest: this one is a person's name and usually has a space in it. Escaped
+# quotes leave the space bare on the compiler's command line, the shell splits
+# there, and the build dies on "linker input file not found: Leushkin" - which
+# names no source and points at nothing. Every contributor whose git identity
+# is two words hit that; the CI build, whose identity is "GitHub Actions", hit
+# it first.
 GIT_USER := $(shell git config user.name 2>/dev/null || echo "Unknown Developer")
 BUILD_USER := $(shell whoami)
 SHA256 := $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo "shasum -a 256")
@@ -255,11 +276,12 @@ DEFINES += \
   -DBUILD_DATE=\"$(BUILD_DATE)\" \
   -DBUILD_TIME=\"$(BUILD_TIME)\" \
   -DGIT_HASH=\"$(GIT_HASH)\" \
-  -DGIT_BRANCH=\"$(GIT_BRANCH)\" \
-  -DGIT_USER=\"$(GIT_USER)\" \
+  -DGIT_BRANCH='"$(GIT_BRANCH)"' \
+  -DGIT_USER='"$(GIT_USER)"' \
   -DBUILD_USER=\"$(BUILD_USER)\" \
   -DFIRMWARE_NAME=\"github.com/niazlv/fun-open-5012H\" \
   -DFIRMWARE_VERSION=\"2.2.5\" \
+  -DDOOM_APP=$(DOOM_APP) \
 
 CFLAGS += $(INCLUDES) $(DEFINES)
 
@@ -285,12 +307,16 @@ else
   DOOM_ASSETS = $(BUILD)/doom_assets_empty.bin
 endif
 
+ifeq ($(DOOM_APP),1)
 OBJS += $(BUILD)/doom_assets.o
+endif
 
 # Which pack was linked is not recorded in any file's timestamp, so switching
 # between them would otherwise leave the previous object in place and the image
 # unchanged. The stamp remembers the setting and the stale artifacts are dropped
-# when it changes.
+# when it changes. DOOM_APP rides along in the same stamp: it decides the same
+# question one level up, and it also reaches launcher.o, which is the one
+# object outside doom/ that compiles differently for it.
 #
 # At PARSE time, deliberately: make decides what is out of date before it runs
 # any recipe, so a stamp that only gets rewritten during the build is a decision
@@ -302,9 +328,9 @@ DOOM_STAMP = $(BUILD)/doom_assets.stamp
 # make 3.81 compares timestamps to the second - two builds a moment apart look
 # simultaneous to it, and it would leave yesterday's image next to today's elf.
 $(shell $(MKDIR) -p $(BUILD); \
-    echo "$(DOOM_ASSETS)" | cmp -s - $(DOOM_STAMP) || { \
-      echo "$(DOOM_ASSETS)" > $(DOOM_STAMP); \
-      rm -f $(BUILD)/doom_assets.o $(BUILD)/$(BIN).elf \
+    echo "$(DOOM_ASSETS) app=$(DOOM_APP)" | cmp -s - $(DOOM_STAMP) || { \
+      echo "$(DOOM_ASSETS) app=$(DOOM_APP)" > $(DOOM_STAMP); \
+      rm -f $(BUILD)/doom_assets.o $(BUILD)/launcher.o $(BUILD)/$(BIN).elf \
             $(BUILD)/$(BIN).bin $(BUILD)/$(BIN).hex; })
 
 # Same trick for the store backend, and for a worse reason than DOOM's: that

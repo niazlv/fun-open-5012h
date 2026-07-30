@@ -1,0 +1,137 @@
+# Builds the firmware on every push, so that having the instrument is enough:
+# nobody needs a toolchain to get an image to flash. The artifact of every run
+# holds open-5012h.bin, and doc/flashing.md points here.
+#
+# The toolchain is Ubuntu's own gcc-arm-none-eabi rather than a pinned release
+# from ARM: it is one apt line, it cannot rot behind a moved download URL, and
+# nothing here depends on the exact compiler version. It is a newer GCC than
+# the 10.3 this project is developed on, so the image comes out a few kilobytes
+# off from a local build - same sources, same behaviour, different inliner.
+#
+# What is NOT in the artifact: the DOOM asset pack. It is built from a real
+# IWAD by tools/wadpack.py and carries id Software artwork, so it is not in the
+# repository and cannot be in a public build. The engine is; the application
+# starts and says how to build the pack.
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A second push to the same branch makes the first one's result uninteresting.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  firmware:
+    name: firmware
+    runs-on: ubuntu-latest
+    outputs:
+      artifact: ${{ steps.vars.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the ARM toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi
+          arm-none-eabi-gcc --version | head -1
+
+      - name: Name this build
+        id: vars
+        run: echo "artifact=open-5012h-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      # GIT_BRANCH and GIT_USER are passed in because the checkout is a
+      # detached HEAD with no git identity, and these two strings end up on the
+      # device's System Information screen. Command-line variables win over the
+      # Makefile's own `:=`, so this is all it takes.
+      #
+      # DOOM=0 links the empty asset stand-in from build/ instead of touching a
+      # placeholder into doom/ - the pack is not in the repository either way.
+      - name: Build
+        run: |
+          make -C make DOOM=0 \
+            GIT_BRANCH="${GITHUB_REF_NAME}" \
+            GIT_USER="GitHub Actions"
+
+      - name: What came out
+        run: |
+          cd make/build
+          size=$(wc -c < open-5012h.bin)
+          {
+            echo "### open-5012h — \`${GITHUB_SHA::7}\`"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| образ | **$size** байт из 524288 ($((size * 100 / 524288))% флеша) |"
+            echo "| sha256 | \`$(sha256sum open-5012h.bin | cut -d' ' -f1)\` |"
+            echo "| ветка | \`${GITHUB_REF_NAME}\` |"
+            echo "| ассеты DOOM | нет (собираются из своего IWAD, см. README) |"
+            echo
+            echo 'Файл для прошивки — `open-5012h.bin`, заливается по адресу `0x08000000`.'
+            echo "Как это сделать — [doc/flashing.md]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/doc/flashing.md)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          arm-none-eabi-size -t open-5012h.elf
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.vars.outputs.artifact }}
+          path: |
+            make/build/open-5012h.bin
+            make/build/open-5012h.hex
+            make/build/open-5012h.elf
+            make/build/open-5012h.map
+          if-no-files-found: error
+          retention-days: 90
+
+  # The DSP, the decoders and the PDP-11 core, on the host compiler. No ARM
+  # toolchain and no hardware: these are arithmetic over a sample buffer and
+  # state machines over key events, and they are the same sources the firmware
+  # links.
+  tests:
+    name: host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make test
+
+  # Only for a pushed v-tag. Ordinary pushes stay artifacts: those live 90 days
+  # and need a GitHub login to download, while a release is a permanent public
+  # link - that is a decision to make on purpose, by tagging.
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [firmware, tests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.firmware.outputs.artifact }}
+          path: dist
+
+      # There is no checkout in this job, so nothing here may reach for git -
+      # gh talks to the API, and the notes are written out below rather than
+      # generated from a tag range.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file - <<'EOF'
+          Прошивка собрана из этого тега. Файл для заливки — `open-5012h.bin`,
+          адрес `0x08000000`; как это сделать, если вы этого никогда не делали,
+          в `doc/flashing.md`.
+
+          Без ассетов DOOM: они делаются из вашего собственного IWAD и не могут
+          быть приложены, поэтому в этой сборке приложения DOOM нет вовсе.
+          EOF
