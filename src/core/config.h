@@ -522,6 +522,18 @@ typedef struct
   bool     show_width_pos;
   bool     show_width_neg;
 
+  // Vpp in the STATUS BAR hands its slot to the DC level when the trace is
+  // flat: false = it does, true = it does not. Inverted on purpose, because
+  // zero is what a config saved before this field existed reads as and the
+  // behaviour wanted by default is the swap - Vpp on a steady level is the
+  // noise band, which is a true answer to a question nobody asked.
+  //
+  // This byte cost nothing: seven bools followed by an int left one byte of
+  // alignment padding here, and the static asserts below say whether that is
+  // still true. The panel and the placed widgets deliberately do NOT do this,
+  // so there is no flag for them - see draw_measure().
+  bool     vpp_dc_off;
+
   // The graticule behind the trace: 0 = on, 1 = off. Zero-is-default like
   // measure_panel_mode, so a config saved before this field existed - or
   // migrated from version 1 - comes back with the ruling it had rather than a

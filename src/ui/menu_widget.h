@@ -44,6 +44,9 @@ typedef enum
   MI_ACTION = 0, // run action.fn(action.arg)
   MI_SUBMENU,    // open a nested menu
   MI_TOGGLE,     // flip *toggle.value in place, rendered as ON/OFF
+  MI_TOGGLE_INV, // the same, for a flag STORED inverted: a setting whose
+                 // default is on has to read zero in a config saved before it
+                 // existed, so the field says "off" and the row says ON
   MI_NUMBER,     // edit *number.value in place with LEFT/RIGHT
   MI_CHOICE,     // cycle *choice.value through choice.labels
   MI_SEPARATOR,

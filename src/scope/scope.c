@@ -4706,9 +4706,35 @@ static void measure_slot(int slot, int x, const char *tag, const char *value,
 static void fft_format_hz(char *buf, int size, float hz);
 static void fft_format_db(char *buf, int size, float db);
 
+// Is the record a level rather than a signal? In ADC CODES, not millivolts and
+// not percent: the question is whether the trace is a LINE on the screen, and a
+// code is about a pixel. Six of them is a quarter of a division - under that,
+// what a peak-to-peak reading reports is the noise band whatever the range;
+// over it there is a waveform to measure.
+//
+// Hysteresis, because what this decides is a WORD on the bar. A signal sitting
+// on the threshold would otherwise flicker between two names, and a flickering
+// label is worse than either of the two things it cannot choose between.
+#define BAR_DC_ENTER   6
+#define BAR_DC_LEAVE   10
+
+static bool measure_bar_is_flat(const ScopeMeasure *sm)
+{
+  static bool flat = false;
+  int swing = sm->vmax_raw - sm->vmin_raw;
+
+  if (config.vpp_dc_off)
+    return false;
+
+  flat = flat ? (swing <= BAR_DC_LEAVE) : (swing <= BAR_DC_ENTER);
+
+  return flat;
+}
+
 static void draw_measure(void)
 {
   ScopeMeasure sm;
+  bool dc;
   // Not static: where the two slots are depends on the text size now
   const int slot_x[MEASURE_LINE_SLOTS] =
       { MEASURE_SLOT_0_X, MEASURE_SLOT_1_X };
@@ -4766,9 +4792,23 @@ static void draw_measure(void)
   if (!capture_get_measurements(&sm))
     return;
 
+  dc = measure_bar_is_flat(&sm);
+
   for (int i = 0; i < MEASURE_LINE_SLOTS; i++)
   {
     MeasureItem item;
+    int metric = config.measure_line[i];
+    bool swap = dc && (MEASURE_VPP == metric);
+
+    // A flat trace has no peak-to-peak worth reading, and what Vpp reports on
+    // one is the noise band: a true answer to a question nobody asked. What
+    // somebody looking at a flat line wants is the level it sits at, so the bar
+    // hands its slot over and renames itself while it does - "Vdc" rather than
+    // a number under a word that no longer describes it. The panel and the
+    // placed widgets do NOT do this: those are lists of metrics somebody chose
+    // one by one, and a list whose entries change meaning is not a list.
+    if (swap)
+      metric = MEASURE_VAVG;
 
     // A slot set to Off draws itself blank: the trigger readouts do not move
     // in to share the space, so leaving the old glyphs there would be a
@@ -4777,11 +4817,21 @@ static void draw_measure(void)
     // one: "Vpp 2.03 V" is what the stock display puts there and there is room
     // for it once the unit and the padding stop being 16 px wide, where at 8 px
     // a character the same name would take a third of the slot.
-    if (measure_format(config.measure_line[i], &sm, &item))
+    if (measure_format(metric, &sm, &item))
+    {
+      if (swap)
+      {
+        snprintf(item.tag, sizeof(item.tag), "=");
+        snprintf(item.label, sizeof(item.label), "Vdc");
+      }
+
       measure_slot(i, slot_x[i], (BAR_SCALE > 1) ? item.label : item.tag,
           item.value, slot_color[i]);
+    }
     else
+    {
       measure_slot(i, slot_x[i], " ", "", slot_color[i]);
+    }
   }
 }
 

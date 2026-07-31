@@ -1271,6 +1271,12 @@ static const menu_item_t g_line_items[] =
     .desc = "Large readout at x=228",
     .u.choice = { &config.measure_line[1], g_measure_slot_labels,
         MEASURE_COUNT, NULL } },
+  { .kind = MI_SEPARATOR },
+  // Stored inverted (see config.h) so that the swap is what a device with no
+  // saved settings does. The row still reads the right way round.
+  { .kind = MI_TOGGLE_INV, .label = "Vpp shows DC",
+    .desc = "On a flat trace the bar reads the level",
+    .u.toggle = { &config.vpp_dc_off, NULL } },
 };
 
 //-----------------------------------------------------------------------------

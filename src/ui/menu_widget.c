@@ -219,6 +219,9 @@ static const char *item_value_str(const menu_item_t *it, char *buf, int size)
   if (MI_TOGGLE == it->kind)
     return *it->u.toggle.value ? "ON" : "OFF";
 
+  if (MI_TOGGLE_INV == it->kind)
+    return *it->u.toggle.value ? "OFF" : "ON";
+
   if (MI_NUMBER == it->kind)
   {
     snprintf(buf, size, "%d%s", *it->u.number.value,
@@ -1248,6 +1251,7 @@ static bool menu_input(void *ctx, int buttons)
         break;
 
       case MI_TOGGLE:
+      case MI_TOGGLE_INV:
         *it->u.toggle.value = !*it->u.toggle.value;
         if (it->u.toggle.on_change)
           it->u.toggle.on_change();

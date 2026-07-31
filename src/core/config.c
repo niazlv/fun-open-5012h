@@ -1866,6 +1866,7 @@ static const struct
   FIELD(average_mode, FT_INT),
   FIELD(draw_mode, FT_INT),
   FIELD(grid_mode, FT_INT),
+  FIELD(vpp_dc_off, FT_BOOL),
   FIELD(roll_from, FT_INT),
   FIELD(startup_app_mode, FT_INT),
   FIELD(ui_scale, FT_INT),
@@ -2162,6 +2163,7 @@ void config_reset(void)
   config.average_mode           = 0;
   config.draw_mode              = DRAW_LINEAR;
   config.grid_mode              = 0; // graticule behind the trace
+  config.vpp_dc_off             = false; // ...and Vpp shows a flat level
   config.decoder_baud           = 0; // auto-detect
   config.decoder_fit_mode       = 0; // fit the timebase to the rate
   config.decoder_bits_mode      = 0; // bit grid over the trace
