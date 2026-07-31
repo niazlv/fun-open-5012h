@@ -5220,13 +5220,13 @@ static int miniview_record_index(int x, int period_ns, int trigger_timepos)
 }
 
 //-----------------------------------------------------------------------------
-// Raw ADC count to a row inside the strip, by way of the row it would land on
-// in the graticule - so the strip is scaled and positioned exactly like the
-// trace, and a signal driven off screen pins to the strip's edge instead of
-// being quietly rescaled to fit.
-static int miniview_row(int raw)
+// A graticule row to a row inside the strip. Everything that lands in the strip
+// goes through the display first, so the strip is scaled and positioned exactly
+// like the trace under it, and a signal driven off screen pins to the strip's
+// edge instead of being quietly rescaled to fit.
+static int miniview_row_of(int display_row)
 {
-  int row = (roll_row(raw) * MINIVIEW_WAVE_ROWS) / (GRID_HEIGHT - 1);
+  int row = (display_row * MINIVIEW_WAVE_ROWS) / (GRID_HEIGHT - 1);
 
   if (row < 0)
     row = 0;
@@ -5234,6 +5234,53 @@ static int miniview_row(int raw)
     row = MINIVIEW_WAVE_ROWS - 1;
 
   return MINIVIEW_WAVE_TOP + row;
+}
+
+//-----------------------------------------------------------------------------
+// ...and a raw ADC count, by the route the swept trace takes to get there
+static int miniview_row(int raw)
+{
+  return miniview_row_of(roll_row(raw));
+}
+
+//-----------------------------------------------------------------------------
+/*
+ * Rolling: the screen IS the record. roll_commit() keeps exactly GRID_WIDTH
+ * columns and drops the oldest one out of the left of them, so there is no
+ * history behind the screen for a record map to reveal - and the window frame
+ * is pinned open across the whole strip to say so.
+ *
+ * So this draws the screen, squeezed. The redundancy is the message: the
+ * miniature matching the trace column for column is what makes the full-width
+ * frame legible as "the window covers everything" rather than as an empty box.
+ * Columns the roll has not reached yet stay empty, so the strip fills in from
+ * the right exactly as the trace does.
+ */
+static void miniview_envelope_roll(void)
+{
+  for (int cx = 0; cx < MINIVIEW_COLS; cx++)
+  {
+    int c0 = (cx * GRID_WIDTH) / MINIVIEW_COLS;
+    int c1 = ((cx + 1) * GRID_WIDTH) / MINIVIEW_COLS;
+    int top = GRID_HEIGHT, bot = -1;
+
+    for (int c = c0; c < c1; c++)
+    {
+      if (!(g_roll_row_flags[c] & SAMPLE_FLAG_VALID))
+        continue;
+
+      // Named for the counts they came from, not the rows they hold: a bigger
+      // count is a HIGHER pixel, so _min is the top row (see roll_commit)
+      if (g_roll_row_min[c] < top)
+        top = g_roll_row_min[c];
+
+      if (g_roll_row_max[c] > bot)
+        bot = g_roll_row_max[c];
+    }
+
+    if (bot >= 0)
+      g_mv_env[cx] = (uint8_t)((miniview_row_of(top) << 4) | miniview_row_of(bot));
+  }
 }
 
 //-----------------------------------------------------------------------------
@@ -5247,9 +5294,13 @@ static void miniview_envelope_build(void)
   g_mv_env_valid = true;
   g_mv_env_gen = capture_get_generation();
 
-  // Rolling has no record and no trigger to hang one on: the strip is pinned
-  // open there and says so by staying empty
-  if (g_roll_active || g_mv_span_ns <= 0)
+  if (g_roll_active)
+  {
+    miniview_envelope_roll();
+    return;
+  }
+
+  if (g_mv_span_ns <= 0)
     return;
 
   if (!capture_get_record(&data, &size, &offset, &period_ns, &trigger_timepos) ||
@@ -11298,7 +11349,10 @@ void scope_task(void)
   {
     g_mv_timer = MINIVIEW_UPDATE_TIMEOUT;
 
-    if (MV_Y >= 0 && capture_get_generation() != g_mv_env_gen)
+    // Rolling reads the on-screen strip rather than a record, and that strip
+    // advances on the fold's schedule with nothing in the acquisition
+    // generation to mark it: there the tick itself is the trigger to repaint
+    if (MV_Y >= 0 && (g_roll_active || capture_get_generation() != g_mv_env_gen))
     {
       g_mv_env_valid = false;
       redraw_miniview();
