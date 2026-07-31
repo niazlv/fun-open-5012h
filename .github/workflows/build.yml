@@ -34,7 +34,7 @@ jobs:
     outputs:
       artifact: ${{ steps.vars.outputs.artifact }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install the ARM toolchain
         run: |
@@ -79,7 +79,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           arm-none-eabi-size -t open-5012h.elf
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.vars.outputs.artifact }}
           path: |
@@ -98,7 +98,7 @@ jobs:
     name: host tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: make test
 
   # Only for a pushed v-tag. Ordinary pushes stay artifacts: those live 90 days
@@ -120,11 +120,11 @@ jobs:
       # generates is a list of merged pull requests, and the work in this
       # repository goes straight onto main, so what came back for v2.3.0 was a
       # bare "Full Changelog" link and no changes at all.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0   # the whole history and every tag, for the range below
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ needs.firmware.outputs.artifact }}
           path: dist
