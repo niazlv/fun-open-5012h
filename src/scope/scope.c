@@ -742,6 +742,7 @@ static int  g_roll_max = 0;
 
 static int cursor_t_col(int64_t t_ns);
 static int cursor_v_row(int mv);
+static int roll_row(int raw);
 static int64_t roll_screen_ns(void);
 static void roll_sync(void);
 static void roll_publish(void);
@@ -1176,6 +1177,16 @@ static int mpanel_row0(void)
 static int g_mv_trigger_px = 0;
 static int g_mv_window_px = -1;
 static int g_mv_width_px = 3;
+// Time the whole strip spans, ns. The strip's x axis is the capture RING, not
+// the record: update_sample_rate() derives every offset above from
+// period * CAPTURE_BUFFER_SIZE, and the trigger sits inside that at
+// g_mv_trigger_px. Kept here so the envelope below can put its samples on the
+// same axis the window frame is already drawn on.
+static int64_t g_mv_span_ns = 0;
+// Nothing else repaints the strip when a frame lands - it is redrawn from
+// settings changes - so the signal in it would otherwise be whatever the record
+// held the last time a key was pressed
+static int g_mv_timer = TIMER_DISABLE;
 
 _Static_assert(sizeof(LogicScratch) <= CAPTURE_SPARE_RAM_SIZE,
     "decoder scratch must fit the spare SRAM block");
@@ -5117,6 +5128,17 @@ static void draw_capture_state(void)
 // window set-ups a frame instead of one and holds 640 bytes instead of 2544.
 #define MINIVIEW_CHUNK 40
 
+// Rows the trace gets. 0 and MINIVIEW_ROWS-1 are the window frame's rails, and
+// they are drawn after the trace, so the envelope stays off them: a signal that
+// reached the rail row would read as the frame extending.
+#define MINIVIEW_WAVE_TOP  1
+#define MINIVIEW_WAVE_ROWS (MINIVIEW_ROWS - 2)
+
+// Rebuild the envelope at 10 Hz at most. A sweep is 786 us at the fast end, so
+// the acquisition generation changes far quicker than anyone can read a 159 px
+// strip, and the scan below is ~24 KB of compares.
+#define MINIVIEW_UPDATE_TIMEOUT 100
+
 // Which decoded byte covers this miniview column? The miniview maps the
 // whole record linearly onto its width, so record position p sits at
 // x = (p/size - 1/2) * MINIVIEW_WIDTH.
@@ -5141,14 +5163,152 @@ static int miniview_byte_at(int x)
 }
 
 //-----------------------------------------------------------------------------
+/*
+ * The signal behind the strip: the record's own min/max envelope, one column at
+ * a time, instead of the zigzag that used to stand in for it.
+ *
+ * One byte per column - the envelope's top row in the high nibble, its bottom
+ * row in the low one, MV_ENV_NONE where no record reaches. Display ROWS and not
+ * the raw counts they came from, which costs nothing: the mapping from counts to
+ * rows depends on the vertical scale and position, and both of those already
+ * invalidate this through scope_display_settings_changed(). It buys back 159
+ * bytes of the borrowed TCM block, which is a region with a floor rather than
+ * room to spare - see the linker script.
+ *
+ * WHY THE RECORD AND NOT THE RING, when the strip's axis is the ring's whole
+ * 786 us. Because the ring cannot be read as a record once acquisition is
+ * running. A sweep is one full lap of it (capture.c: the post-trigger count is
+ * CAPTURE_BUFFER_SIZE - trigger_offset), and dma_finish() hands straight over
+ * to dma_start(), which begins overwriting from ring index 0 again. The ring is
+ * a coherent, trigger-anchored record for exactly as long as it takes the next
+ * sweep to start, which at 125 MS/s is 786 us - tens of laps between two
+ * repaints of this strip. Whatever the main loop finds there afterwards is a
+ * different sweep, and the trigger position saved from the last dma_finish does
+ * not describe it. The 24 KB storage record is the ONLY trigger-anchored
+ * snapshot that survives, and it is what the trace is drawn from - so it is
+ * also the only thing that can be drawn here without the frame below lying
+ * about which signal it is framing.
+ *
+ * At slow timebases the record IS the whole ring, decimated 4:1, so the strip
+ * fills end to end. Past ~16 us/div it becomes a 24 KB full-rate WINDOW of the
+ * ring (update_storage_window) and covers about a quarter of the strip; the
+ * rest stays empty, which is the true statement - there is no record there, and
+ * panning into it moves the window rather than revealing anything.
+ */
+#define MV_ENV_NONE 0xff
+
+static uint8_t g_mv_env[MINIVIEW_COLS];
+static bool g_mv_env_valid = false;
+static uint32_t g_mv_env_gen = 0;
+
+//-----------------------------------------------------------------------------
+// Strip column edge x to a sample index in the record. Both go through
+// trigger-relative time, which is the one axis the strip, the window frame and
+// the record all already agree on.
+static int miniview_record_index(int x, int period_ns, int trigger_timepos)
+{
+  int64_t t = ((int64_t)(x - g_mv_trigger_px) * g_mv_span_ns) / MINIVIEW_WIDTH;
+  int64_t j = t / period_ns;
+
+  // Floor, not truncate: C rounds toward zero, and on the left half of the
+  // strip that would round two adjacent column edges to the same index and
+  // leave the column between them empty
+  if (t < 0 && (t % period_ns) != 0)
+    j -= 1;
+
+  return (int)(j + trigger_timepos);
+}
+
+//-----------------------------------------------------------------------------
+// Raw ADC count to a row inside the strip, by way of the row it would land on
+// in the graticule - so the strip is scaled and positioned exactly like the
+// trace, and a signal driven off screen pins to the strip's edge instead of
+// being quietly rescaled to fit.
+static int miniview_row(int raw)
+{
+  int row = (roll_row(raw) * MINIVIEW_WAVE_ROWS) / (GRID_HEIGHT - 1);
+
+  if (row < 0)
+    row = 0;
+  else if (row >= MINIVIEW_WAVE_ROWS)
+    row = MINIVIEW_WAVE_ROWS - 1;
+
+  return MINIVIEW_WAVE_TOP + row;
+}
+
+//-----------------------------------------------------------------------------
+static void miniview_envelope_build(void)
+{
+  const uint8_t *data;
+  int size, offset, period_ns, trigger_timepos;
+
+  memset(g_mv_env, MV_ENV_NONE, sizeof(g_mv_env));
+
+  g_mv_env_valid = true;
+  g_mv_env_gen = capture_get_generation();
+
+  // Rolling has no record and no trigger to hang one on: the strip is pinned
+  // open there and says so by staying empty
+  if (g_roll_active || g_mv_span_ns <= 0)
+    return;
+
+  if (!capture_get_record(&data, &size, &offset, &period_ns, &trigger_timepos) ||
+      period_ns <= 0 || size <= 0)
+    return;
+
+  for (int cx = 0; cx < MINIVIEW_COLS; cx++)
+  {
+    int x = cx - MINIVIEW_WIDTH/2 + 1;
+    int j0 = miniview_record_index(x, period_ns, trigger_timepos);
+    int j1 = miniview_record_index(x + 1, period_ns, trigger_timepos);
+    int vmin = 255, vmax = 0;
+    int idx;
+
+    if (j0 < 0)
+      j0 = 0;
+
+    if (j1 > size)
+      j1 = size;
+
+    if (j0 >= j1)
+      continue;   // no record under this column
+
+    idx = offset + j0;
+
+    if (idx >= size)
+      idx -= size;
+
+    for (int j = j0; j < j1; j++)
+    {
+      int v = data[idx];
+
+      if (v < vmin)
+        vmin = v;
+
+      if (v > vmax)
+        vmax = v;
+
+      if (++idx == size)
+        idx = 0;
+    }
+
+    // Bigger count is higher on screen, i.e. the SMALLER row number
+    g_mv_env[cx] = (uint8_t)((miniview_row(vmax) << 4) | miniview_row(vmin));
+  }
+}
+
+//-----------------------------------------------------------------------------
 static void draw_miniview(int trigger_offset, int window_offset, int window_width)
 {
-  static const uint8_t wave_pattern[8] = { 1, 0, 0, 1, 2, 3, 3, 2 };
-
   // No row for it at the large size: the settings the stock layout puts in the
   // top bar need the width this was using. See ScopeGeom.
   if (MV_Y < 0)
     return;
+
+  // Cheap when it is already current: a decoder selection moving repaints this
+  // strip without the record under it having changed
+  if (!g_mv_env_valid)
+    miniview_envelope_build();
 
   // Rendered row-major in column chunks, one blit each.
   //
@@ -5177,10 +5337,6 @@ static void draw_miniview(int trigger_offset, int window_offset, int window_widt
       int x = cx - MINIVIEW_WIDTH/2 + 1;
       bool inside = ((x > window_offset) && (x < (window_offset + window_width)));
       bool edge = ((x == window_offset) || (x == (window_offset + window_width - 1)));
-      // C truncates toward zero, so a bare x % 8 is negative for the left half
-      // of the miniview; that indexed wave_pattern out of bounds and the value
-      // read there was then used as a write index into this column
-      int phase = ((x % (int)sizeof(wave_pattern)) + sizeof(wave_pattern)) % (int)sizeof(wave_pattern);
       int byte_here = miniview_byte_at(x);
       uint16_t col[MINIVIEW_ROWS];
 
@@ -5197,16 +5353,24 @@ static void draw_miniview(int trigger_offset, int window_offset, int window_widt
         if (byte_here >= 0)
         {
           // Decoder view: the record map shows where the decoded bytes sit
-          // instead of the decorative wave
+          // instead of the signal
           uint16_t color = (byte_here == g_decode_sel) ? DSTRIP_SEL :
               ((byte_here & 1) ? DSTRIP_ODD : DSTRIP_EVEN);
 
           for (int i = 2; i <= 5; i++)
             col[i] = color;
         }
-        else
+        else if (g_mv_env[cx] != MV_ENV_NONE)
         {
-          col[2 + wave_pattern[phase]] = inside ? TRACE_COLOR : MV_FRAME_COLOR;
+          // The record's own envelope for this column, min to max, on the same
+          // vertical scale as the trace. Same colour rule the zigzag had: lit
+          // inside the window, frame-grey outside, so the strip still reads as
+          // "this part is on screen" at a glance.
+          uint16_t color = inside ? TRACE_COLOR : MV_FRAME_COLOR;
+          int bot = g_mv_env[cx] & 0x0f;
+
+          for (int i = g_mv_env[cx] >> 4; i <= bot; i++)
+            col[i] = color;
         }
 
         if (inside)
@@ -5292,6 +5456,8 @@ static void update_sample_rate(void)
     g_mv_trigger_px = 0;
     g_mv_window_px = -MINIVIEW_WIDTH/2;
     g_mv_width_px = MINIVIEW_WIDTH;
+    g_mv_span_ns = 0;   // no record behind the strip; the envelope stays empty
+    g_mv_env_valid = false;
     draw_miniview(g_mv_trigger_px, g_mv_window_px, g_mv_width_px);
 
     // The lower readout is the ring's own rate, undecimated: the fold reads
@@ -5367,6 +5533,12 @@ static void update_sample_rate(void)
   g_mv_trigger_px = trigger_offset_px;
   g_mv_window_px = window_offset_px;
   g_mv_width_px = window_width_px;
+
+  // Same denom the three offsets above were scaled by: the envelope has to land
+  // on the axis they were placed on, or the signal and the frame around it
+  // would be drawn to different rulers
+  g_mv_span_ns = denom;
+  g_mv_env_valid = false;
 
   draw_miniview(trigger_offset_px, window_offset_px, window_width_px);
 
@@ -5444,6 +5616,10 @@ void scope_display_settings_changed(void)
   g_persist_stamp = timer_ms();
   memset(g_avg_have, 0, sizeof(g_avg_have));
   g_shadow_valid = false;
+
+  // The record map's envelope is stored as display rows, so it was built
+  // through the vertical scale and position - which is exactly what just moved
+  g_mv_env_valid = false;
 }
 
 //-----------------------------------------------------------------------------
@@ -10709,8 +10885,10 @@ void scope_init(bool calibration_mode)
   timer_add(&g_fps_timer);
   timer_add(&g_fft_timer);
   timer_add(&g_trend_timer);
+  timer_add(&g_mv_timer);
   g_fps_timer = 1000;
   g_trend_timer = TREND_INTERVAL_MS;
+  g_mv_timer = MINIVIEW_UPDATE_TIMEOUT;
 
   g_measure_timer = config.measure_display ? MEASURE_UPDATE_TIMEOUT : TIMER_DISABLE;
 
@@ -11110,6 +11288,21 @@ void scope_task(void)
 
     if (!g_toast_active)
       draw_status_line();
+  }
+
+  // Put the current record in the record map. Only when the acquisition has
+  // actually moved on: the strip costs a 24 KB scan and four blits, and at a
+  // fast timebase this timer would otherwise pay both to redraw the same
+  // picture. MV_Y < 0 is the Large layout, where there is no strip at all.
+  if (g_mv_timer == 0)
+  {
+    g_mv_timer = MINIVIEW_UPDATE_TIMEOUT;
+
+    if (MV_Y >= 0 && capture_get_generation() != g_mv_env_gen)
+    {
+      g_mv_env_valid = false;
+      redraw_miniview();
+    }
   }
 
   // measure_display can also be flipped from the system menu, which does not
