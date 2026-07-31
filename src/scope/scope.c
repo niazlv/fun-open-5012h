@@ -8770,7 +8770,10 @@ static void gain_prompt(void)
   g_gain_note_until = 0;
   snprintf(want, sizeof(want), "%s", gain_trim(format_voltage(ref, false)));
 
-  if (capture_get_measurements(&sm) && sm.vavg_mv > 0)
+  // A tenth of the expected level, not merely "positive": at this prompt in a
+  // full calibration run the input is still shorted, and "reads 3.00 mV, want
+  // 1.00 V, -99.7%" is a true sentence that tells nobody anything.
+  if (capture_get_measurements(&sm) && sm.vavg_mv > ref / 10)
   {
     // Percent, because that is the shape of the error: a gain is a multiplier,
     // and 3.5% out at 5 V/div is 3.5% out everywhere on that range
@@ -8798,9 +8801,9 @@ static void gain_prompt(void)
 }
 
 //-----------------------------------------------------------------------------
-static void gain_note(const char *msg)
+static void gain_note(const char *msg, int ms)
 {
-  g_gain_note_until = timer_ms() + 2500;
+  g_gain_note_until = timer_ms() + ms;
   autocal_say(msg, "MODE trims  L/R level  SHIFT+U/D range  STOP done");
 }
 
@@ -8813,7 +8816,7 @@ static void gain_refuse(const char *note, const char *l0, const char *l1)
 {
   if (g_autocal_gain_only)
   {
-    gain_note(note);
+    gain_note(note, 2500);
     g_autocal_phase = ACAL_ASK_REF;
     g_autocal_timer = TIMER_DISABLE;
     autocal_mark();
@@ -9070,7 +9073,7 @@ static void lin_done(void)
 {
   int q[2] = { 0, 0 }, resid[2] = { 0, 0 };
   const char *why = "no measurement";
-  char l0[80], l1[80];
+  char l0[80];
   bool ok;
 
   ok = lin_fit(0, &q[0], &resid[0], &why) && lin_fit(1, &q[1], &resid[1], &why);
@@ -9113,9 +9116,10 @@ static void lin_done(void)
   g_autocal_phase = ACAL_ASK_REF;
   g_autocal_timer = TIMER_DISABLE; // connecting a source takes as long as it takes
 
-  snprintf(l1, sizeof(l1), "Apply %s DC.  MODE continues  STOP finishes",
-      format_voltage(scope_calib_ref_mv(), false));
-  autocal_say(l0, l1);
+  // Held for six seconds and then the gain prompt takes the line: what the
+  // sweep found is worth reading, and what comes next is worth doing, and the
+  // one thing that must not happen is the number going by unread.
+  gain_note(l0, 6000);
 }
 
 //-----------------------------------------------------------------------------
@@ -9342,8 +9346,7 @@ static void autocal_advance(void)
       autocal_set_position(0);
       g_autocal_phase = ACAL_ASK_REF;
       g_autocal_timer = TIMER_DISABLE;
-      autocal_say("Linearity: both converters have to be running",
-          "MODE continues to gain   STOP finishes here");
+      gain_note("Linearity: both converters have to be running", 4000);
       return;
     }
 
@@ -9475,7 +9478,7 @@ static void autocal_advance(void)
         snprintf(msg, sizeof(msg), "%s/div gain %c%d.%d%% - now reads %s",
             gain_trim(vs_label(config.vertical_scale)), sign, err / 10,
             err % 10, gain_trim(format_voltage(gain_ref_tip_mv(), false)));
-        gain_note(msg);
+        gain_note(msg, 2500);
 
         g_autocal_phase = ACAL_ASK_REF;
         g_autocal_timer = TIMER_DISABLE;
@@ -9503,7 +9506,7 @@ static void autocal_step(void)
     // see the error settle before committing to it. mpanel_set_lines() drops a
     // line identical to the one already up, so a steady reading is not a
     // repaint.
-    if (ACAL_ASK_REF == g_autocal_phase && g_autocal_gain_only)
+    if (ACAL_ASK_REF == g_autocal_phase)
       gain_prompt();
 
     update_display(); // just keep the trace alive under the message
@@ -9924,7 +9927,7 @@ void scope_buttons_handler(int buttons)
     // level and the range are the two things the user is holding, so those
     // four keys keep their normal meaning and their auto-repeat. Everything
     // else in a run is a one-shot answer to a question that was asked.
-    if (ACAL_ASK_REF == g_autocal_phase && g_autocal_gain_only)
+    if (ACAL_ASK_REF == g_autocal_phase)
     {
       if (buttons & (BTN_LEFT | BTN_RIGHT))
       {
