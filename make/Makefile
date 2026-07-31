@@ -325,7 +325,7 @@ DEFINES += \
   -DGIT_USER='"$(GIT_USER)"' \
   -DBUILD_USER=\"$(BUILD_USER)\" \
   -DFIRMWARE_NAME=\"github.com/niazlv/fun-open-5012H\" \
-  -DFIRMWARE_VERSION=\"2.2.5\" \
+  -DFIRMWARE_VERSION=\"2.3.0\" \
   -DDOOM_APP=$(DOOM_APP) \
 
 CFLAGS += $(INCLUDES) $(DEFINES)

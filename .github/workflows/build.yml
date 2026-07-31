@@ -118,8 +118,12 @@ jobs:
           path: dist
 
       # There is no checkout in this job, so nothing here may reach for git -
-      # gh talks to the API, and the notes are written out below rather than
-      # generated from a tag range.
+      # gh talks to the API for all of it, including what changed. That is why
+      # the list of changes comes from --generate-notes, which asks GitHub for
+      # the commits since the previous release, rather than from a `git log`
+      # over a tag range: there is no tree here to run it in. The text below is
+      # the part that is the same in every release - what the file is and where
+      # it goes - and the generated list is appended to it.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -127,6 +131,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
+            --generate-notes \
             --notes-file - <<'EOF'
           Прошивка собрана из этого тега. Файл для заливки — `open-5012h.bin`,
           адрес `0x08000000`; как это сделать, если вы этого никогда не делали,
