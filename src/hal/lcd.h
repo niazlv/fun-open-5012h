@@ -76,6 +76,22 @@ void lcd_backlight_activity(void);
 // One pass of the inactivity clock. may_dim says whether what is on screen
 // right now is allowed to be dimmed - the caller knows that, this does not.
 void lcd_backlight_task(bool may_dim);
+/*
+ * The clip window: everything drawn while one is set lands inside it and
+ * nothing outside it is touched, glyphs and images included.
+ *
+ * It exists so that restoring one area of the screen can be done by the same
+ * code that paints the whole of it. A menu that closes uncovers a rectangle,
+ * and the screen under it was frozen while the menu was up - so the way back
+ * is the application's own redraw, clipped to that rectangle, instead of a
+ * full repaint the eye sees as a flash. See ui_pop().
+ *
+ * The panel is the default window and lcd_clip_none() puts it back. There is
+ * no stack: whoever narrows it puts it back.
+ */
+void lcd_set_clip(int x, int y, int w, int h);
+void lcd_clip_none(void);
+
 void lcd_draw_pixel(int x, int y, int color);
 void lcd_draw_buf(int x, int y, int w, int h, const uint16_t *buf);
 void lcd_draw_indexed(int x, int y, int w, int h, const uint8_t *pix,

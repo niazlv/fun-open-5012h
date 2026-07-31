@@ -81,11 +81,31 @@ enum
   ST7789_PWCTRL1   = 0xd0,
 };
 
+/*- Types -------------------------------------------------------------------*/
+// The part of a blit that survives the clip window: where in the source it
+// starts, and how much of it there is. See blit_window().
+typedef struct
+{
+  int col, row;
+  int w, h;
+} blit_t;
+
 /*- Variables ---------------------------------------------------------------*/
 static const Font *lcd_font = NULL;
 static int lcd_scale = 1;
 static int bg_color[2];
 static int fg_color[2];
+
+/*
+ * The clip window, inclusive on both edges. The panel is the default one, so
+ * every primitive below clips against these instead of against 0..LCD_WIDTH -
+ * the panel clamp that fill_rect always did is the same code, with the bounds
+ * in variables. See lcd_set_clip().
+ */
+static int clip_x0 = 0;
+static int clip_y0 = 0;
+static int clip_x1 = LCD_WIDTH - 1;
+static int clip_y1 = LCD_HEIGHT - 1;
 
 /*- Implementations ---------------------------------------------------------*/
 
@@ -366,9 +386,30 @@ void lcd_backlight_task(bool may_dim)
 }
 
 //-----------------------------------------------------------------------------
+// Draw into this rectangle and nothing outside it, until it is cleared. The
+// window is intersected with the panel, so a caller may hand over a rectangle
+// worked out from a menu's geometry without checking it first.
+void lcd_set_clip(int x, int y, int w, int h)
+{
+  clip_x0 = (x > 0) ? x : 0;
+  clip_y0 = (y > 0) ? y : 0;
+  clip_x1 = (x + w - 1 < LCD_WIDTH - 1) ? x + w - 1 : LCD_WIDTH - 1;
+  clip_y1 = (y + h - 1 < LCD_HEIGHT - 1) ? y + h - 1 : LCD_HEIGHT - 1;
+}
+
+//-----------------------------------------------------------------------------
+void lcd_clip_none(void)
+{
+  clip_x0 = 0;
+  clip_y0 = 0;
+  clip_x1 = LCD_WIDTH - 1;
+  clip_y1 = LCD_HEIGHT - 1;
+}
+
+//-----------------------------------------------------------------------------
 void lcd_draw_pixel(int x, int y, int color)
 {
-  if (x < 0 || x >= LCD_WIDTH || y < 0 || y >= LCD_HEIGHT)
+  if (x < clip_x0 || x > clip_x1 || y < clip_y0 || y > clip_y1)
     return;
 
   lcd_set_rect(x, y, 1, 1);
@@ -381,20 +422,50 @@ void lcd_draw_pixel(int x, int y, int color)
 }
 
 //-----------------------------------------------------------------------------
+// Opens the window a w x h blit at (x, y) writes through, and says which part
+// of the source goes into it. False when the clip window leaves nothing of it,
+// in which case no window was opened and there is nothing to send.
+static bool blit_window(int x, int y, int w, int h, blit_t *b)
+{
+  int x0 = (x > clip_x0) ? x : clip_x0;
+  int y0 = (y > clip_y0) ? y : clip_y0;
+  int x1 = (x + w - 1 < clip_x1) ? x + w - 1 : clip_x1;
+  int y1 = (y + h - 1 < clip_y1) ? y + h - 1 : clip_y1;
+
+  if (x1 < x0 || y1 < y0)
+    return false;
+
+  b->col = x0 - x;
+  b->row = y0 - y;
+  b->w = x1 - x0 + 1;
+  b->h = y1 - y0 + 1;
+
+  lcd_set_rect(x0, y0, b->w, b->h);
+
+  return true;
+}
+
+//-----------------------------------------------------------------------------
 void lcd_draw_buf(int x, int y, int w, int h, const uint16_t *buf)
 {
-  int size = w * h;
+  blit_t b;
 
-  lcd_set_rect(x, y, w, h);
+  if (!blit_window(x, y, w, h, &b))
+    return;
 
   HAL_GPIO_LCD_CS_clr();
   lcd_command_write(ST7789_RAMWR);
 
-  for (int i = 0; i < size; i++)
+  for (int row = 0; row < b.h; row++)
   {
-    uint16_t v = buf[i];
-    lcd_data_write_bop(LCD_BOP_WORD(v >> 8));
-    lcd_data_write_bop(LCD_BOP_WORD(v));
+    const uint16_t *src = buf + (b.row + row) * w + b.col;
+
+    for (int col = 0; col < b.w; col++)
+    {
+      uint16_t v = src[col];
+      lcd_data_write_bop(LCD_BOP_WORD(v >> 8));
+      lcd_data_write_bop(LCD_BOP_WORD(v));
+    }
   }
 
   HAL_GPIO_LCD_CS_set();
@@ -407,18 +478,24 @@ void lcd_draw_buf(int x, int y, int w, int h, const uint16_t *buf)
 void lcd_draw_indexed(int x, int y, int w, int h, const uint8_t *pix,
     const uint16_t *palette)
 {
-  int size = w * h;
+  blit_t b;
 
-  lcd_set_rect(x, y, w, h);
+  if (!blit_window(x, y, w, h, &b))
+    return;
 
   HAL_GPIO_LCD_CS_clr();
   lcd_command_write(ST7789_RAMWR);
 
-  for (int i = 0; i < size; i++)
+  for (int row = 0; row < b.h; row++)
   {
-    uint16_t v = palette[pix[i]];
-    lcd_data_write_bop(LCD_BOP_WORD(v >> 8));
-    lcd_data_write_bop(LCD_BOP_WORD(v));
+    const uint8_t *src = pix + (b.row + row) * w + b.col;
+
+    for (int col = 0; col < b.w; col++)
+    {
+      uint16_t v = palette[src[col]];
+      lcd_data_write_bop(LCD_BOP_WORD(v >> 8));
+      lcd_data_write_bop(LCD_BOP_WORD(v));
+    }
   }
 
   HAL_GPIO_LCD_CS_set();
@@ -427,18 +504,25 @@ void lcd_draw_indexed(int x, int y, int w, int h, const uint8_t *pix,
 //-----------------------------------------------------------------------------
 void lcd_draw_image(int x, int y, const Image *image)
 {
-  int size = image->width * image->height;
+  int w = image->width;
+  blit_t b;
 
-  lcd_set_rect(x - image->ox, y - image->oy, image->width, image->height);
+  if (!blit_window(x - image->ox, y - image->oy, w, image->height, &b))
+    return;
 
   HAL_GPIO_LCD_CS_clr();
   lcd_command_write(ST7789_RAMWR);
 
-  for (int i = 0; i < size; i++)
+  for (int row = 0; row < b.h; row++)
   {
-    uint16_t v = image->data[i];
-    lcd_data_write_bop(LCD_BOP_WORD(v >> 8));
-    lcd_data_write_bop(LCD_BOP_WORD(v));
+    const uint16_t *src = image->data + (b.row + row) * w + b.col;
+
+    for (int col = 0; col < b.w; col++)
+    {
+      uint16_t v = src[col];
+      lcd_data_write_bop(LCD_BOP_WORD(v >> 8));
+      lcd_data_write_bop(LCD_BOP_WORD(v));
+    }
   }
 
   HAL_GPIO_LCD_CS_set();
@@ -462,27 +546,28 @@ void lcd_fill_rect(int x, int y, int w, int h, int color)
   uint32_t bop1 = LCD_BOP_WORD(color & 0xff);
   int size;
 
-  // Clip to the panel. A window that runs off an edge is not merely invisible:
-  // the controller wraps the address counter and the overflow is painted
-  // somewhere else on the display, so partially off-screen sprites (game
-  // objects at the edges) would corrupt the image.
-  if (x < 0)
+  // Clip to the window, which is the panel unless someone narrowed it. A
+  // window that runs off an edge is not merely invisible: the controller wraps
+  // the address counter and the overflow is painted somewhere else on the
+  // display, so partially off-screen sprites (game objects at the edges) would
+  // corrupt the image.
+  if (x < clip_x0)
   {
-    w += x;
-    x = 0;
+    w -= clip_x0 - x;
+    x = clip_x0;
   }
 
-  if (y < 0)
+  if (y < clip_y0)
   {
-    h += y;
-    y = 0;
+    h -= clip_y0 - y;
+    y = clip_y0;
   }
 
-  if (x + w > LCD_WIDTH)
-    w = LCD_WIDTH - x;
+  if (x + w > clip_x1 + 1)
+    w = clip_x1 + 1 - x;
 
-  if (y + h > LCD_HEIGHT)
-    h = LCD_HEIGHT - y;
+  if (y + h > clip_y1 + 1)
+    h = clip_y1 + 1 - y;
 
   if (w <= 0 || h <= 0)
     return;
@@ -576,13 +661,14 @@ void lcd_putc(int x, int y, char ch)
   uint32_t bg0 = LCD_BOP_WORD(bg_color[0]);
   uint32_t bg1 = LCD_BOP_WORD(bg_color[1]);
   const uint8_t *bitmap;
+  blit_t b;
 
-  // A glyph that does not fit is dropped rather than drawn through an
-  // off-panel window, which the controller would wrap somewhere else
-  if (x < 0 || y < 0 || x + gw > LCD_WIDTH || y + gh > LCD_HEIGHT)
+  // A glyph that only half fits is drawn to the edge of the window and no
+  // further. It matters at a clip window's edge, where the alternative -
+  // dropping a glyph the window cuts through - is a hole in a line of text
+  // that nothing will come back to fill.
+  if (!blit_window(x, y, gw, gh, &b))
     return;
-
-  lcd_set_rect(x, y, gw, gh);
 
   HAL_GPIO_LCD_CS_clr();
   lcd_command_write(ST7789_RAMWR);
@@ -596,11 +682,11 @@ void lcd_putc(int x, int y, char ch)
   // At scale 1 this is the loop it has always been - one bit, one pixel - and
   // above it each source row is written `scale` times over and each source bit
   // `scale` times across.
-  for (int row = 0; row < gh; row++)
+  for (int row = b.row; row < b.row + b.h; row++)
   {
     int i0 = (row / lcd_scale) * lcd_font->width;
 
-    for (int col = 0; col < gw; col++)
+    for (int col = b.col; col < b.col + b.w; col++)
     {
       int i = i0 + col / lcd_scale;
 
