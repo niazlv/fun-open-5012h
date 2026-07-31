@@ -112,27 +112,36 @@ jobs:
     permissions:
       contents: write
     steps:
+      # First, and before the artifact is downloaded: checkout cleans the
+      # workspace it lands in, and dist/ would go with it.
+      #
+      # It is here at all because the list of changes is built from git log
+      # below. --generate-notes was tried and is not usable here: what the API
+      # generates is a list of merged pull requests, and the work in this
+      # repository goes straight onto main, so what came back for v2.3.0 was a
+      # bare "Full Changelog" link and no changes at all.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the whole history and every tag, for the range below
+
       - uses: actions/download-artifact@v4
         with:
           name: ${{ needs.firmware.outputs.artifact }}
           path: dist
 
-      # There is no checkout in this job, so nothing here may reach for git -
-      # gh talks to the API for all of it, including what changed. That is why
-      # the list of changes comes from --generate-notes, which asks GitHub for
-      # the commits since the previous release, rather than from a `git log`
-      # over a tag range: there is no tree here to run it in. The text below is
-      # the part that is the same in every release - what the file is and where
-      # it goes - and the generated list is appended to it.
+      # The fixed part says what the file is and where it goes, which is the
+      # same in every release; the rest is what happened since the previous
+      # v-tag. The first tagged release has no previous one to measure from and
+      # says so rather than printing the entire history.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-            --notes-file - <<'EOF'
+          prev=$(git describe --tags --abbrev=0 --match 'v*' \
+              "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+
+          {
+            cat <<'EOF'
           Прошивка собрана из этого тега. Файл для заливки — `open-5012h.bin`,
           адрес `0x08000000`; как это сделать, если вы этого никогда не делали,
           в `doc/flashing.md`.
@@ -140,3 +149,23 @@ jobs:
           Без ассетов DOOM: они делаются из вашего собственного IWAD и не могут
           быть приложены, поэтому в этой сборке приложения DOOM нет вовсе.
           EOF
+
+            echo
+            if [ -n "$prev" ]; then
+              echo "## Что изменилось с $prev"
+              echo
+              git log --no-merges --pretty='- %s' "$prev..$GITHUB_REF_NAME"
+            else
+              echo "## Что изменилось"
+              echo
+              echo "Первый релиз с тегом — сравнивать не с чем, вся история по ссылке ниже."
+            fi
+
+            echo
+            echo "**Полная история**: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME"
+          } > notes.md
+
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md
