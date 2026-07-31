@@ -70,6 +70,19 @@
  * ways at once, none of which depend on how full the pack is: the outline
  * changes colour, a bolt is drawn across the middle of the icon, and the rest
  * of the bar sweeps up to full and starts again behind a level that stays put.
+ *
+ * ...and what the level itself does across a plug event, which is nothing. The
+ * charge in a pack cannot change because a cable was connected, so neither can
+ * the icon: what changes is the voltage at the terminals, and the two things
+ * that read it - the median filter and the charge lift - do not change at the
+ * same speed. The lift is applied the instant the charger pin says so and the
+ * filtered voltage needs the width of its window to catch up, so for those few
+ * seconds the gauge is reading a charging voltage as though it were a resting
+ * one or the other way about. The whole of the lift used to be snapped onto
+ * the icon at exactly that moment: a third of the scale, in the wrong
+ * direction, walked back over the following ten seconds. It now holds still
+ * instead - see BATTERY_PLUG_HOLD - and picks the reading up once it means
+ * something.
  */
 
 /*- Includes ----------------------------------------------------------------*/
@@ -130,10 +143,49 @@
 #define BATTERY_FULL_VOLTAGE     4150
 #define BATTERY_FULL_HYST        50
 
-// What the charge current adds to the terminal voltage across the cell's own
-// resistance. Subtracted before the curve is read, so plugging the charger in
-// does not make the gauge jump twenty points.
+/*
+ * What the charge current adds to the terminal voltage across the cell's own
+ * resistance. Subtracted before the curve is read, or the icon would report
+ * the charger's push as charge in the pack.
+ *
+ * It is not a constant, and treating it as one is what made the gauge drop by
+ * a third of its scale the moment a charger was connected. The TP4056 holds
+ * full current only until the terminals reach the top of its range and then
+ * tapers it away to nothing, so a lift that is right in the middle of a charge
+ * is far too big at the end of one - and the end of a charge is where a
+ * charger spends most of its time. Between the two voltages below the lift is
+ * scaled down in step with the current the charger can still be pushing, which
+ * is what lets the gauge reach full while the pack is still on the cable.
+ *
+ * The size of it is a property of the pack and the charge current, not
+ * something this file can know: BATTERY_CHARGE_LIFT is a starting figure, and
+ * the Battery page reports the lift it actually saw at the last unplug beside
+ * it so the two can be compared on real hardware.
+ */
 #define BATTERY_CHARGE_LIFT      120
+#define BATTERY_CV_START         4050
+#define BATTERY_CV_END           4200
+
+/*
+ * How long the displayed per cent is held still after the charger goes on or
+ * comes off, in samples.
+ *
+ * A plug event does not change the charge in the pack. It changes the voltage
+ * at the terminals, and g_battery_voltage needs the width of its median window
+ * to follow that - so for those few seconds the lift has moved and the reading
+ * it is applied to has not, and the difference between them is the whole of
+ * the lift, on screen, in the wrong direction. It used to be snapped onto the
+ * icon at exactly that moment.
+ *
+ * Longer than the median window on purpose, and the reading is picked up again
+ * once it means something.
+ */
+#define BATTERY_PLUG_HOLD        24
+
+// ...and how long after the charger comes off the pack is left to settle
+// before the difference is called the lift: the curve is a resting curve, and
+// a cell that has just been let go of takes some tens of seconds to rest.
+#define BATTERY_LIFT_SETTLE      60
 
 #define BATTERY_SAMPLE_INTERVAL  500
 
@@ -291,6 +343,16 @@ static int g_charger_count = 0;
 
 static int g_battery_low_count = 0;
 
+// Samples left of the freeze after a plug event. See BATTERY_PLUG_HOLD.
+static int g_battery_hold = 0;
+
+// The lift, as measured rather than as assumed: the filtered voltage at the
+// moment the charger came off, the samples left before the pack is called
+// rested, and the drop between the two. -1 until an unplug has been seen.
+static int g_battery_lift_ref = 0;
+static int g_battery_lift_wait = 0;
+static int g_battery_lift_seen = -1;
+
 // Updates left before settling is given up on, and how many of the samples in
 // the window were taken by battery_task() rather than put there by the priming
 // in battery_init(). See BATTERY_SETTLE_SPREAD.
@@ -342,6 +404,23 @@ static int battery_median(void)
   g_battery_window_max = sorted[BATTERY_SAMPLES-1];
 
   return sorted[BATTERY_SAMPLES/2];
+}
+
+//-----------------------------------------------------------------------------
+// The lift to take off the terminals at this reading: the whole of it while
+// the charger can still push its full current, tapering to nothing as the
+// terminals reach the top of its range and it stops being able to. See
+// BATTERY_CHARGE_LIFT.
+static int battery_charge_lift(int mv)
+{
+  if (mv <= BATTERY_CV_START)
+    return BATTERY_CHARGE_LIFT;
+
+  if (mv >= BATTERY_CV_END)
+    return 0;
+
+  return BATTERY_CHARGE_LIFT * (BATTERY_CV_END - mv) /
+      (BATTERY_CV_END - BATTERY_CV_START);
 }
 
 //-----------------------------------------------------------------------------
@@ -525,15 +604,14 @@ static void battery_draw(void)
 // reading dithers across a knee of the curve, and then it closes a quarter of
 // the gap per update, which puts a real change on screen in a few seconds.
 //
-// `snap` is for the moments where following at all would be a lie rather than
-// a smoothing: the settling period after a boot, and the step the reading
-// takes when the charger is plugged in or pulled out.
-static void battery_set_percent(int raw, bool snap)
+// The settling period after a boot is the one time it simply is the filtered
+// value: there is nothing on screen yet to be smooth about.
+static void battery_set_percent(int raw)
 {
   int diff = raw - g_battery_percent;
   int step;
 
-  if (snap || g_battery_percent < 0 || g_battery_settle > 0)
+  if (g_battery_percent < 0 || g_battery_settle > 0)
   {
     g_battery_percent = raw;
     return;
@@ -584,10 +662,12 @@ static void battery_sample(void)
     state = BATTERY_DISCHARGING;
   }
 
-  // The cell sits BATTERY_CHARGE_LIFT above its resting voltage for as long as
-  // the charger is pushing current, so the curve is read below the terminals
+  // The cell sits above its resting voltage for as long as the charger is
+  // pushing current into it, so the curve is read below the terminals - by
+  // less and less as the charger tapers off. See battery_charge_lift().
   soc_mv = (BATTERY_CHARGING == state) ?
-      g_battery_voltage - BATTERY_CHARGE_LIFT : g_battery_voltage;
+      g_battery_voltage - battery_charge_lift(g_battery_voltage) :
+      g_battery_voltage;
 
   g_battery_percent_raw = (BATTERY_FULL == state) ? 100 :
       battery_percent_of(soc_mv);
@@ -600,6 +680,24 @@ static void battery_sample(void)
     if (BATTERY_CHARGING == state)
       config.charge_cycles++;
 
+    // The lift, measured on this pack rather than assumed: the charger has
+    // just let go of a cell it was holding above its resting voltage, so what
+    // the reading gives up over the next half minute is the lift that was on
+    // it. Recorded for the Battery page, which is where a figure that belongs
+    // to the hardware rather than to this file can be read off and compared
+    // with BATTERY_CHARGE_LIFT.
+    if (BATTERY_CHARGING == g_battery_state)
+    {
+      g_battery_lift_ref = g_battery_voltage;
+      g_battery_lift_wait = BATTERY_LIFT_SETTLE;
+    }
+    else if (BATTERY_CHARGING == state)
+    {
+      // Back on the charger before it had rested: whatever it would have
+      // settled to, this is no longer a measurement of it
+      g_battery_lift_wait = 0;
+    }
+
     g_battery_state = state;
 
     // From the start of the sweep either way round, so the icon does not come
@@ -611,18 +709,33 @@ static void battery_sample(void)
     else
       g_battery_anim_timer = TIMER_DISABLE;
 
-    // The lift comes off or goes on with the charger, so the displayed value
-    // steps here rather than walking to the new one a per cent at a time
-    battery_set_percent(g_battery_percent_raw, true);
+    // The lift comes off or goes on with the charger here, and the reading it
+    // is applied to takes the width of the median window to follow. Nothing is
+    // put on the icon in between - see BATTERY_PLUG_HOLD.
+    g_battery_hold = BATTERY_PLUG_HOLD;
 
-    // Whatever rate was being measured belonged to the other side of this.
-    // Anchored after the snap above, or the step would be counted as drain.
+    // Whatever rate was being measured belonged to the other side of this
     g_battery_est_stamp = timer_ms();
     g_battery_est_percent = g_battery_percent;
   }
+
+  if (g_battery_hold > 0 && 0 == g_battery_settle)
+    g_battery_hold--;
   else
+    battery_set_percent(g_battery_percent_raw);
+
+  // ...and the other end of the measurement started above
+  if (g_battery_lift_wait > 0)
   {
-    battery_set_percent(g_battery_percent_raw, false);
+    g_battery_lift_wait--;
+
+    if (0 == g_battery_lift_wait)
+    {
+      g_battery_lift_seen = g_battery_lift_ref - g_battery_voltage;
+
+      if (g_battery_lift_seen < 0)
+        g_battery_lift_seen = 0;
+    }
   }
 
   // Settled once the window holds nothing but samples this function took and
@@ -876,7 +989,7 @@ void battery_get_state(char *buf, int size)
 //-----------------------------------------------------------------------------
 enum
 {
-  BP_CHARGE, BP_VOLTAGE, BP_FILTER, BP_WINDOW, BP_STATE, BP_SETTLE,
+  BP_CHARGE, BP_VOLTAGE, BP_FILTER, BP_WINDOW, BP_STATE, BP_LIFT, BP_SETTLE,
   BP_ESTIMATE, BP_CYCLES, BP_ADC,
   BP_GAP,
   BP_HEAD, BP_T1, BP_T2, BP_T3, BP_T4,
@@ -923,6 +1036,29 @@ bool battery_get_line(int index, char *buf, int size)
           battery_state_names[g_battery_state],
           g_charger_on ? "low" : "released");
       break;
+
+    // What is being taken off the terminals before the curve is read, and what
+    // the pack itself said the last time a charger let go of it. The two
+    // disagreeing is the reason to change BATTERY_CHARGE_LIFT, and there is no
+    // way to know the right figure from this side of the divider.
+    case BP_LIFT:
+    {
+      int lift = (BATTERY_CHARGING == g_battery_state) ?
+          battery_charge_lift(g_battery_voltage) : 0;
+
+      if (g_battery_lift_seen < 0)
+      {
+        snprintf(buf, size, "Lift:      %d mV assumed, none measured yet",
+            lift);
+      }
+      else
+      {
+        snprintf(buf, size, "Lift:      %d mV assumed, %d mV measured at unplug",
+            lift, g_battery_lift_seen);
+      }
+
+      break;
+    }
 
     // Settling, and what it is holding off: the low-battery halt. A gauge that
     // says "settling" a minute after boot is a reading that will not sit still,
