@@ -20,6 +20,7 @@
 #include "measure.h"
 #include "fft.h"
 #include "alias.h"
+#include "am.h"
 #include "classify.h"
 #include "logic_decode.h"
 #include "record_window.h"
@@ -103,6 +104,56 @@ static void synth_square_bl(uint8_t *buf, int size, double f0_hz,
       v += sin(2 * M_PI * k * f0_hz * t) / k;
 
     v = dc + amp * v;
+    buf[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : (int)lround(v));
+  }
+}
+
+// A carrier under sinusoidal amplitude modulation, as the SAMPLER sees it:
+// carrier_hz may be anything, including well past nyquist, because folding it
+// is the sampler's job and is the whole point of what these tests pin. amp is
+// the unmodulated amplitude, so the peaks reach amp*(1+depth).
+static void synth_am(uint8_t *buf, int size, double carrier_hz,
+    double period_ns, double rate_hz, double depth, double amp, double dc)
+{
+  for (int i = 0; i < size; i++)
+  {
+    double t = i * period_ns * 1e-9;
+    double env = 1.0 + depth * sin(2 * M_PI * rate_hz * t);
+    double v = dc + amp * env * sin(2 * M_PI * carrier_hz * t);
+
+    buf[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : (int)lround(v));
+  }
+}
+
+// The same carrier keyed fully on and off by a square at rate_hz: OOK, which
+// is AM at 100% depth that also SITS at its two levels
+static void synth_ook(uint8_t *buf, int size, double carrier_hz,
+    double period_ns, double rate_hz, double amp, double dc)
+{
+  for (int i = 0; i < size; i++)
+  {
+    double t = i * period_ns * 1e-9;
+    double on = (fmod(rate_hz * t, 1.0) < 0.5) ? 1.0 : 0.0;
+    double v = dc + amp * on * sin(2 * M_PI * carrier_hz * t);
+
+    buf[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : (int)lround(v));
+  }
+}
+
+// Constant amplitude, frequency swinging by dev_hz at rate_hz. The envelope
+// detector must find NOTHING here, and that is a result rather than a miss:
+// it is what separates FM and PSK from AM.
+static void synth_fm(uint8_t *buf, int size, double carrier_hz,
+    double period_ns, double rate_hz, double dev_hz, double amp, double dc)
+{
+  double beta = dev_hz / rate_hz;
+
+  for (int i = 0; i < size; i++)
+  {
+    double t = i * period_ns * 1e-9;
+    double ph = 2 * M_PI * carrier_hz * t + beta * sin(2 * M_PI * rate_hz * t);
+    double v = dc + amp * sin(ph);
+
     buf[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : (int)lround(v));
   }
 }
@@ -2175,6 +2226,207 @@ int main(void)
     check_near("no evidence", al.verdict == ALIAS_NO_EVIDENCE, 1, 0);
     check_near("reason", 0 == strcmp(al.reason,
         "h3 is past the frontend"), 1, 0);
+  }
+
+  // ======================= amplitude modulation =========================
+  // Same instrument, same 125 MS/s, and the question alias.c cannot answer:
+  // the carrier's identity. What is pinned here is that the ENVELOPE never
+  // needed it. Sampling is linear, so folding moves the carrier and leaves
+  // A(t) untouched - the depth and the rate are true readings on a signal
+  // whose frequency the record genuinely cannot name.
+  //
+  // 65536 samples at 8 ns is a 524 us record: 128 samples a block, a 1.907
+  // kHz envelope bin and modulation readable out to 488 kHz.
+  {
+    enum { REC = 65536, PER = 8 };
+    static uint8_t am_buf[REC];
+    AmAnalysis am;
+    FftAnalysis an;
+    double in_band_depth, in_band_rate;
+
+    // --- a carrier in band, modulated 50% at 100 kHz ---
+    printf("am: 5 MHz carrier, 100 kHz at 50%%:\n");
+    synth_am(am_buf, REC, 5e6, PER, 100e3, 0.50, 55.0, ZERO_POINT);
+    fft_spectrum(am_buf, REC, 0, mag);
+    fft_analyze(mag, PER, &an);
+    am_analyze(am_buf, REC, 0, PER, an.fundamental, &am);
+    check_near("verdict MODULATED", am.verdict == AM_MODULATED, 1, 0);
+    check_near("rate Hz", am.rate_hz, 100e3, 2);
+    check_near("depth", am.depth, 0.50, 5);
+    check_near("block samples", am.block, 128, 0);
+    check_near("envelope bin Hz", am.env_bin_hz, 1907.35, 1);
+    check_near("no artifact", am.artifact, 0, 0);
+
+    // --- THE case: the same modulation on a carrier past nyquist ---
+    // 108 MHz at 125 MS/s reads as 17 MHz and alias.c can only list what it
+    // might have been. The envelope does not care: depth and rate come out
+    // the same as they did in band.
+    printf("am: 108 MHz carrier (reads 17 MHz), 100 kHz at 60%%:\n");
+    synth_am(am_buf, REC, 108e6, PER, 100e3, 0.60, 55.0, ZERO_POINT);
+    fft_spectrum(am_buf, REC, 0, mag);
+    fft_analyze(mag, PER, &an);
+    check_near("carrier reads as", an.fundamental, 17e6, 1);
+    am_analyze(am_buf, REC, 0, PER, an.fundamental, &am);
+    check_near("verdict MODULATED", am.verdict == AM_MODULATED, 1, 0);
+    check_near("rate Hz", am.rate_hz, 100e3, 2);
+    check_near("depth", am.depth, 0.60, 5);
+    check_near("no artifact", am.artifact, 0, 0);
+    in_band_depth = am.depth;
+    in_band_rate  = am.rate_hz;
+
+    // A REAL 17 MHz carrier under the same modulation must read identically:
+    // the two records are the same record, which is the theorem alias.h
+    // states, and the envelope reading is what survives it intact.
+    printf("am: a real 17 MHz carrier reads the same envelope:\n");
+    synth_am(am_buf, REC, 17e6, PER, 100e3, 0.60, 55.0, ZERO_POINT);
+    fft_spectrum(am_buf, REC, 0, mag);
+    fft_analyze(mag, PER, &an);
+    am_analyze(am_buf, REC, 0, PER, an.fundamental, &am);
+    check_near("verdict MODULATED", am.verdict == AM_MODULATED, 1, 0);
+    check_near("same rate", am.rate_hz, in_band_rate, 0.5);
+    check_near("same depth", am.depth, in_band_depth, 2);
+
+    // --- depth accuracy, shallow to nearly full ---
+    printf("am: depth sweep at 60 kHz:\n");
+    {
+      const double want[] = { 0.10, 0.30, 0.90 };
+
+      for (int i = 0; i < 3; i++)
+      {
+        synth_am(am_buf, REC, 17e6, PER, 60e3, want[i], 55.0, ZERO_POINT);
+        fft_spectrum(am_buf, REC, 0, mag);
+        fft_analyze(mag, PER, &an);
+        am_analyze(am_buf, REC, 0, PER, an.fundamental, &am);
+        check_near("verdict MODULATED", am.verdict == AM_MODULATED, 1, 0);
+        check_near("depth", am.depth, want[i], 5);
+      }
+    }
+
+    // --- an unmodulated carrier: FLAT is a result, not a failure ---
+    // This reading IS the block-RMS estimator's own noise floor, so it is
+    // what AM_FLAT_DEPTH has to be set above.
+    printf("am: unmodulated 17 MHz carrier:\n");
+    synth(am_buf, REC, 0, fn_sine, NULL, 17e6, PER, 90.0, ZERO_POINT);
+    fft_spectrum(am_buf, REC, 0, mag);
+    fft_analyze(mag, PER, &an);
+    am_analyze(am_buf, REC, 0, PER, an.fundamental, &am);
+    check_near("verdict FLAT", am.verdict == AM_FLAT, 1, 0);
+    check_near("estimator floor", am.depth_pp < AM_FLAT_DEPTH, 1, 0);
+
+    // --- FM: the discriminator. Constant amplitude, 2 MHz of deviation,
+    // and the envelope must stay flat through all of it. ---
+    printf("am: FM, 17 MHz +-2 MHz at 100 kHz:\n");
+    synth_fm(am_buf, REC, 17e6, PER, 100e3, 2e6, 90.0, ZERO_POINT);
+    fft_spectrum(am_buf, REC, 0, mag);
+    fft_analyze(mag, PER, &an);
+    am_analyze(am_buf, REC, 0, PER, an.fundamental, &am);
+    check_near("verdict FLAT", am.verdict == AM_FLAT, 1, 0);
+
+    // --- OOK: 100% depth AND resting at both levels ---
+    printf("am: OOK, 17 MHz keyed at 50 kHz:\n");
+    synth_ook(am_buf, REC, 17e6, PER, 50e3, 90.0, ZERO_POINT);
+    fft_spectrum(am_buf, REC, 0, mag);
+    fft_analyze(mag, PER, &an);
+    am_analyze(am_buf, REC, 0, PER, an.fundamental, &am);
+    check_near("verdict BURST", am.verdict == AM_BURST, 1, 0);
+    check_near("keying rate Hz", am.rate_hz, 50e3, 2);
+    check_near("depth pp", am.depth_pp, 1.0, 2);
+
+    // --- two oscillators beating. Reported as AM at their difference, and
+    // that is CORRECT rather than a false positive: a carrier with two
+    // sidebands and three free-running tones at the same three frequencies
+    // are the same signal, and addition has already made them identical. ---
+    printf("am: 17 MHz + 17.08 MHz beat (not a false positive):\n");
+    for (int i = 0; i < REC; i++)
+    {
+      double t = i * PER * 1e-9;
+      double v = ZERO_POINT + 45 * sin(2 * M_PI * 17.00e6 * t)
+                            + 45 * sin(2 * M_PI * 17.08e6 * t);
+
+      am_buf[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : (int)lround(v));
+    }
+    fft_spectrum(am_buf, REC, 0, mag);
+    fft_analyze(mag, PER, &an);
+    am_analyze(am_buf, REC, 0, PER, an.fundamental, &am);
+    check_near("verdict MODULATED", am.verdict == AM_MODULATED, 1, 0);
+    check_near("rate is the beat", am.rate_hz, 80e3, 3);
+
+    // ---------------- what must NOT be called modulation ----------------
+    // A carrier so slow that a block holds barely four cycles: the block RMS
+    // then swings with the carrier's own phase, and folded to the block rate
+    // that swing arrives as a clean line at a plausible rate. Without the
+    // artifact check this is a confident "AM at 187.5 kHz" on a carrier that
+    // is not modulated at all.
+    printf("am: unmodulated 4 MHz carrier (the estimator's own beat):\n");
+    synth(am_buf, REC, 0, fn_sine, NULL, 4e6, PER, 90.0, ZERO_POINT);
+    fft_spectrum(am_buf, REC, 0, mag);
+    fft_analyze(mag, PER, &an);
+    am_analyze(am_buf, REC, 0, PER, an.fundamental, &am);
+    check_near("not called AM", am.verdict != AM_MODULATED, 1, 0);
+
+    // A carrier close to nyquist leaves so few samples a cycle that the
+    // block RMS wanders badly, and what it leaves stands 3% deep - twenty
+    // times the depth floor at this many cycles a block, so the floor lets
+    // it through. What stops it is that it does not survive being re-cut.
+    // Without that check this is a confident "AM at 339 kHz"; the swept
+    // measurement in am.h counts twelve more like it.
+    printf("am: 59.74 MHz carrier (only the re-cut rejects it):\n");
+    synth(am_buf, REC, 0, fn_sine, NULL, 59.74e6, PER, 90.0, ZERO_POINT);
+    fft_spectrum(am_buf, REC, 0, mag);
+    fft_analyze(mag, PER, &an);
+    am_analyze(am_buf, REC, 0, PER, an.fundamental, &am);
+    check_near("not called AM", am.verdict != AM_MODULATED, 1, 0);
+    check_near("rejected by the re-cut", am.artifact, 1, 0);
+    check_near("depth was over the floor", am.depth > 10 * AM_RESIDUAL_K /
+        am.cycles_per_block, 1, 0);
+
+    // The limitation am.h names, pinned so it stays known rather than
+    // becoming a surprise: a hard-edged carrier beside Fs/4 folds its own
+    // 3rd harmonic back onto its fundamental, and the two beat. The record
+    // really does hold that envelope - alias.c is what says where the
+    // second line came from.
+    printf("am: 31.2 MHz square, beating with its own folded h3:\n");
+    synth_square_bl(am_buf, REC, 31.2e6, PER, 100e6, 70.0, ZERO_POINT);
+    fft_spectrum(am_buf, REC, 0, mag);
+    fft_analyze(mag, PER, &an);
+    am_analyze(am_buf, REC, 0, PER, an.fundamental, &am);
+    check_near("reads as AM (known)", am.verdict == AM_MODULATED, 1, 0);
+    check_near("at the fold spacing", am.rate_hz, 200e3, 5);
+
+    // Slower still and the estimator is not even valid: refused outright,
+    // rather than answered badly.
+    printf("am: 1 MHz carrier, under four cycles a block:\n");
+    synth(am_buf, REC, 0, fn_sine, NULL, 1e6, PER, 90.0, ZERO_POINT);
+    am_analyze(am_buf, REC, 0, PER, 1e6, &am);
+    check_near("no evidence", am.verdict == AM_NO_EVIDENCE, 1, 0);
+    check_near("cycles per block", am.cycles_per_block, 1.024, 1);
+    check_near("reason", 0 == strcmp(am.reason,
+        "carrier too slow for a block to hold"), 1, 0);
+
+    // Noise has an envelope too, and it moves. What it does not have is a
+    // rate, and that is what stops it being called a modulation.
+    printf("am: noise only:\n");
+    {
+      uint32_t seed = 12345;
+
+      for (int i = 0; i < REC; i++)
+      {
+        seed = seed * 1103515245u + 12345u;
+        am_buf[i] = (uint8_t)(ZERO_POINT + ((int)((seed >> 16) & 0xFF) - 128) / 3);
+      }
+
+      am_analyze(am_buf, REC, 0, PER, 17e6, &am);
+      check_near("not called AM", am.verdict != AM_MODULATED, 1, 0);
+    }
+
+    // A record with no signal at all: the envelope is the ADC's noise, and
+    // there is nothing to measure a depth against.
+    printf("am: flat line:\n");
+    memset(am_buf, ZERO_POINT, REC);
+    am_analyze(am_buf, REC, 0, PER, 17e6, &am);
+    check_near("no evidence", am.verdict == AM_NO_EVIDENCE, 1, 0);
+    check_near("reason", 0 == strcmp(am.reason,
+        "no carrier worth the name"), 1, 0);
   }
 
   // ============================= classifier =============================
