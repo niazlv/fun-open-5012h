@@ -2616,6 +2616,7 @@ static int measure_quality(int metric, const ScopeMeasure *sm)
     {
       int mv_code = config.vertical_mult / CALIB_MULTIPLIER;
       int mv = metric_mv(metric, sm);
+      int codes, swing;
 
       if (sm->vmax_raw >= 254 || sm->vmin_raw <= 1)
         return MQ_BAD;
@@ -2626,7 +2627,19 @@ static int measure_quality(int metric, const ScopeMeasure *sm)
       if (mv < 0)
         mv = -mv;
 
-      return (mv / mv_code < 25) ? MQ_WEAK : MQ_OK;
+      // How many codes the RECORD uses, not how many this particular reading
+      // is worth. Judging a reading by its own magnitude flags avg = 0 mV on a
+      // full-screen symmetric signal - which is a perfectly good measurement
+      // of zero, and its relative error is a meaningless quantity. What is
+      // actually coarse is a trace that lives in three codes; then every
+      // number off it is coarse, including the large ones.
+      codes = mv / mv_code;
+      swing = sm->vmax_raw - sm->vmin_raw;
+
+      if (swing > codes)
+        codes = swing;
+
+      return (codes < 25) ? MQ_WEAK : MQ_OK;
     }
 
     case MEASURE_FREQ:
@@ -2652,12 +2665,28 @@ static int measure_quality(int metric, const ScopeMeasure *sm)
       if (spp < 3)
         return MQ_BAD;
 
-      // The floor is about a hundredth of a sample period, in picoseconds
-      if (MEASURE_JITTER == metric && sm->jitter_rms_ps >= 0 &&
-          sm->jitter_rms_ps <= per * 10)
-        return MQ_WEAK;
+      // Jitter is a STATISTIC over periods, so how many there were is the
+      // whole question: a sigma over four of them is not a sigma. And its
+      // floor is about a hundredth of a sample period, in picoseconds.
+      if (MEASURE_JITTER == metric)
+      {
+        if (sm->periods < 5)
+          return MQ_WEAK;
 
-      return (sm->periods < 5 || spp < 10) ? MQ_WEAK : MQ_OK;
+        if (sm->jitter_rms_ps >= 0 && sm->jitter_rms_ps <= per * 10)
+          return MQ_WEAK;
+
+        return MQ_OK;
+      }
+
+      // Frequency, period, duty and the widths do NOT get their precision from
+      // the number of cycles: they get it from the time between two
+      // interpolated crossings, which one clean period already gives to a
+      // fraction of a percent. Three cycles of mains on the screen is a normal
+      // way to look at mains, not a doubtful measurement - what would be
+      // doubtful is a record that holds less than a whole cycle, or an edge
+      // sampled so coarsely that the crossing has nowhere to land.
+      return (sm->periods < 2 || spp < 10) ? MQ_WEAK : MQ_OK;
     }
 
     default:
