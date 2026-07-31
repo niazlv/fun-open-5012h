@@ -2427,8 +2427,42 @@ static void format_ps(int ps, char *out, int size)
 }
 
 //-----------------------------------------------------------------------------
-// Classify the current record (type + THD), cached per acquisition. Runs the
-// FFT on a non-consuming sample copy so the display pipeline is unaffected.
+// Decimation that puts the measured fundamental somewhere the harmonics can be
+// counted from.
+//
+// This is what stood between the THD reading and ever showing a number. The
+// transform is FFT_SIZE points; taken raw off the record they span
+// FFT_SIZE * period, which at any ordinary timebase is a sliver of a
+// microsecond-scale window - a 1 kHz signal has a hundredth of a cycle in it,
+// the fundamental lands in bin zero, and classify.c refuses (rightly: there is
+// nothing there to call a fundamental). The spectrum VIEW never had the problem
+// because it decimates to a band; this had no band to pick.
+//
+// So pick one: aim the fundamental at bin FFT_SIZE/32 and let the clamps do the
+// rest. That leaves the fifth harmonic at bin 80 of 256 - inside the spectrum,
+// which is what the THD sum needs - and a whole number of the signal's periods
+// in the window either way.
+static int signal_info_decim(int freq, int size, int period_ns)
+{
+  int64_t want;
+  int max = fft_max_decimation(size);
+
+  if (freq <= 0 || period_ns <= 0)
+    return 1;
+
+  want = (int64_t)(FFT_SIZE / 32) * 1000000000ll /
+      ((int64_t)freq * FFT_SIZE * period_ns);
+
+  if (want < 1)
+    return 1;
+
+  return (want > max) ? max : (int)want;
+}
+
+//-----------------------------------------------------------------------------
+// Classify the current record (type + THD), cached per acquisition. Reads the
+// record in place rather than copying it, so the display pipeline is
+// unaffected.
 //
 // The same transform also yields the spectrum's own reading of the frequency,
 // which MEASURE_FFT_FREQ puts next to the counter's. It costs nothing extra:
@@ -2438,8 +2472,9 @@ static void signal_info_update(void)
 {
   static uint32_t cached_gen = 0xffffffff;
   uint32_t gen = capture_get_generation();
+  const uint8_t *data;
   Measure m;
-  int period_ns = 0;
+  int size, offset, period_ns, tpos;
 
   if (gen == cached_gen)
     return;
@@ -2447,30 +2482,47 @@ static void signal_info_update(void)
   if (!capture_get_raw_measure(&m))
     return;
 
-  if (capture_read_samples(g_fft_samples, FFT_SIZE, &period_ns, false) == FFT_SIZE)
+  if (capture_get_record(&data, &size, &offset, &period_ns, &tpos) &&
+      size >= FFT_SIZE && period_ns > 0)
   {
-    int fund_bin = (int)(((int64_t)m.frequency * FFT_SIZE * period_ns) / 1000000000ll);
+    int decim = signal_info_decim(m.frequency, size, period_ns);
+    int64_t bin_period = (int64_t)period_ns * decim;
+    int fund_bin = (int)(((int64_t)m.frequency * FFT_SIZE * bin_period) /
+        1000000000ll);
 
-    fft_spectrum(g_fft_samples, FFT_SIZE, 0, g_fft_mag);
+    fft_spectrum_decim(data, size, offset, decim, g_fft_mag);
     classify_signal(&m, g_fft_mag, FFT_BINS, fund_bin, &g_signal_class);
-    g_spectrum_hz = fft_peak_frequency(g_fft_mag, period_ns);
+    g_spectrum_hz = fft_peak_frequency(g_fft_mag, (int)bin_period);
+
+    // The full harmonic analysis, which is where the THD reading comes from:
+    // the same function, on the same kind of spectrum, as the number the
+    // spectrum view puts in its panel. It also feeds the alias test below.
+    fft_analyze(g_fft_mag, (int)bin_period, &g_alias_an);
 
     // Same argument as the peak above: the transform is already paid for, and
-    // this reads an answer out of it. The spectrum here is undecimated by
-    // construction - FFT_SIZE samples straight off the record - which is the
-    // one condition alias.c reasons under, since past that the band edge is
-    // the decimation's low-pass rather than the analog frontend.
+    // this reads an answer out of it. But only when the spectrum is UNDECIMATED
+    // - that is the one condition alias.c reasons under, since past it the band
+    // edge is the decimation's low-pass rather than the analog frontend. No
+    // loss: a signal that needed decimation to be seen at all is nowhere near
+    // the Nyquist rate this question is about.
     //
     // Only ALIAS_POSSIBLE produces a number. IN_BAND means the harmonics were
     // found where only an in-band source can put them, and printing "could be
     // 108 MHz" beside a reading the record just PROVED honest would be worse
     // than printing nothing; NO_EVIDENCE means the test was refused rather
     // than passed, and a refusal is not a candidate either.
-    fft_analyze(g_fft_mag, period_ns, &g_alias_an);
-    alias_check(g_fft_mag, &g_alias_an, ALIAS_FRONTEND_HZ, &g_alias_res);
+    if (1 == decim)
+    {
+      alias_check(g_fft_mag, &g_alias_an, ALIAS_FRONTEND_HZ, &g_alias_res);
 
-    g_alias_hz = (ALIAS_POSSIBLE == g_alias_res.verdict && g_alias_res.count > 1) ?
-        (int)(g_alias_res.cand[1].freq + 0.5f) : 0;
+      g_alias_hz = (ALIAS_POSSIBLE == g_alias_res.verdict && g_alias_res.count > 1) ?
+          (int)(g_alias_res.cand[1].freq + 0.5f) : 0;
+    }
+    else
+    {
+      g_alias_res.verdict = ALIAS_NO_EVIDENCE;
+      g_alias_hz = 0;
+    }
   }
   else
   {
@@ -2667,8 +2719,13 @@ static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
       signal_info_update();
       // "THD", not the lone "t" it used to be. A one-letter name over a field
       // that is blank most of the time is a puzzle, not a label.
+      //
+      // From the same analysis the spectrum view prints, not from the
+      // classifier's own smaller sum: two readings called THD on one
+      // instrument have to be the same number, and the one with twelve folded
+      // harmonics behind it is the better of the two to keep.
       tag = "T"; label = "THD"; kind = MK_OTHER;
-      present = g_signal_class.thd_x10 >= 0;
+      present = g_alias_an.thd_x10 >= 0;
 
       // A spectrum is not always there to take it from, and a slot the user
       // asked for says so rather than going blank or keeping a stale number
@@ -2676,7 +2733,7 @@ static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
         snprintf(scratch, sizeof(scratch), " --.-%%");
       else
         snprintf(scratch, sizeof(scratch), "%3d.%d%%",
-            g_signal_class.thd_x10 / 10, g_signal_class.thd_x10 % 10);
+            g_alias_an.thd_x10 / 10, g_alias_an.thd_x10 % 10);
 
       value = scratch;
       break;
