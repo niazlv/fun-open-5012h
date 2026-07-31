@@ -158,11 +158,20 @@
  * is what lets the gauge reach full while the pack is still on the cable.
  *
  * The size of it is a property of the pack and the charge current, not
- * something this file can know: BATTERY_CHARGE_LIFT is a starting figure, and
- * the Battery page reports the lift it actually saw at the last unplug beside
- * it so the two can be compared on real hardware.
+ * something this file can know, so it was measured on the bench rather than
+ * taken from the charger's datasheet: one pack read 3.88 V resting and 3.93 V
+ * with the charger on it, which is 50 mV and not the 120 mV that was assumed
+ * here. 120 mV was worth 16 points of the gauge at that voltage - the pack
+ * above read 62 % on its own and 48 % on the cable, and that is the whole of
+ * why a charger appeared to half-empty the battery. At 50 mV both readings
+ * land on 62 %, which is the property worth having: connecting a cable does
+ * not move the gauge, because it does not move the charge.
+ *
+ * The Battery page reports the lift it saw at the last unplug beside the
+ * figure below, so a different pack disagreeing with this one is visible from
+ * the front panel rather than only from a bench meter.
  */
-#define BATTERY_CHARGE_LIFT      120
+#define BATTERY_CHARGE_LIFT      50
 #define BATTERY_CV_START         4050
 #define BATTERY_CV_END           4200
 
