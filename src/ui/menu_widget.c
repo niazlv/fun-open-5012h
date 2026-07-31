@@ -149,6 +149,7 @@ static const UiMetrics g_ui_metrics[UI_SCALE_COUNT] =
 static void menu_leave(void *ctx);
 static void menu_draw(void *ctx, bool full);
 static bool menu_input(void *ctx, int buttons);
+static bool menu_bounds(void *ctx, ui_rect_t *rect);
 
 //-----------------------------------------------------------------------------
 static const ui_screen_t menu_screen_popup =
@@ -156,6 +157,7 @@ static const ui_screen_t menu_screen_popup =
   .leave  = menu_leave,
   .draw   = menu_draw,
   .input  = menu_input,
+  .bounds = menu_bounds,
   .opaque = false,
 };
 
@@ -471,6 +473,7 @@ static void number_adjust(const menu_item_t *it, int delta)
   if (it->u.number.apply)
     it->u.number.apply(v);
 
+  ui_invalidate_below(); // the screen under the menu is showing the old value
   ui_request_redraw();
 }
 
@@ -488,6 +491,7 @@ static void choice_adjust(const menu_item_t *it, int dir)
   if (it->u.choice.on_change)
     it->u.choice.on_change();
 
+  ui_invalidate_below();
   ui_request_redraw();
 }
 
@@ -1118,6 +1122,25 @@ static void menu_leave(void *ctx)
 }
 
 //-----------------------------------------------------------------------------
+// What this popup covers, so that closing it costs a repaint of that and not
+// of the instrument behind it. The box plus the two pixels of shadow that
+// popup_draw() lays down and to the right of it.
+static bool menu_bounds(void *ctx, ui_rect_t *rect)
+{
+  const menu_inst_t *m = (const menu_inst_t *)ctx;
+
+  if (m->fullscreen)
+    return false;
+
+  rect->x = m->x;
+  rect->y = m->y;
+  rect->w = m->w + 2;
+  rect->h = m->h + 2;
+
+  return true;
+}
+
+//-----------------------------------------------------------------------------
 static void menu_draw(void *ctx, bool full)
 {
   menu_inst_t *m = (menu_inst_t *)ctx;
@@ -1255,6 +1278,7 @@ static bool menu_input(void *ctx, int buttons)
         *it->u.toggle.value = !*it->u.toggle.value;
         if (it->u.toggle.on_change)
           it->u.toggle.on_change();
+        ui_invalidate_below();
         ui_request_redraw();
         break;
 
@@ -1265,6 +1289,11 @@ static bool menu_input(void *ctx, int buttons)
         break;
 
       case MI_ACTION:
+        // An action is anything at all - an auto-setup, a saved config, a
+        // calibration run - so what it left behind it is not knowable from
+        // here, and the screen under the menu is repainted whole afterwards
+        ui_invalidate_below();
+
         // May push a dialog or pop this very menu — no instance access after
         it->u.action.fn(it->u.action.arg);
         break;
