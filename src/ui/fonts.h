@@ -34,7 +34,11 @@
 
 /*- Definitions -------------------------------------------------------------*/
 #define FONT_FIRST_CHAR        ' '
-#define FONT_LAST_CHAR         '~'
+// One past printable ASCII, because there is one glyph past it: a V with the
+// direct-current sign under it, for a status-bar tag that has one glyph of room
+// and something more than "V" to say
+#define FONT_LAST_CHAR         '\x7f'
+#define FONT_DC_MARK           '\x7f'
 #define FONT_HALF_SPACE        '\x01'
 
 #define FONT_SMALL             &font_6x8

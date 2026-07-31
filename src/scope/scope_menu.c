@@ -1275,7 +1275,7 @@ static const menu_item_t g_line_items[] =
   // Stored inverted (see config.h) so that the swap is what a device with no
   // saved settings does. The row still reads the right way round.
   { .kind = MI_TOGGLE_INV, .label = "Vpp shows DC",
-    .desc = "On a flat trace the bar reads the level",
+    .desc = "Flat trace, DC coupled - or hold AC/DC",
     .u.toggle = { &config.vpp_dc_off, NULL } },
 };
 

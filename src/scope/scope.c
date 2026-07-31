@@ -736,6 +736,8 @@ static MarkerRect g_vpos_marker = { 0, 0, 0, 0, false };
 static MarkerRect g_trig_marker = { 0, 0, 0, 0, false };
 
 static bool g_toast_active = false;
+// One Vpp/DC toggle per hold of the AC/DC key, not one per auto-repeat tick
+static bool g_acdc_held = false;
 static int g_toast_timer = TIMER_DISABLE;
 
 static int g_state = -1;
@@ -4723,7 +4725,11 @@ static bool measure_bar_is_flat(const ScopeMeasure *sm)
   static bool flat = false;
   int swing = sm->vmax_raw - sm->vmin_raw;
 
-  if (config.vpp_dc_off)
+  // Only with the input DC coupled, and that is not a detail: in AC the DC is
+  // taken out by the hardware before the converter ever sees it, so there is no
+  // level to report and a flat trace means "nothing is happening" rather than
+  // "a steady voltage is here". Vpp is the honest reading there and it stays.
+  if (config.vpp_dc_off || config.ac_coupling)
     return false;
 
   flat = flat ? (swing <= BAR_DC_LEAVE) : (swing <= BAR_DC_ENTER);
@@ -4821,7 +4827,10 @@ static void draw_measure(void)
     {
       if (swap)
       {
-        snprintf(item.tag, sizeof(item.tag), "=");
+        // The tag keeps the V and gains the direct-current sign under it - one
+        // glyph, because the tag column is one glyph, and the reading is still
+        // volts. At the large size there is room for the word instead.
+        snprintf(item.tag, sizeof(item.tag), "%c", FONT_DC_MARK);
         snprintf(item.label, sizeof(item.label), "Vdc");
       }
 
@@ -9950,6 +9959,11 @@ void scope_buttons_handler(int buttons)
   bool shift  = (buttons & BTN_SHIFT);
   bool repeat = (buttons & BTN_REPEAT);
 
+  // The AC/DC hold is armed again only once the key is let go - the release
+  // arrives as an event with no keys in it, which is exactly what this reads
+  if (0 == (buttons & BTN_AC_DC))
+    g_acdc_held = false;
+
   // ...and so does the layout editor, for a simpler reason: every key on this
   // screen means something else than it does over a live trace
   if (g_layout_edit)
@@ -10191,8 +10205,39 @@ void scope_buttons_handler(int buttons)
 
   else if (buttons & BTN_AC_DC)
   {
+    // HELD: the other thing this key is about. Coupling decides whether there
+    // is a DC level at all, so the switch for "show it in the bar instead of a
+    // peak-to-peak of noise" belongs on the same key rather than four rows deep
+    // in a menu - and it only does anything on the side of the key that has a
+    // level to show. One toast, because a setting toggled by a long press with
+    // no visible result is a setting nobody trusts.
     if (repeat)
+    {
+      char msg[48];
+
+      if (g_acdc_held)
+        return; // one toggle per hold, not one per repeat tick
+
+      g_acdc_held = true;
+
+      // The press that began this hold has already flipped the coupling. Put it
+      // back: a hold means the OTHER thing on this key, not both things, and
+      // the user who wants the coupling changed has not lifted their finger yet
+      // to say so.
+      config.ac_coupling = !config.ac_coupling;
+      scope_display_settings_changed();
+      capture_set_vertical_parameters();
+      draw_ac_dc();
+
+      config.vpp_dc_off = !config.vpp_dc_off;
+
+      snprintf(msg, sizeof(msg), "Flat DC in the bar: %s%s",
+          config.vpp_dc_off ? "OFF" : "ON",
+          config.ac_coupling ? "  (DC coupling only)" : "");
+      toast_show();
+      lcd_puts(GRID_LEFT, STATUS_LINE_Y, msg);
       return;
+    }
 
     config.ac_coupling = !config.ac_coupling;
 
