@@ -59,6 +59,17 @@
  * low under load and high just off the charger, and the Battery page says so.
  * What it does do is stay put when the battery has not changed, which is the
  * property that makes a gauge readable.
+ *
+ * ...and then there is saying that current is going in at all. That was two
+ * pixels of dark green blinking on the end of the fill, and the arithmetic
+ * behind it is the whole problem: the blink was the gap between the level and
+ * the end of the bar, capped at two pixels, and a charger spends almost all of
+ * its time at the top of the curve where that gap is one pixel or none. So the
+ * one state the user most wants to see - it is plugged in, it is working - was
+ * the state the icon had the least room to show. Charging now says so three
+ * ways at once, none of which depend on how full the pack is: the outline
+ * changes colour, a bolt is drawn across the middle of the icon, and the rest
+ * of the bar sweeps up to full and starts again behind a level that stays put.
  */
 
 /*- Includes ----------------------------------------------------------------*/
@@ -88,6 +99,21 @@
 #define BATTERY_FILL_W           16
 #define BATTERY_FILL_H           6
 
+// Charging, in its own colour: the fill keeps the level's red/amber/green,
+// because a pack at 10 % is still a pack at 10 % while it charges, and the
+// outline and the sweep carry the plugged-in part of the message. A colour
+// difference on the outline is legible across a bench without looking at it,
+// which is what a status icon is for.
+#define BATTERY_CHARGE_COLOR     LCD_COLOR(0, 210, 255)
+#define BATTERY_SWEEP_COLOR      LCD_COLOR(0, 80, 105)
+
+// The bolt, centred in the fill. Six rows is the height of the fill, so it is
+// as large as the icon can hold - anything smaller stops reading as a bolt.
+#define BATTERY_BOLT_W           5
+#define BATTERY_BOLT_H           6
+#define BATTERY_BOLT_X           (BATTERY_FILL_X + (BATTERY_FILL_W - BATTERY_BOLT_W) / 2)
+#define BATTERY_BOLT_Y           BATTERY_FILL_Y
+
 // Full scale at the cell: 3.3 V reference through the divider on PB1
 #define BATTERY_REF_VOLTAGE      6600
 
@@ -110,7 +136,12 @@
 #define BATTERY_CHARGE_LIFT      120
 
 #define BATTERY_SAMPLE_INTERVAL  500
-#define BATTERY_BLINK_INTERVAL   500
+
+// The charging sweep: one step every interval, and back to the start after
+// the last one. Four steps of 500 ms is a two-second cycle - slow enough to
+// read as filling up rather than as something flashing for attention.
+#define BATTERY_ANIM_INTERVAL    500
+#define BATTERY_ANIM_STEPS       4
 
 // Consecutive filtered readings under the floor before the device is halted -
 // 10 s on top of a median that is already 7.5 s wide, so nothing short of a
@@ -210,10 +241,31 @@ static const char *const battery_state_names[] =
   "discharging", "charging", "full",
 };
 
+/*
+ * The bolt, one bit per pixel with bit 4 leftmost:
+ *
+ *     . . # # .
+ *     . # # . .
+ *     # # # # #
+ *     . . # # .
+ *     . # # . .
+ *     # # . . .
+ *
+ * A stroke down and to the left, a bar across the middle, and the stroke
+ * picked up again to the right of where it stopped - which is the kick that
+ * makes five pixels of zigzag read as a lightning bolt rather than as a slash.
+ */
+static const uint8_t battery_bolt[BATTERY_BOLT_H] =
+{
+  0x06, 0x0c, 0x1f, 0x06, 0x0c, 0x18,
+};
+
 /*- Variables ---------------------------------------------------------------*/
 static int g_battery_sample_timer = TIMER_DISABLE;
-static int g_battery_blink_timer = TIMER_DISABLE;
-static bool g_battery_blink_state = false;
+
+// The charging sweep: running only while charging, 0..BATTERY_ANIM_STEPS-1
+static int g_battery_anim_timer = TIMER_DISABLE;
+static int g_battery_anim_phase = 0;
 
 // The median window, primed at init so every slot is always a real reading
 static uint16_t g_battery_samples[BATTERY_SAMPLES];
@@ -341,8 +393,18 @@ static bool battery_charger_on(void)
 //-----------------------------------------------------------------------------
 static void battery_draw_frame(void)
 {
-  int frame = (g_battery_percent >= 0 && g_battery_percent < 15 &&
-      BATTERY_DISCHARGING == g_battery_state) ? LCD_RED_COLOR : LCD_WHITE_COLOR;
+  int frame;
+
+  // Charging outranks the low-battery red: a pack under 15 % that is on a
+  // charger is not the thing red is warning about, and the state the user is
+  // looking for an answer about is the charger.
+  if (BATTERY_CHARGING == g_battery_state)
+    frame = BATTERY_CHARGE_COLOR;
+  else if (g_battery_percent >= 0 && g_battery_percent < 15 &&
+      BATTERY_DISCHARGING == g_battery_state)
+    frame = LCD_RED_COLOR;
+  else
+    frame = LCD_WHITE_COLOR;
 
   // Outline and nub, then the one-pixel gap between the outline and the fill.
   // Lines rather than a filled 20x10 rectangle with a black one over it: every
@@ -367,8 +429,39 @@ static void battery_draw_frame(void)
 }
 
 //-----------------------------------------------------------------------------
+// The bolt, over whatever the level left behind in the middle of the icon:
+// black where it lands on a painted column and the charge colour where it
+// lands on an empty one. That is what makes it the one part of the icon whose
+// legibility does not depend on how full the pack is - and a pack on a charger
+// is at the top of the curve nearly all of the time, which is exactly where
+// the bar has no room left to say anything.
+//
+// `painted` is how far along the fill area something has been drawn, fill plus
+// sweep, in columns.
+static void battery_draw_bolt(int painted)
+{
+  for (int row = 0; row < BATTERY_BOLT_H; row++)
+  {
+    uint8_t bits = battery_bolt[row];
+
+    for (int col = 0; col < BATTERY_BOLT_W; col++)
+    {
+      int x = BATTERY_BOLT_X + col;
+
+      if (0 == (bits & (1 << (BATTERY_BOLT_W - 1 - col))))
+        continue;
+
+      lcd_draw_pixel(x, BATTERY_BOLT_Y + row,
+          ((x - BATTERY_FILL_X) < painted) ? LCD_BLACK_COLOR :
+          BATTERY_CHARGE_COLOR);
+    }
+  }
+}
+
+//-----------------------------------------------------------------------------
 static void battery_draw_level(void)
 {
+  bool charging = (BATTERY_CHARGING == g_battery_state);
   int pct = (g_battery_percent < 0) ? 0 : g_battery_percent;
   int fill = (pct * BATTERY_FILL_W + 50) / 100;
   int ghost = 0;
@@ -381,16 +474,16 @@ static void battery_draw_level(void)
   else
     color = LCD_GREEN_COLOR;
 
-  // Charging reads as the next slice of the bar blinking on and off past the
-  // level, rather than as the level itself moving: the bar keeps saying how
-  // full the pack is while the animation says current is going in.
-  if (BATTERY_CHARGING == g_battery_state && g_battery_blink_state &&
-      fill < BATTERY_FILL_W)
+  // Charging reads as the rest of the bar sweeping up to full and starting
+  // again, rather than as the level itself moving: the bar keeps saying how
+  // full the pack is while the sweep says current is going in. Rounded up, so
+  // a gap of one or two columns is a tail that is drawn rather than one that
+  // divides away to nothing.
+  if (charging)
   {
-    ghost = BATTERY_FILL_W - fill;
-
-    if (ghost > 2)
-      ghost = 2;
+    rest = BATTERY_FILL_W - fill;
+    ghost = (rest * (g_battery_anim_phase + 1) + BATTERY_ANIM_STEPS - 1) /
+        BATTERY_ANIM_STEPS;
   }
 
   rest = BATTERY_FILL_W - fill - ghost;
@@ -401,7 +494,7 @@ static void battery_draw_level(void)
   if (ghost > 0)
   {
     lcd_fill_rect(BATTERY_FILL_X + fill, BATTERY_FILL_Y, ghost,
-        BATTERY_FILL_H, LCD_COLOR(0, 110, 0));
+        BATTERY_FILL_H, BATTERY_SWEEP_COLOR);
   }
 
   if (rest > 0)
@@ -409,6 +502,9 @@ static void battery_draw_level(void)
     lcd_fill_rect(BATTERY_FILL_X + fill + ghost, BATTERY_FILL_Y, rest,
         BATTERY_FILL_H, LCD_BLACK_COLOR);
   }
+
+  if (charging)
+    battery_draw_bolt(fill + ghost);
 }
 
 //-----------------------------------------------------------------------------
@@ -506,16 +602,14 @@ static void battery_sample(void)
 
     g_battery_state = state;
 
+    // From the start of the sweep either way round, so the icon does not come
+    // out of a plug event with the bar half painted
+    g_battery_anim_phase = 0;
+
     if (BATTERY_CHARGING == state)
-    {
-      if (TIMER_DISABLE == g_battery_blink_timer)
-        g_battery_blink_timer = BATTERY_BLINK_INTERVAL;
-    }
+      g_battery_anim_timer = BATTERY_ANIM_INTERVAL;
     else
-    {
-      g_battery_blink_timer = TIMER_DISABLE;
-      g_battery_blink_state = false;
-    }
+      g_battery_anim_timer = TIMER_DISABLE;
 
     // The lift comes off or goes on with the charger, so the displayed value
     // steps here rather than walking to the new one a per cent at a time
@@ -647,7 +741,7 @@ void battery_init(void)
   g_battery_est_percent = g_battery_percent;
 
   timer_add(&g_battery_sample_timer);
-  timer_add(&g_battery_blink_timer);
+  timer_add(&g_battery_anim_timer);
 
   g_battery_sample_timer = BATTERY_SAMPLE_INTERVAL;
 
@@ -698,10 +792,10 @@ void battery_task(bool may_draw)
     redraw = (percent != g_battery_percent || state != g_battery_state);
   }
 
-  if (0 == g_battery_blink_timer)
+  if (0 == g_battery_anim_timer)
   {
-    g_battery_blink_timer = BATTERY_BLINK_INTERVAL;
-    g_battery_blink_state = !g_battery_blink_state;
+    g_battery_anim_timer = BATTERY_ANIM_INTERVAL;
+    g_battery_anim_phase = (g_battery_anim_phase + 1) % BATTERY_ANIM_STEPS;
 
     redraw = true;
   }
