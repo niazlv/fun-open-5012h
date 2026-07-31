@@ -27,6 +27,10 @@ typedef struct
                    // would erase (a us-scale packet in a ms-scale record)
   int  mean_c100;  // mean of (sample - zero_point), in counts * 100
   int  rms_c100;   // RMS of (sample - zero_point), in counts * 100
+  int  mean3_c100; // mean of (sample - zero_point)^3, counts^3 * 100. Only the
+                   // nonlinearity correction reads it (capture.c): shifting an
+                   // RMS off a bent code axis needs the third moment, and this
+                   // is the one place that has seen every sample.
   int  frequency;  // Hz; 0 when no periodic signal was found
   int  duty_x10;   // duty cycle in 0.1% units (0..1000); -1 when n/a
   int  width_pos_ns;    // mean time per period spent above the mid level and

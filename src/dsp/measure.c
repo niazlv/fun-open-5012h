@@ -252,6 +252,28 @@ void measure_run(const uint8_t *data, int size, int offset,
       index = 0;
   }
 
+  // Third moment, out of the histogram rather than the sample loop: the bins
+  // already hold how many samples sat on each code, so this is 256 iterations
+  // once per scan instead of a 64-bit multiply-add on every one of 24 thousand
+  // samples. It exists for the nonlinearity correction, which needs E[x^3] to
+  // move an RMS from the measured code axis onto the corrected one - see
+  // capture.c. Nothing else reads it.
+  {
+    int64_t cube = 0;
+
+    for (int v = 0; v < 256; v++)
+    {
+      if (g_hist[v])
+      {
+        int d = v - zero_point;
+
+        cube += (int64_t)g_hist[v] * d * d * d;
+      }
+    }
+
+    m->mean3_c100 = (int)(cube * 100 / size);
+  }
+
   m->vmin = vmin;
   m->vmax = vmax;
   m->base = percentile_level(size, PCTL_LOW);

@@ -926,6 +926,21 @@ void capture_set_vertical_parameters(void)
 }
 
 //-----------------------------------------------------------------------------
+// The offset DAC on its own, in its own units, for the one caller that wants
+// the DAC rather than a vertical position: the linearity sweep, whose whole
+// method is that the steps it takes are exactly equal. Going through
+// config.vertical_position would put a truncating divide by calib_dac_mult
+// between the intent and the hardware, and a jitter of one DAC count is a
+// fifth of an ADC code - which is most of what the sweep is trying to measure.
+//
+// No DMA restart: this writes one register, the converter keeps running, and
+// the caller waits for whole records to arrive before believing any of them.
+void capture_set_dac_raw(int code)
+{
+  dac_write(code);
+}
+
+//-----------------------------------------------------------------------------
 void capture_set_horizontal_parameters(int sr_divider, int trigger_offset)
 {
   int divider, dma_divider;
@@ -1535,16 +1550,115 @@ static bool measure_active_buffer_ex(Measure *out, bool fresh)
   return true;
 }
 
+/*
+ * Nonlinearity of the analog chain, undone.
+ *
+ * The chain is a resistive attenuator, an amplifier and the converter. The
+ * first is linear to orders of magnitude past anything measurable here; the
+ * other two are not, and both of them work on the same axis - what the ADC
+ * calls a code - which is why ONE pair of coefficients covers all eight ranges
+ * and why they are indexed by converter rather than by volts/div.
+ *
+ * The model is the smallest one that fits what the sweep measures: a code x
+ * counted from ZERO_POINT reads back as
+ *
+ *     m = x + q * x^2 / NL_SHIFT
+ *
+ * so the reading is undone by x = m - q*m^2/NL_SHIFT, to first order, which is
+ * to the same order the model is good for. It is zero at x = 0 on purpose: the
+ * zero calibration is done on a shorted input, and a correction that moved the
+ * origin would fight it.
+ *
+ * Everything here works in hundredths of a code, the units measure.c hands
+ * back, and everything is corrected BEFORE the volts-per-count multiplier -
+ * which is the point: the gain calibration is then measuring a chain that is
+ * already straight, and one number can describe it.
+ */
+#define NL_SHIFT   22
+
+static int nl_q(void)
+{
+  // Which converter's curve applies depends on which converters ran: a
+  // single-channel acquisition is ADC B alone, everything else interleaves the
+  // two, and an average over both is what the record's aggregates are made of.
+  if (g_dual_channel)
+    return ((int)config.calib_nl2[0] + (int)config.calib_nl2[1]) / 2;
+
+  return config.calib_nl2[0];
+}
+
+// A code as measure.c reports it (already relative to ZERO_POINT, hundredths)
+static int nl_undo_x100(int x100, int q)
+{
+  if (0 == q)
+    return x100;
+
+  return x100 - (int)((int64_t)q * x100 * x100 / (100LL << NL_SHIFT));
+}
+
+// ...and a raw code, 0..255, straight out of the histogram
+static int nl_code_x100(int code, int q)
+{
+  return nl_undo_x100((code - ZERO_POINT) * 100, q);
+}
+
+// The mean is not the mean of the corrected samples - E[m - q*m^2] is
+// E[m] - q*E[m^2], and E[m^2] is the RMS the same scan already returned. Exact,
+// and it costs a multiply rather than a second pass over the record.
+static int nl_mean_x100(const Measure *m, int q)
+{
+  if (0 == q)
+    return m->mean_c100;
+
+  return m->mean_c100 -
+      (int)((int64_t)q * m->rms_c100 * m->rms_c100 / (100LL << NL_SHIFT));
+}
+
+// The RMS moves by the same identity one order up: E[(m - q*m^2)^2] is
+// E[m^2] - 2q*E[m^3], which is what the third moment out of measure.c is for.
+// Note what this does NOT do - a symmetric signal about zero has E[m^3] = 0, so
+// its RMS does not move at all, which is correct: a quadratic bend rectifies a
+// symmetric swing into the MEAN and leaves its amplitude alone.
+static int nl_rms_x100(const Measure *m, int q)
+{
+  int64_t sq;
+
+  if (0 == q)
+    return m->rms_c100;
+
+  sq = (int64_t)m->rms_c100 * m->rms_c100 -
+      2 * (int64_t)q * m->mean3_c100 * 100 / (1LL << NL_SHIFT);
+
+  return (int)isqrt64(sq > 0 ? (uint64_t)sq : 0);
+}
+
+//---------------------------------------------------------------------
+// Hundredths of a code to millivolts, the one place the volts-per-count
+// calibration is allowed to multiply: everything above it is a code.
+static int mv_of_x100(int x100, int64_t mult)
+{
+  return (int)((int64_t)x100 * mult / CALIB_MULTIPLIER / 100);
+}
+
 //---------------------------------------------------------------------
 static bool get_measurements_ex(ScopeMeasure *out, bool fresh)
 {
   Measure m;
   int64_t mult;
+  int q, vmax100, vmin100, hi100, lo100, top100, base100;
 
   if (!measure_active_buffer_ex(&m, fresh))
     return false;
 
   mult = (int64_t)config.calib_vs_mult[config.vertical_scale] * config_probe_mult();
+
+  q = nl_q();
+  vmax100 = nl_code_x100(m.vmax, q);
+  vmin100 = nl_code_x100(m.vmin, q);
+  hi100   = nl_code_x100(m.pk_hi, q);
+  lo100   = nl_code_x100(m.pk_lo, q);
+  top100  = nl_code_x100(m.top, q);
+  base100 = nl_code_x100(m.base, q);
 
   out->vmin_raw  = m.vmin;
   out->vmax_raw  = m.vmax;
@@ -1558,14 +1672,14 @@ static bool get_measurements_ex(ScopeMeasure *out, bool fresh)
   // trace sits. Which is also why they read ~0 on a steady level - there is
   // nothing there to swing, and what is left is the noise band. The DC level
   // is vavg_mv / vmax_mv, not these.
-  out->vpp_mv    = (int)((int64_t)(m.vmax - m.vmin) * mult / CALIB_MULTIPLIER);
-  out->vamp_mv   = (int)((int64_t)(m.pk_hi - m.pk_lo) * mult / CALIB_MULTIPLIER);
+  out->vpp_mv    = mv_of_x100(vmax100 - vmin100, mult);
+  out->vamp_mv   = mv_of_x100(hi100 - lo100, mult);
   // Mid level between the spike-trimmed peaks: works for continuous signals
   // (equals the rail midpoint) and for bursts (percentiles would put the
   // "midpoint" at the baseline). Stays measured from the middle of the screen,
   // because its one consumer is the 50% trigger key and a trigger level IS
   // pixels from the middle of the screen.
-  out->vmid_mv   = (int)((int64_t)((m.pk_hi + m.pk_lo) / 2 - ZERO_POINT) * mult / CALIB_MULTIPLIER);
+  out->vmid_mv   = mv_of_x100((hi100 + lo100) / 2, mult);
 
   // ...and the same conversion with the vertical position taken back out, so
   // these read the input and not the screen. ZERO_POINT is the code the offset
@@ -1580,8 +1694,8 @@ static bool get_measurements_ex(ScopeMeasure *out, bool fresh)
   // conventions in one panel would be worse than either.
   {
     int vpos = config.vertical_position_mv;
-    int hi = (int)((int64_t)(m.vmax - ZERO_POINT) * mult / CALIB_MULTIPLIER) - vpos;
-    int lo = (int)((int64_t)(m.vmin - ZERO_POINT) * mult / CALIB_MULTIPLIER) - vpos;
+    int hi = mv_of_x100(vmax100, mult) - vpos;
+    int lo = mv_of_x100(vmin100, mult) - vpos;
 
     out->vmax_mv = hi;
     out->vmin_mv = lo;
@@ -1590,8 +1704,8 @@ static bool get_measurements_ex(ScopeMeasure *out, bool fresh)
     // percentiles rather than the trimmed peaks: what this pair is for is an
     // amplitude with the overshoot left out, and a 4% overshoot lasts far
     // longer than the eight samples a spike trim discards.
-    out->vtop_mv  = (int)((int64_t)(m.top - ZERO_POINT) * mult / CALIB_MULTIPLIER) - vpos;
-    out->vbase_mv = (int)((int64_t)(m.base - ZERO_POINT) * mult / CALIB_MULTIPLIER) - vpos;
+    out->vtop_mv  = mv_of_x100(top100, mult) - vpos;
+    out->vbase_mv = mv_of_x100(base100, mult) - vpos;
 
     if (hi < 0)
       hi = -hi;
@@ -1613,8 +1727,8 @@ static bool get_measurements_ex(ScopeMeasure *out, bool fresh)
     // quadratic: <(x-k)^2> = <x^2> - 2k<x> + k^2. That identity is exact, so
     // the record does not have to be scanned a second time to re-reference it.
     {
-      int64_t mean_mv = (int64_t)m.mean_c100 * mult / CALIB_MULTIPLIER / 100;
-      int64_t rms_mv  = (int64_t)m.rms_c100 * mult / CALIB_MULTIPLIER / 100;
+      int64_t mean_mv = mv_of_x100(nl_mean_x100(&m, q), mult);
+      int64_t rms_mv  = mv_of_x100(nl_rms_x100(&m, q), mult);
       int64_t sq = rms_mv * rms_mv - 2 * (int64_t)vpos * mean_mv +
           (int64_t)vpos * vpos;
 
@@ -1663,6 +1777,17 @@ bool capture_get_raw_measure(Measure *out)
 bool capture_get_raw_measure_fresh(Measure *out)
 {
   return measure_active_buffer_ex(out, true);
+}
+
+//---------------------------------------------------------------------
+// The mean of a raw scan with the chain's own bend taken out, in hundredths of
+// a code. For the gain calibration, which has to measure a chain that is
+// already straight - trimming volts-per-count against a bent one puts the bend
+// into the gain, where it fits nobody, and the two calibrations would then
+// disagree by however much the bend was worth at whatever level was used.
+int capture_measure_mean_x100(const Measure *m)
+{
+  return nl_mean_x100(m, nl_q());
 }
 
 //---------------------------------------------------------------------

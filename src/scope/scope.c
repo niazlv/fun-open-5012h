@@ -837,6 +837,7 @@ enum
   ACAL_ZERO,   // single channel: put ADC B's mean on ZERO_POINT
   ACAL_DELTA,  // dual channel: match ADC A's mean to ADC B's
   ACAL_DAC,    // per range: one position pixel must move the trace one pixel
+  ACAL_LIN,    // sweep the offset DAC across the window and fit the bend in it
   ACAL_ASK_REF,// waiting for the reference voltage to be connected
   ACAL_SCALE,  // gain: make the reading equal that reference
   ACAL_DONE,
@@ -856,6 +857,20 @@ static int g_autocal_saved_vpos = 0;
 static int g_autocal_saved_srl = 0;
 static int g_autocal_saved_tmode = 0;
 static bool g_autocal_did_gain = false; // whether the gain step actually ran
+
+// The linearity sweep's accumulators. Sums rather than a table of points: the
+// fit is three coefficients, and three coefficients need six sums, not 33
+// samples kept around in a TCM that has none to spare.
+#define ACAL_LIN_M       16       // points either side of the middle
+#define ACAL_LIN_N       (2*ACAL_LIN_M + 1)
+#define ACAL_LIN_SPAN    110      // ADC codes the sweep aims to cover, +-
+#define ACAL_LIN_MIN_SPAN 60      // ...and the least it may actually cover
+static int g_lin_i = 0;           // -M..+M, the step being measured
+static int g_lin_step = 0;        // DAC counts between steps
+static int g_lin_dac0 = 0;        // DAC code the sweep is centred on
+static int g_lin_n[2] = { 0, 0 }; // points that landed inside the window
+static int64_t g_lin_sx[2], g_lin_sxi[2], g_lin_sxi2[2], g_lin_sxx[2];
+static int64_t g_lin_si[2], g_lin_si2[2], g_lin_si3[2], g_lin_si4[2];
 // The gain pass on its own: no shorted-input preamble, and it does not stop
 // after one range. Zero, delta and the DAC step are statements about the
 // instrument and are found once; gain is a volts-per-count claim and there is
@@ -8663,6 +8678,15 @@ static void autocal_say(const char *l0, const char *l1)
 //-----------------------------------------------------------------------------
 static bool autocal_ready(void)
 {
+  // The linearity sweep waits on a DAC write and nothing else - no relay, no
+  // sample rate, no attenuator - and capture_get_channel_means() reads the raw
+  // ring rather than a decimated snapshot, so one whole record already holds
+  // none of the old level. Two, and its thirty-three steps take six seconds
+  // instead of eighteen; the six the other phases use are for a switched
+  // attenuator, which is a different kind of settling.
+  if (ACAL_LIN == g_autocal_phase)
+    return (capture_get_generation() - g_autocal_gen) >= 2;
+
   return (capture_get_generation() - g_autocal_gen) >= AUTOCAL_SETTLE;
 }
 
@@ -8834,6 +8858,266 @@ static void gain_range_step(int delta)
   gain_prompt();
 }
 
+/*
+ * Linearity: the instrument measuring its own bend, with nothing plugged in.
+ *
+ * The trick is that the reference is already on the board. The offset DAC is
+ * twelve bits and it moves the signal across the converter's window; the ADC is
+ * eight. Step the DAC in equal jumps with the input shorted, write down where
+ * the trace lands each time, and any departure from a straight line is the
+ * chain's - because the DAC's own nonlinearity, at +-2 LSB of 4096, is 0.06 of
+ * an 8-bit code. A ruler eight times finer than the thing being measured is a
+ * ruler.
+ *
+ * What comes out is fitted as x = a + b*i + c*i^2 over the step number i, and
+ * only c is kept: a is the zero (calibrated already, and by a step that owns
+ * it) and b is the gain (calibrated per range, later, and by a step that owns
+ * that). The curvature is the part nothing else can express - and it is the
+ * part that made a single-point gain trim fix 9.18 V and break 5.28 V.
+ *
+ * Both converters are measured in the same sweep: the ring interleaves them,
+ * capture_get_channel_means() splits them, and they do not have the same curve.
+ */
+static void lin_reset(void)
+{
+  for (int c = 0; c < 2; c++)
+  {
+    g_lin_n[c] = 0;
+    g_lin_sx[c] = g_lin_sxi[c] = g_lin_sxi2[c] = g_lin_sxx[c] = 0;
+    g_lin_si[c] = g_lin_si2[c] = g_lin_si3[c] = g_lin_si4[c] = 0;
+  }
+}
+
+//-----------------------------------------------------------------------------
+static void lin_accumulate(int c, int mean_x100)
+{
+  // Outside this the amplifier is on its rail and the point is a lie about a
+  // straight line rather than a measurement of a bent one
+  if (mean_x100 < 1200 || mean_x100 > 24300)
+    return;
+
+  {
+    int64_t x = mean_x100 - ZERO_POINT * 100;
+    int64_t i = g_lin_i;
+
+    g_lin_n[c]++;
+    g_lin_sx[c]   += x;
+    g_lin_sxi[c]  += i * x;
+    g_lin_sxi2[c] += i * i * x;
+    g_lin_sxx[c]  += x * x;
+    g_lin_si[c]   += i;
+    g_lin_si2[c]  += i * i;
+    g_lin_si3[c]  += i * i * i;
+    g_lin_si4[c]  += i * i * i * i;
+  }
+}
+
+//-----------------------------------------------------------------------------
+static void lin_set_dac(void)
+{
+  capture_set_dac_raw(g_lin_dac0 + g_lin_i * g_lin_step);
+  autocal_mark();
+}
+
+//-----------------------------------------------------------------------------
+// Least squares through the three sums, with the step number normalised to
+// -1..1 first: i^4 over 33 steps is a quarter of a million, and a float has
+// seven digits to spend. Normalised, every term is order n, and the ratio the
+// correction is made of - c/b^2 - is invariant under the scaling anyway.
+//
+// Returns false and says why when the sweep is not something to calibrate
+// against: too little of the window covered (a DAC that could not move it), or
+// a scatter too wide to be a curve (an input that was not quiet).
+static bool lin_fit(int c, int *q_out, int *resid_x100, const char **why)
+{
+  const float M = ACAL_LIN_M;
+  float n   = (float)g_lin_n[c];
+  float s1  = (float)g_lin_si[c]  / M;
+  float s2  = (float)g_lin_si2[c] / (M*M);
+  float s3  = (float)g_lin_si3[c] / (M*M*M);
+  float s4  = (float)g_lin_si4[c] / (M*M*M*M);
+  float y0  = (float)g_lin_sx[c]   / 100.0f;
+  float y1  = (float)g_lin_sxi[c]  / (100.0f*M);
+  float y2  = (float)g_lin_sxi2[c] / (100.0f*M*M);
+  float yy  = (float)g_lin_sxx[c]  / 10000.0f;
+  float det, a, b, q, rss;
+
+  if (g_lin_n[c] < ACAL_LIN_N / 2)
+  {
+    *why = "too few usable points - was the input shorted?";
+    return false;
+  }
+
+  det = n*(s2*s4 - s3*s3) - s1*(s1*s4 - s3*s2) + s2*(s1*s3 - s2*s2);
+
+  if (det > -1e-3f && det < 1e-3f)
+  {
+    *why = "the sweep did not move - check the offset DAC";
+    return false;
+  }
+
+  a = (y0*(s2*s4 - s3*s3) - s1*(y1*s4 - s3*y2) + s2*(y1*s3 - s2*y2)) / det;
+  b = (n*(y1*s4 - s3*y2) - y0*(s1*s4 - s3*s2) + s2*(s1*y2 - y1*s2)) / det;
+  q = (n*(s2*y2 - y1*s3) - s1*(s1*y2 - y1*s2) + y0*(s1*s3 - s2*s2)) / det;
+
+  // b is half the span in codes, by construction: i runs -1..1
+  if (b < ACAL_LIN_MIN_SPAN/2 && b > -ACAL_LIN_MIN_SPAN/2)
+  {
+    *why = "the sweep covered too little of the window";
+    return false;
+  }
+
+  // What the fit did not explain, in hundredths of a code. Not noise: the mean
+  // of two thousand samples has hundredths of a code of that. It is the
+  // converter's own code-to-code error, the part of the curve no quadratic
+  // reaches, and a converter with a whole code of it is still a normal
+  // converter. Past that, what is being fitted is not a curve - it is a
+  // signal on the input, a lead that came off, or mains humming into an
+  // unterminated 1 MOhm, and none of those may be averaged into a constant.
+  rss = yy - a*y0 - b*y1 - q*y2;
+
+  if (rss < 0.0f)
+    rss = 0.0f;
+
+  *resid_x100 = (int)isqrt64((uint64_t)(rss / n * 10000.0f));
+
+  if (*resid_x100 > 150)
+  {
+    *why = "the input is not quiet - short it and try again";
+    return false;
+  }
+
+  // The curvature over the slope squared IS the coefficient: a chain that
+  // reads x + k*x^2 fits as b*i + k*b^2*i^2, so c/b^2 is k whatever the sweep
+  // was scaled by - which is why neither the DAC step nor the range it ran on
+  // has to be known accurately for this to come out right.
+  q = q / (b * b) * 4194304.0f; // 2^22, the scale capture.c corrects with
+
+  if (q > 3000.0f || q < -3000.0f)
+  {
+    *why = "the bend is too big to be this instrument's own";
+    return false;
+  }
+
+  *q_out = (int)(q + (q < 0 ? -0.5f : 0.5f));
+
+  return true;
+}
+
+//-----------------------------------------------------------------------------
+// The bend, said in the only unit that means anything from the front: how much
+// the correction is worth at the top of the screen, as a percentage of it.
+// x = 100 codes is four divisions on every range.
+static int lin_percent_x100(int q)
+{
+  // q*100^2 / 2^22 codes of correction at x = 100, over 100 codes, in
+  // hundredths of a percent: q * 10^6 / 2^22
+  return (int)((int64_t)q * 1000000 / 4194304);
+}
+
+//-----------------------------------------------------------------------------
+static void lin_start(void)
+{
+  int r = config.vertical_scale;
+  int64_t codes_per_dac_x1000;
+  int step;
+
+  lin_reset();
+  g_lin_dac0 = config.calib_dac_zero;
+
+  // What one DAC count is worth in ADC codes: a screen pixel is
+  // 1024/calib_dac_mult DAC counts and vs_px_value millivolts, and a code is
+  // calib_vs_mult/1024 millivolts. Both halves of that were measured by the two
+  // steps before this one, which is why this one runs after them - it only
+  // needs them to pick a step size, but a wrong step size is a sweep that
+  // either misses the window or spends itself on a quarter of it.
+  codes_per_dac_x1000 = (int64_t)vs_px_value[r] * 1048576 * 1000 /
+      ((int64_t)config.calib_dac_mult[r] * config.calib_vs_mult[r]);
+
+  if (codes_per_dac_x1000 < 20)
+    codes_per_dac_x1000 = 20;
+
+  step = (int)((int64_t)ACAL_LIN_SPAN * 1000 /
+      (ACAL_LIN_M * codes_per_dac_x1000));
+
+  if (step < 2)
+    step = 2;
+  else if (step > 200)
+    step = 200;
+
+  // ...and the whole sweep has to stay inside the DAC's twelve bits, or the
+  // ends of it are the same point measured twice
+  while (step > 2 && (g_lin_dac0 - ACAL_LIN_M * step < 0 ||
+      g_lin_dac0 + ACAL_LIN_M * step > 4095))
+    step--;
+
+  g_lin_step = step;
+  g_lin_i = -ACAL_LIN_M;
+
+  g_autocal_phase = ACAL_LIN;
+  g_autocal_timer = AUTOCAL_TIMEOUT;
+
+  autocal_say("Step 4 of 4: linearity", "Keep the input shorted");
+  lin_set_dac();
+}
+
+//-----------------------------------------------------------------------------
+// The sweep is over: fit both converters, keep the pair only if BOTH of them
+// came out of a measurement worth keeping, and hand over to the gain prompt
+// with the result still on the line - the next thing this run does depends on
+// this having worked, and a number that scrolled past is a number nobody read.
+static void lin_done(void)
+{
+  int q[2] = { 0, 0 }, resid[2] = { 0, 0 };
+  const char *why = "no measurement";
+  char l0[80], l1[80];
+  bool ok;
+
+  ok = lin_fit(0, &q[0], &resid[0], &why) && lin_fit(1, &q[1], &resid[1], &why);
+
+  if (ok)
+  {
+    int pb = lin_percent_x100(q[0]);
+    int pa = lin_percent_x100(q[1]);
+
+    config.calib_nl2[0] = (int16_t)q[0];
+    config.calib_nl2[1] = (int16_t)q[1];
+
+    snprintf(l0, sizeof(l0), "Bend: B %s%d.%02d%%  A %s%d.%02d%% at 4 divisions",
+        pb < 0 ? "-" : "+", (pb < 0 ? -pb : pb) / 100, (pb < 0 ? -pb : pb) % 100,
+        pa < 0 ? "-" : "+", (pa < 0 ? -pa : pa) / 100, (pa < 0 ? -pa : pa) % 100);
+  }
+  else
+  {
+    // Deliberately leaves whatever was stored alone. A failed sweep is not a
+    // statement that the chain is straight, and zeroing it here would turn one
+    // noisy minute into the loss of a good measurement.
+    snprintf(l0, sizeof(l0), "Linearity: %s", why);
+    // The scatter goes on the line whatever happened: it is the one number
+    // that says whether the sweep was measuring the instrument or the room
+    if (resid[0] > 0 || resid[1] > 0)
+    {
+      int r = (resid[0] > resid[1]) ? resid[0] : resid[1];
+
+      snprintf(l0 + strlen(l0), sizeof(l0) - strlen(l0), " (%d.%02d)",
+          r / 100, r % 100);
+    }
+  }
+
+  // Gain is per range, so it belongs on the range the user chose before
+  // starting - not on whichever one the sweeps above ended at. Position back to
+  // zero: the reading is taken against the centre line.
+  autoset_set_scale(g_autocal_saved_vs);
+  autocal_set_position(0);
+
+  g_autocal_phase = ACAL_ASK_REF;
+  g_autocal_timer = TIMER_DISABLE; // connecting a source takes as long as it takes
+
+  snprintf(l1, sizeof(l1), "Apply %s DC.  MODE continues  STOP finishes",
+      format_voltage(scope_calib_ref_mv(), false));
+  autocal_say(l0, l1);
+}
+
 //-----------------------------------------------------------------------------
 // Restore the user's settings and report. It stays "active" so the band and
 // the keyboard remain ours until the result has actually been read - a
@@ -8936,7 +9220,7 @@ static void autocal_advance(void)
       config.sample_rate_limit = 0; // dual channel: both converters visible
       update_sample_rate();
       autocal_mark();
-      autocal_say("Step 2 of 3: matching the two ADCs",
+      autocal_say("Step 2 of 4: matching the two ADCs",
           "Keep the input shorted");
       return;
     }
@@ -8976,7 +9260,7 @@ static void autocal_advance(void)
     g_autocal_sub = 0;
     autoset_set_scale(0);
     autocal_set_position(0);
-    autocal_say("Step 3 of 3: DAC step, range 1 of 8",
+    autocal_say("Step 3 of 4: DAC step, range 1 of 8",
         "Keep the input shorted");
     return;
   }
@@ -9021,33 +9305,73 @@ static void autocal_advance(void)
 
     if (g_autocal_range >= VS_COUNT)
     {
-      char msg[52];
-
-      // Gain is per range, so it belongs on the range the user chose before
-      // starting - not on whichever one the sweep above ended at. Position
-      // back to zero: the reading is taken against the centre line.
-      autoset_set_scale(g_autocal_saved_vs);
+      // Linearity next, and on the LEAST sensitive range: the prompt allows an
+      // unplugged probe as well as a shorted one, and whatever an open 1 MOhm
+      // input picks up out of the room is worth eighty times less in codes at
+      // 10 V/div than at 50 mV/div. The bend being measured lives past the
+      // attenuator, so the range it is measured on does not otherwise matter.
+      autoset_set_scale(VS_LAST);
       autocal_set_position(0);
-
-      g_autocal_phase = ACAL_ASK_REF;
-      g_autocal_timer = TIMER_DISABLE; // connecting a source takes as long as it takes
-
-      snprintf(msg, sizeof(msg), "Now apply %s DC to the input",
-          format_voltage(scope_calib_ref_mv(), false));
-      autocal_say(msg, "MODE continues   STOP finishes here");
+      lin_start();
       return;
     }
 
     {
       char msg[40];
 
-      snprintf(msg, sizeof(msg), "Step 3 of 3: DAC step, range %d of 8",
+      snprintf(msg, sizeof(msg), "Step 3 of 4: DAC step, range %d of 8",
           g_autocal_range + 1);
       autocal_say(msg, "Keep the input shorted");
     }
 
     autoset_set_scale(g_autocal_range);
     autocal_set_position(0);
+    return;
+  }
+
+  if (ACAL_LIN == g_autocal_phase)
+  {
+    int a_x100, b_x100;
+
+    // Both converters at once, which is the only reason the sweep is worth the
+    // seconds it takes: they do not have the same curve, and separating them
+    // afterwards from an interleaved record is impossible.
+    if (!capture_get_channel_means(&a_x100, &b_x100))
+    {
+      autoset_set_scale(g_autocal_saved_vs);
+      autocal_set_position(0);
+      g_autocal_phase = ACAL_ASK_REF;
+      g_autocal_timer = TIMER_DISABLE;
+      autocal_say("Linearity: both converters have to be running",
+          "MODE continues to gain   STOP finishes here");
+      return;
+    }
+
+    lin_accumulate(0, b_x100);
+    lin_accumulate(1, a_x100);
+
+    // Per step rather than for the whole sweep: thirty-three of them at six
+    // records each is longer than the twenty seconds the rest of the run is
+    // allowed, and what the watchdog is for is a step that never lands.
+    g_autocal_timer = AUTOCAL_TIMEOUT;
+    g_lin_i++;
+
+    if (g_lin_i > ACAL_LIN_M)
+    {
+      lin_done();
+      return;
+    }
+
+    if (0 == ((g_lin_i + ACAL_LIN_M) & 7))
+    {
+      char msg[52];
+
+      snprintf(msg, sizeof(msg), "Step 4 of 4: linearity, %d%%",
+          (g_lin_i + ACAL_LIN_M) * 100 / ACAL_LIN_N);
+      autocal_say(msg, "Keep the input shorted");
+    }
+
+    lin_set_dac();
     return;
   }
 
@@ -9060,7 +9384,12 @@ static void autocal_advance(void)
     if (!capture_get_raw_measure_fresh(&m))
       return;
 
-    counts_x100 = m.mean_c100;
+    // The mean with the measured bend already taken out of it: gain is a
+    // straight multiplier and can only be trimmed against a straight chain.
+    // Calibrated against a bent one it would be right at the level used and
+    // wrong either side of it - which is exactly the failure that made the
+    // linearity step above worth having.
+    counts_x100 = capture_measure_mean_x100(&m);
 
     // The reference has to actually be there, and it has to fit on the ADC.
     // Calibrating gain against a clipped or near-zero reading would scale the
@@ -9277,7 +9606,7 @@ static void autocal_begin(void)
   capture_start();
 
   draw_trigger_mode();
-  autocal_say("Step 1 of 3: zeroing the offset DAC",
+  autocal_say("Step 1 of 4: zeroing the offset DAC",
       "Keep the input shorted");
 }
 
@@ -9635,7 +9964,7 @@ void scope_buttons_handler(int buttons)
         g_gain_note_until = 0;
         autocal_mark();
         autocal_say(g_autocal_gain_only ? "Measuring this range" :
-            "Step 4 of 4: gain", "Hold the level steady");
+            "Step 5 of 5: gain", "Hold the level steady");
       }
     }
 

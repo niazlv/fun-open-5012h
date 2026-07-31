@@ -1772,6 +1772,7 @@ typedef enum
   FT_HEX,      // uint32_t, as hex - magic and the checksums
   FT_I64,
   FT_IARR,     // int[count], one line per element
+  FT_S16A,     // int16_t[count], same, for a field that had to fit a word
   FT_MAP,      // int[count] of which only the non-zero entries are interesting
   FT_WARR,     // PanelWidget[count]: metric and where it was put
 } FieldType;
@@ -1875,6 +1876,7 @@ static const struct
   FIELD(tetris_high_score, FT_INT),
 
   FIELD(calib_ref_mv, FT_INT),
+  FIELD_N(calib_nl2, FT_S16A, 2),
   FIELD(calib_crc, FT_HEX),
   FIELD(calib_channel_delta, FT_INT),
   FIELD(calib_dac_zero, FT_INT),
@@ -1889,7 +1891,7 @@ static const struct
 // else gets one
 static int field_lines(int i)
 {
-  if (FT_IARR == g_fields[i].type)
+  if (FT_IARR == g_fields[i].type || FT_S16A == g_fields[i].type)
     return g_fields[i].count;
 
   // The widget array gets its count first and then one line per slot
@@ -1946,6 +1948,14 @@ bool config_describe(const Config *cfg, int index, char *buf, int size)
         char label[28];
         snprintf(label, sizeof(label), "%s[%d]", name, index);
         snprintf(buf, size, "%-24s%d", label, ((const int *)p)[index]);
+        break;
+      }
+
+      case FT_S16A:
+      {
+        char label[28];
+        snprintf(label, sizeof(label), "%s[%d]", name, index);
+        snprintf(buf, size, "%-24s%d", label, ((const int16_t *)p)[index]);
         break;
       }
 
@@ -2190,6 +2200,13 @@ void config_reset(void)
 void config_reset_calibration(void)
 {
   config.calib_ref_mv           = 0;
+
+  // By hand, because it lives outside the sealed block that the rest of this
+  // function is about - see the note on the field. Zero is a straight chain,
+  // which is the right thing for "back to factory numbers": the factory has
+  // never measured this unit's converters.
+  config.calib_nl2[0]           = 0;
+  config.calib_nl2[1]           = 0;
 
   config.calib_channel_delta    = -5;
   config.calib_dac_zero         = 2010;

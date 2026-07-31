@@ -119,6 +119,12 @@ typedef struct
   double adc_noise_lsb;    /* thermal + quantisation noise floor, rms      */
   double il_gain;          /* converter A gain relative to B               */
   double il_offset;        /* and its offset, in counts                    */
+  double nl2[2];           /* second-order bend of the chain, in counts at  */
+                           /* 100 counts from mid-scale: [0] is ADC B, [1]  */
+                           /* ADC A. Real converters and the amplifier in   */
+                           /* front of them are not straight, and this is   */
+                           /* the shape of what is left after gain and      */
+                           /* offset have been taken out.                   */
   double probe_div;        /* 1 for a 1x probe, 10 for a 10x               */
   bool   ideal;            /* switch every impairment above off            */
 } Frontend;
@@ -142,6 +148,9 @@ static Frontend g_afe_model =
   .adc_noise_lsb = 0.35,   /* what an ENOB of ~7.2 bits amounts to         */
   .il_gain = 1.008,        /* the two converters are not identical         */
   .il_offset = 5.0,        /* nor are their offsets - hence calib_channel_delta */
+  .nl2 = { 0.0, 0.0 },     /* straight until asked otherwise: the bend is   */
+                           /* per unit, so there is no typical value to     */
+                           /* default to - see --afe nl2=                   */
   .probe_div = 1.0,
   .ideal = false,
 };
@@ -543,6 +552,18 @@ uint8_t sig_adc_sample(uint64_t t_ns, const AfeState *afe, int converter)
     if (converter == 1)
       counts = ZERO_COUNT + (counts - ZERO_COUNT) * fe->il_gain + fe->il_offset;
 
+    // The bend. Quoted as counts of error at 100 counts from mid-scale, which
+    // is four divisions - the top of the screen - because that is where anyone
+    // would notice it, and applied as the quadratic it is. Zero at mid-scale on
+    // purpose: an offset is the zero calibration's business, and a chain whose
+    // bend moved its own zero would be two faults wearing one coat.
+    if (fe->nl2[converter] != 0.0)
+    {
+      double x = counts - ZERO_COUNT;
+
+      counts += fe->nl2[converter] * x * x / 10000.0;
+    }
+
     if (fe->adc_noise_lsb > 0)
       counts += fe->adc_noise_lsb * hash_gauss(t_ns ^ 0xA5A5A5A5ull,
           (uint64_t)converter);
@@ -790,6 +811,9 @@ bool sig_configure_afe(const char *spec, char *err, size_t errsz)
     if      (0 == strcmp(k, "bw"))        g_afe_model.bw_hz = v;
     else if (0 == strcmp(k, "overshoot")) g_afe_model.overshoot = (v > 1) ? v / 100 : v;
     else if (0 == strcmp(k, "jitter"))    g_afe_model.jitter_ps = v * 1e12;
+    else if (0 == strcmp(k, "nl2"))       g_afe_model.nl2[0] = g_afe_model.nl2[1] = v;
+    else if (0 == strcmp(k, "nl2b"))      g_afe_model.nl2[0] = v;
+    else if (0 == strcmp(k, "nl2a"))      g_afe_model.nl2[1] = v;
     else if (0 == strcmp(k, "dnl"))       g_afe_model.dnl_lsb = v;
     else if (0 == strcmp(k, "adcnoise"))  g_afe_model.adc_noise_lsb = v;
     else if (0 == strcmp(k, "ilgain"))    g_afe_model.il_gain = 1 + ((v > 0.5) ? v / 100 : v);

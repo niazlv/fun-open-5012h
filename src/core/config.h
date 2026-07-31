@@ -608,7 +608,30 @@ typedef struct
    * a layout forward now, so another version costs a row in g_old_layouts, a
    * static assert, and nothing else.
    */
-  uint32_t padding[1];
+  /*
+   * Second-order nonlinearity of the analog chain, in the CODE domain: one
+   * signed coefficient per converter, index 0 for ADC B (the one a single-
+   * channel acquisition uses on its own) and index 1 for ADC A.
+   *
+   * A code x, counted from ZERO_POINT, comes back as x + q*x^2 / 2^22 when the
+   * chain bends, so the measurement path subtracts exactly that much back off -
+   * see capture.c. Zero is a straight chain, which is what every config saved
+   * before this existed reads as, and what this instrument did until somebody
+   * measured it. It belongs to the converter and the amplifier in front of it,
+   * NOT to a vertical range: the attenuator is resistors, and resistors are
+   * linear to orders of magnitude past this.
+   *
+   * Here rather than in the calibration block below, and that is a trade: the
+   * block is sealed by calib_crc, and appending to it would change what the
+   * seal covers. Two consequences, both deliberate - a calibration RECOVERED
+   * out of an otherwise broken entry comes back without this, reading the way
+   * it read before it was ever measured, and config_reset_calibration() has to
+   * clear this by hand rather than getting it for free.
+   *
+   * This was the last word of the version 3 reserve. The next field to be added
+   * is a version 4, on the terms the note above describes.
+   */
+  int16_t  calib_nl2[2];
 
   // The calibration block. Contiguous, and last before crc, on purpose:
   // calib_crc covers exactly the bytes from calib_channel_delta up to crc. A

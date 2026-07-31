@@ -161,7 +161,18 @@ bool capture_get_raw_measure(Measure *out);
 bool capture_get_raw_measure_fresh(Measure *out);
 // Mean level of each converter on its own, from the raw ring and without the
 // channel delta applied. Dual-channel acquisitions only; false otherwise.
+// Deliberately RAW in the other sense too: the nonlinearity sweep measures its
+// own curve with these, so nothing that corrects for that curve may be in them.
 bool capture_get_channel_means(int *a_x100, int *b_x100);
+// The offset DAC directly, 0..4095, without going through a vertical position.
+// For the linearity calibration only - anything else must use
+// capture_set_vertical_parameters(), which keeps config and the hardware
+// agreeing about where the trace is.
+void capture_set_dac_raw(int code);
+// The mean of a raw scan with the measured nonlinearity taken back out, in
+// hundredths of an ADC code. What the gain calibration must aim at - see
+// config.calib_nl2 and the note in capture.c.
+int capture_measure_mean_x100(const Measure *m);
 uint32_t capture_get_generation(void);
 // Sample period (ns) of the record everything downstream reads. Equal to the
 // ring's period while the full-rate window applies, four times it when the
