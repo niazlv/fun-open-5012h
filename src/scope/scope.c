@@ -312,6 +312,10 @@ enum
 
 #define MEASURE_MODE_COLOR     LCD_COLOR(50, 255, 255)
 #define MEASURE_VOLTAGE_COLOR  LCD_COLOR(255, 255, 0)
+// A reading the record cannot support, and one that is only just supported.
+// Red is the same red the trace clips in, which is usually the reason for it.
+#define MEASURE_BAD_COLOR      LCD_COLOR(255, 48, 48)
+#define MEASURE_WEAK_COLOR     LCD_COLOR(255, 132, 0)
 #define MEASURE_FREQ_COLOR     LCD_COLOR(255, 255, 255)
 
 #define CAPTURE_STOP_COLOR     LCD_COLOR(255, 0, 0)
@@ -531,6 +535,21 @@ typedef enum
 // no spectrum for a THD, no periods for a jitter - and the panel greys the
 // whole cell rather than dropping it, so the layout does not move under the
 // reading that is still there.
+/*
+ * How much the RECORD supports the number, which is not the same question as
+ * whether the signal is any good - and the instrument can only answer the
+ * first one. It does not know what this signal is for: 1% of jitter is broken
+ * on a clock and normal on a servo, and a firmware that painted the second one
+ * red would be inventing a fault. What it does know exactly is when its own
+ * record cannot carry the reading it just printed.
+ */
+typedef enum
+{
+  MQ_OK = 0,
+  MQ_WEAK,   // usable, but against a limit: coarse, or few cycles, or the floor
+  MQ_BAD,    // the record cannot support this number at all
+} MeasureQuality;
+
 typedef struct
 {
   char label[6];
@@ -538,6 +557,7 @@ typedef struct
   char value[16];
   uint8_t metric;   // which MEASURE_* this is, for the layout editor
   uint8_t kind;
+  uint8_t quality;  // MeasureQuality, and what colours the reading
   bool present;
 } MeasureItem;
 
@@ -2545,6 +2565,110 @@ static void signal_info_update(void)
 // and whether there is a number at all. Both default to the common case here
 // (a voltage that is being reported) and each metric overrides what differs.
 //
+/*
+ * What a metric is worth on THIS record.
+ *
+ * Every rule here is about the record and the instrument, never about the
+ * signal - see MeasureQuality. Each one is a fact the firmware can check:
+ *
+ *   clipped        the converter hit an end. Every voltage taken off that
+ *                  record is a lower bound wearing a measurement's clothes.
+ *   under a division  the reading is worth fewer than 25 ADC codes, so one
+ *                  code is 4% of it. True, and coarse, and the fix is one key.
+ *   periods disagree  the "period" the timing readings are built on is the
+ *                  median of a set that has no middle. Frequency, duty and
+ *                  jitter are then arithmetic on noise.
+ *   under 3 samples per period  the counter's own trap: at 2.5 samples the
+ *                  Schmitt arming misses every second crossing and 50 MHz
+ *                  reads exactly 25 MHz, with nothing else on screen to say so.
+ *   at the jitter floor  an edge lands between two samples and interpolates to
+ *                  about a hundredth of one, so below that the number is the
+ *                  timebase and not the signal.
+ */
+static int metric_mv(int metric, const ScopeMeasure *sm)
+{
+  switch (metric)
+  {
+    case MEASURE_VPP:  return sm->vpp_mv;
+    case MEASURE_VRMS: return sm->vrms_mv;
+    case MEASURE_VAVG: return sm->vavg_mv;
+    case MEASURE_VP:   return sm->vp_mv;
+    case MEASURE_VMAX: return sm->vmax_mv;
+    case MEASURE_VMIN: return sm->vmin_mv;
+    case MEASURE_VAMP: return sm->vtop_mv - sm->vbase_mv;
+    default:           return 0;
+  }
+}
+
+static int measure_quality(int metric, const ScopeMeasure *sm)
+{
+  int per = capture_get_record_period();
+
+  switch (metric)
+  {
+    case MEASURE_VPP:
+    case MEASURE_VRMS:
+    case MEASURE_VAVG:
+    case MEASURE_VP:
+    case MEASURE_VMAX:
+    case MEASURE_VMIN:
+    case MEASURE_VAMP:
+    {
+      int mv_code = config.vertical_mult / CALIB_MULTIPLIER;
+      int mv = metric_mv(metric, sm);
+
+      if (sm->vmax_raw >= 254 || sm->vmin_raw <= 1)
+        return MQ_BAD;
+
+      if (mv_code <= 0)
+        return MQ_OK;
+
+      if (mv < 0)
+        mv = -mv;
+
+      return (mv / mv_code < 25) ? MQ_WEAK : MQ_OK;
+    }
+
+    case MEASURE_FREQ:
+    case MEASURE_FFT_FREQ:
+    case MEASURE_PERIOD:
+    case MEASURE_WIDTH_POS:
+    case MEASURE_WIDTH_NEG:
+    case MEASURE_DUTY:
+    case MEASURE_JITTER:
+    {
+      int spp;
+
+      // Nothing to judge: those readings are already blank, and a colour on a
+      // row of dashes is a statement about nothing
+      if (sm->periods <= 0 || per <= 0 || sm->period_med_ns <= 0)
+        return MQ_OK;
+
+      if (sm->period_good_pct < 60)
+        return MQ_BAD;
+
+      spp = sm->period_med_ns / per;
+
+      if (spp < 3)
+        return MQ_BAD;
+
+      // The floor is about a hundredth of a sample period, in picoseconds
+      if (MEASURE_JITTER == metric && sm->jitter_rms_ps >= 0 &&
+          sm->jitter_rms_ps <= per * 10)
+        return MQ_WEAK;
+
+      return (sm->periods < 5 || spp < 10) ? MQ_WEAK : MQ_OK;
+    }
+
+    default:
+      // Settings (V/div, s/div, trigger level, sample rate) are not
+      // measurements and have no record to be judged against; the signal type
+      // and the alias candidate say their own uncertainty in words already.
+      return MQ_OK;
+  }
+}
+
+//-----------------------------------------------------------------------------
 // format_*() all hand back the same static buffer, so the value is copied into
 // the item before anything else is formatted.
 static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
@@ -2748,6 +2872,7 @@ static bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it)
   it->metric = (uint8_t)metric;
   it->kind = (uint8_t)kind;
   it->present = present;
+  it->quality = present ? (uint8_t)measure_quality(metric, sm) : MQ_OK;
 
   return true;
 }
@@ -3981,6 +4106,12 @@ static uint16_t measure_item_color(const MeasureItem *it)
   if (!it->present)
     return MPANEL_NONE_COLOR;
 
+  if (MQ_BAD == it->quality)
+    return MEASURE_BAD_COLOR;
+
+  if (MQ_WEAK == it->quality)
+    return MEASURE_WEAK_COLOR;
+
   return kind_color[it->kind < ARRAY_SIZE(kind_color) ? it->kind : MK_OTHER];
 }
 
@@ -4891,8 +5022,13 @@ static void draw_measure(void)
         snprintf(item.label, sizeof(item.label), "Vdc");
       }
 
+      // The bar colours by slot, not by metric - the two big readouts are a
+      // fixed pair of colours so the eye finds them without reading. A verdict
+      // on the reading overrides that, because it is the more urgent thing the
+      // colour can be carrying.
       measure_slot(i, slot_x[i], (BAR_SCALE > 1) ? item.label : item.tag,
-          item.value, slot_color[i]);
+          item.value, (MQ_OK == item.quality) ? slot_color[i] :
+          measure_item_color(&item));
     }
     else
     {

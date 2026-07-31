@@ -239,6 +239,32 @@ SIZE_OPTIMIZED = \
   $(BUILD)/bk_port.o \
   $(BUILD)/pd_decode.o \
   $(BUILD)/usb_decode.o \
+  $(BUILD)/can_decode.o \
+  $(BUILD)/knx_decode.o \
+  $(BUILD)/dali_decode.o \
+  $(BUILD)/lin_decode.o \
+  $(BUILD)/dht_decode.o \
+  $(BUILD)/ev1527_decode.o \
+  $(BUILD)/dshot_decode.o \
+  $(BUILD)/sent_decode.o \
+  $(BUILD)/midi_decode.o \
+  $(BUILD)/ir_decode.o \
+  $(BUILD)/manchester_decode.o \
+  $(BUILD)/nec_decode.o \
+  $(BUILD)/onewire_decode.o \
+  $(BUILD)/ppm_decode.o \
+  $(BUILD)/rc5_decode.o \
+  $(BUILD)/servo_decode.o \
+  $(BUILD)/sirc_decode.o \
+  $(BUILD)/spi_decode.o \
+  $(BUILD)/swd_decode.o \
+  $(BUILD)/swo_decode.o \
+  $(BUILD)/uart_decode.o \
+  $(BUILD)/ws2812_decode.o \
+  $(BUILD)/logic_decode.o \
+  $(BUILD)/cube3d.o \
+  $(BUILD)/engine3d.o \
+  $(BUILD)/raytrace_test.o \
 
 $(SIZE_OPTIMIZED): CFLAGS += -Os
 
