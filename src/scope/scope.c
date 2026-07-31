@@ -10985,17 +10985,49 @@ void scope_redraw_all(void)
   update_sample_rate();
   redraw_trace();
 
+  /*
+   * ...and run the sweep out here, instead of leaving it to paint a column a
+   * main-loop pass.
+   *
+   * What this function repaints is a screen something else covered, and the
+   * usual something else is a menu - which is on top of the scope, so the
+   * scope is not ticked at all while it is up. A trace left to the sweep is
+   * then not a trace that arrives a moment later: it is a hole in the display
+   * that stays there until the last menu closes. It showed as a black grid
+   * behind an open menu every time a submenu was closed.
+   *
+   * It is the same three hundred columns either way, and the sweep that
+   * follows redraws none of them: this leaves the shadows describing exactly
+   * what was painted, which is what tells it there is nothing to do.
+   */
+  g_trace_column = 0;
+
+  while (!trace_ready())
+    draw_trace();
+
   // The editor's backdrop is its own, and this has just cleared the screen and
   // re-armed the sweep - which is exactly the path taken when the menu that
   // opened the editor closes over it
   if (g_layout_edit)
     layout_edit_refresh();
 
+  // The panels are holes in the sweep, so what is under a closed menu comes
+  // back only when they are painted - here, for the same reason as the trace.
+  // The snapshot tag is normally put back by scope_task() when it sees a sweep
+  // finish; the sweep above finished before it could see it start.
+  if (g_snap_tag)
+    snap_tag_paint();
+
   if (g_decode_mode)
-    g_decode_panel_pending = true;
+    draw_decode_panel();
 
   if (g_fft_mode)
+  {
     g_fft_panel_pending = true;
+
+    if (g_fft_panel_on)
+      draw_fft_panel();
+  }
 }
 
 //-----------------------------------------------------------------------------
