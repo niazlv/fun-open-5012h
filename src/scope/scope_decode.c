@@ -1885,6 +1885,8 @@ void decode_mode_enter(void)
 static int  g_decode_saved_level;
 static int  g_decode_saved_mode;
 static int  g_decode_saved_edge;
+static int  g_decode_saved_mv;    // the LEVEL is saved as a voltage: pixels
+static int  g_decode_saved_vs;    // mean a different voltage on another range
 static bool g_decode_saved_valid = false;
 
 void decode_trigger_save(void)
@@ -1893,6 +1895,8 @@ void decode_trigger_save(void)
     return;
 
   g_decode_saved_level = config.trigger_level;
+  g_decode_saved_mv = config.trigger_level_mv;
+  g_decode_saved_vs = config.vertical_scale;
   g_decode_saved_mode = config.trigger_mode;
   g_decode_saved_edge = config.trigger_edge;
   g_decode_saved_valid = true;
@@ -1903,7 +1907,16 @@ void decode_trigger_restore(void)
   if (!g_decode_saved_valid)
     return;
 
-  config.trigger_level = g_decode_saved_level;
+  // Same range as at entry: the pixel level still means the same voltage.
+  // Range changed underneath (the hunt refits, autoset ran): put the SAVED
+  // VOLTAGE back at the new scale, or the restored pixels would silently
+  // re-arm the trigger at whatever that row happens to mean now - which in
+  // NORMAL/SINGLE is a trigger that may simply never fire again.
+  if (config.vertical_scale == g_decode_saved_vs)
+    config.trigger_level = g_decode_saved_level;
+  else
+    config.trigger_level = g_decode_saved_mv / vs_mv_px(config.vertical_scale);
+
   config.trigger_mode = g_decode_saved_mode;
   config.trigger_edge = g_decode_saved_edge;
   g_decode_saved_valid = false;
