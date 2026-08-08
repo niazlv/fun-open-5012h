@@ -574,6 +574,10 @@ void measure_slot(int slot, int x, const char *tag, const char *value,
     int color);
 void decode_band_build(void);
 void layout_edit_footer(void);
+void layout_mock_measure(ScopeMeasure *sm);
+void layout_mock_trace(void);
+void layout_edit_refresh(void);
+void layout_edit_keys(int buttons);
 void draw_measure(void);
 void cursor_readout(void);
 void trend_readout(void);
@@ -622,6 +626,16 @@ void fft_format_hz(char *buf, int size, float hz);
 void fft_format_db(char *buf, int size, float db);
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
+typedef struct
+{
+  char text[MPANEL_CHARS_MAX + 1];
+  uint8_t len;
+  uint8_t label_len;
+  uint8_t size;                    // 0 = 6x8, 1 = 8x16, 2 = 8x16 doubled
+  int16_t x, y;                    // top-left, in trace-area pixels
+  uint16_t color;
+} PanelPlaced;
+
 extern LogicResult g_logic;
 extern ScopeGeom g_geom;
 extern bool g_calibration_dual_channel;
@@ -641,6 +655,7 @@ extern uint8_t g_roll_row_max[GRID_WIDTH];
 extern uint8_t g_roll_row_min[GRID_WIDTH];
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
+
 extern bool g_autocal_active;
 extern bool g_autocal_gain_only;
 extern bool g_calib_hint;
@@ -665,12 +680,14 @@ void close_gaps(DisplayBuffer *db);
 void change_horizontal_scale(int delta);
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
+
 extern DataBuffer g_data_buffer;
 extern DisplayBuffer g_display_buffer;
 extern bool g_line_owner;
 extern bool g_mpanel_active;
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
+
 extern AliasAnalysis g_fft_alias;
 extern FftAnalysis g_fft_an;
 extern bool g_fft_band_auto;
@@ -686,14 +703,44 @@ extern uint16_t g_fft_grad[GRID_HEIGHT_MAX];
 extern uint8_t g_fft_samples[FFT_SIZE];
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
+
 extern bool g_shadow_valid;
 extern bool g_sweep_force;
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
+
 extern int  g_trend_timer;
 extern int g_measure_timer;
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
+
 extern bool g_autoset_active;
+
+/*- Shared state (definitions stay with their owner file) ------------------*/
+
+extern bool g_layout_grab;
+extern int g_layout_sel;
+
+/*- Shared state (definitions stay with their owner file) ------------------*/
+
+extern PanelPlaced g_placed[PANEL_WIDGETS_MAX];
+extern bool g_mpanel_is_text;
+extern int g_placed_n;
+
+// Cross-file (owner: scope.c):
+int layout_unused_metric(void);
+int layout_used(void);
+int mpanel_chars(void);
+int mpanel_row_h(void);
+int mpanel_rows(void);
+int mpanel_scale(void);
+void widget_pos(const PanelWidget *w, int wide, int gh, int *px, int *py);
+int widget_scale(int size);
+void widget_set_pos(PanelWidget *w, int x, int y, int wide, int gh);
+int widget_size_of(uint8_t flags);
+void widgets_update(const ScopeMeasure *sm);
+const Font *mpanel_font(void);
+const Font *widget_font(int size);
+PanelWidget *layout_selected(void);
 
 #endif // _SCOPE_INTERNAL_H_
