@@ -1,0 +1,37 @@
+# Manual repro harness for horizontal-scaling regressions. Not part of
+# screenshots.sh - run it by hand, shots land in /tmp:
+#
+#   ./build/fun5012h-emu <fw.bin> --headless --script scripts/zz-zoom-repro.txt \
+#       --signal "square f=100k vpp=2"
+#
+# Zoom is SHIFT+LEFT (faster) / SHIFT+RIGHT (slower); TRIG cycles the
+# trigger mode. The second half is the retime-relabel scenario fixed in
+# 2fc8e0f: a record lands in NORMAL, the signal dies (no more triggers),
+# then the timebase steps across the 125M->31M record-mode threshold. The
+# frozen 10 us period must KEEP its true scale at every step - before the
+# fix it rendered 4x wide past the window flip.
+wait 800
+press auto
+wait 1500
+press trig
+wait 600
+shot /tmp/zz-live0.png
+press shift+right
+wait 700
+shot /tmp/zz-live-slower1.png
+press shift+right
+wait 700
+shot /tmp/zz-live-slower2.png
+press shift+left
+wait 700
+press shift+left
+wait 700
+shot /tmp/zz-live-back.png
+signal square f=100k vpp=0.01
+wait 400
+press shift+right
+wait 800
+shot /tmp/zz-stale-slower1.png
+press shift+right
+wait 800
+shot /tmp/zz-stale-slower2.png
