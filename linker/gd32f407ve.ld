@@ -103,8 +103,10 @@ SECTIONS
   {
     __borrowed_start = .;
     /* The glob is deliberately wide: the scope is several scope_*.o objects,
-       and every one of them must land here or its state escapes the memset. */
-    *scope*.o(.bss*)
+       and every one of them must land here or its state escapes the memset.
+       Sorted by alignment so the pool packs tight across objects - the order
+       is free to change, the whole range is zeroed as one. */
+    *scope*.o(SORT_BY_ALIGNMENT(.bss*))
     *fft.o(.bss*)
     *trend.o(.bss*)
     *measure.o(.bss*)

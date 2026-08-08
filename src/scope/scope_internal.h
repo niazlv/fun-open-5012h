@@ -36,6 +36,8 @@
 #include "lcd.h"
 #include "common.h"
 #include "config.h"
+#include "images.h"
+#include "logic_decode.h"
 
 /*- Definitions -------------------------------------------------------------*/
 #define ZERO_POINT             0x80
@@ -123,6 +125,18 @@ typedef struct
 #define MV_Y                   (g_geom.mv_y)
 
 #define MINIVIEW_WIDTH         160
+#define MINIVIEW_UPDATE_TIMEOUT 100  // envelope rebuild cap, ms
+#define MV_ENV_NONE            0xff  // no envelope byte for this column
+
+// Decoded bytes are marked in the miniview (the whole-record map at the top
+// of the screen): alternating tints per byte, bright for the selected one
+#define DSTRIP_EVEN    LCD_COLOR(0, 150, 200)
+#define DSTRIP_ODD     LCD_COLOR(0, 90, 130)
+#define DSTRIP_SEL     LCD_COLOR(255, 255, 0)
+// The other bytes of the character the selected byte belongs to. Lit, but not
+// as the selection: "this one, and these came with it".
+#define DSTRIP_GROUP   LCD_COLOR(150, 150, 0)
+#define FORMAT_PS_W            5     // format_ps() field width
 
 // Top bar, right of the record map and left of the sample rates. Nine free
 // columns, 243..251: the map's own clear reaches 242 (its trigger marker
@@ -482,5 +496,98 @@ typedef struct
   uint8_t quality;  // MeasureQuality, and what colours the reading
   bool present;
 } MeasureItem;
+
+/*- The chrome: status bars, formatting, utf8, the record map ---------------*/
+// Drawn by scope_chrome.c; state shared with the rest of the scope.
+
+typedef struct
+{
+  int  x, y, w, h;
+  bool valid;
+} MarkerRect;
+
+extern MarkerRect g_vpos_marker;
+extern MarkerRect g_trig_marker;
+extern bool g_toast_active;
+extern int g_toast_timer;
+extern int g_state;              // capture state as the top bar last drew it
+extern int g_state_timer;
+extern int g_sample_rate;
+extern bool g_snap_tag;
+extern uint8_t g_mv_env[];       // miniview envelope; sized by scope_chrome.c
+extern bool g_mv_env_valid;
+extern int g_mv_timer;
+extern uint32_t g_mv_env_gen;
+
+extern const char *const hs_str[HS_COUNT];
+extern const int64_t hs_div_value[HS_COUNT];
+extern const int hs_px_value[HS_COUNT];
+extern const char *const vs_str[VS_COUNT];
+extern const int vs_px_value[VS_COUNT];
+
+int vs_mv_px(int scale);
+const char *vs_label(int scale);
+void toast_show(void);
+void draw_grid_frame(void);
+void draw_ac_dc(void);
+void draw_horizontal_scale(void);
+void draw_horizontal_position(void);
+void draw_marker_image(MarkerRect *prev, int x, int y, const Image *image);
+void draw_vertical_position(bool toast);
+void draw_vertical_scale(void);
+void draw_trigger_level(void);
+void draw_trigger_edge(void);
+void draw_trigger_mode(void);
+char *format_duty(int duty_x10);
+void format_ps(int ps, char *out, int size);
+void format_ns(int64_t ns, char *out, int size);
+void format_hz_mhz(int64_t mhz, char *out, int size);
+void format_mv(int mv, char *out, int size);
+void overlay_repaint_region(int row0, int rows);
+void snap_tag_paint(void);
+int utf8_len(const uint8_t *b, int n);
+uint32_t utf8_code_point(const uint8_t *b, int len);
+int utf8_char_count(const uint8_t *bytes, int count);
+void utf8_group_at(const uint8_t *bytes, int count, int idx,
+                   int *start, int *len);
+int text_width(const char *str);
+void draw_capture_state(void);
+void draw_miniview(int trigger_offset, int window_offset, int window_width);
+void redraw_miniview(void);
+void draw_sample_rates(int sample_rate_limit, int sample_rate);
+void update_sample_rate(void);
+int64_t roll_screen_ns(void);   // scope.c (roll)
+void draw_status_line(void);
+
+// Still owned by scope.c, called from scope_chrome.c:
+int roll_row(int raw);
+void build_trace_column(int c, uint16_t *column);
+bool measure_owns_status_line(void);
+void measure_slot(int slot, int x, const char *tag, const char *value,
+    int color);
+void decode_band_build(void);
+void layout_edit_footer(void);
+void draw_measure(void);
+void cursor_readout(void);
+void trend_readout(void);
+
+/*- Shared state (definitions stay with their owner file) ------------------*/
+extern LogicResult g_logic;
+extern ScopeGeom g_geom;
+extern bool g_calibration_dual_channel;
+extern bool g_decode_held;
+extern bool g_decode_mode;
+extern bool g_fft_mode;
+extern bool g_layout_edit;
+extern bool g_logic_have;
+extern bool g_roll_active;
+extern bool g_trend_mode;
+extern int     g_cursor_sel;
+extern int g_decode_sel;
+extern int g_decode_size;
+extern int g_trace_column;
+extern uint8_t g_roll_row_flags[GRID_WIDTH];
+extern uint8_t g_roll_row_max[GRID_WIDTH];
+extern uint8_t g_roll_row_min[GRID_WIDTH];
 
 #endif // _SCOPE_INTERNAL_H_
