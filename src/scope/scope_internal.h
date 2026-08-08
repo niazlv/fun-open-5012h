@@ -558,6 +558,12 @@ void draw_sample_rates(int sample_rate_limit, int sample_rate);
 void update_sample_rate(void);
 int64_t roll_screen_ns(void);   // scope.c (roll)
 void roll_sync(void);
+void roll_rescale(int old_scale, int old_vpos);
+void roll_set_active(bool active);
+void roll_task(void);
+bool roll_wanted(void);
+void roll_commit(void);
+void roll_publish(void);
 void draw_status_line(void);
 
 // Still owned by scope.c, called from scope_chrome.c:
@@ -686,5 +692,8 @@ extern bool g_sweep_force;
 /*- Shared state (definitions stay with their owner file) ------------------*/
 extern int  g_trend_timer;
 extern int g_measure_timer;
+
+/*- Shared state (definitions stay with their owner file) ------------------*/
+extern bool g_autoset_active;
 
 #endif // _SCOPE_INTERNAL_H_
