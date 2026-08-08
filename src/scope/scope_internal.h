@@ -573,6 +573,117 @@ bool measure_owns_status_line(void);
 void measure_slot(int slot, int x, const char *tag, const char *value,
     int color);
 void decode_band_build(void);
+void decode_trigger_save(void);
+void dbit_span_update(void);
+void decode_update(void);
+void decode_mode_enter(void);
+void decode_jump_to_selected(void);
+void decode_arm_hunt(void);
+void decode_trigger_restore(void);
+void draw_decode_panel(void);
+bool decode_group_color(int idx, uint16_t *col);
+int decode_bit_slots(int *data0, bool *msb_first);
+int decoder_baud_value(void);
+int decoder_man_rate_value(void);
+bool decode_proto_is_serial(proto_t proto);
+void trigger_set_50_percent(void);   // scope.c: the trigger helpers
+
+#define DBAND_H1       11   // tint, boundary ticks and one row of text
+#define DBAND_H2       20   // ...and the character under it
+// ...and a third for what the bytes add up to, where several of them do. The
+// rows go from the specific to the general as they get further from the
+// trace: the number that was on the wire, then what that byte is, then the
+// value its group makes - the way a protocol analyser puts bit0 bit1 bit2
+// over one bracket labelled "command".
+#define DBAND_H3       29
+#define DBAND_TEXT_Y0   1   // text rows inside the band
+#define DBAND_TEXT_Y1  10
+#define DBAND_TEXT_Y2  19
+
+// The bit grid: a hairline straight across the trace at every bit boundary of
+// a decoded byte, and in each cell the number of the bit that landed there.
+// The waveform already shows the LEVEL; what it cannot show is which bit of
+// which byte that level became, and that is the one thing needed to check a
+// decode by eye - especially the bit ORDER, which is the single most
+// confusing thing about reading a serial line off a screen.
+//
+// Drawn OVER everything, trace included: a boundary is a fact about that
+// column, and a line that stops at the waveform is a line you cannot follow
+// to the edge it is meant to line up with.
+//
+// But only as TALL as the signal. A hairline from the top of the grid to the
+// bottom is a ruler for a screen; a hairline that spans exactly what the
+// waveform spans is a ruler for the WAVEFORM, and that is the only thing it
+// is ever used to measure against. A two-volt square wave gets two volts of
+// line, and the rest of the grid is left alone.
+//
+// And blended rather than painted: half the column's own colour and half the
+// grey. Over black it comes out a whisper, over the trace it tints rather
+// than replaces, and nothing the line crosses is ever hidden by it.
+#define DBIT_BLEND(px, col)    (uint16_t)(MPANEL_DIM(px) + MPANEL_DIM(col))
+#define DBIT_TICK_COLOR        LCD_COLOR(120, 120, 140)
+#define DBIT_TEXT_COLOR        LCD_COLOR(140, 140, 150)
+
+// Under this the ticks are a grey wall rather than a grid, and the numbers
+// have nowhere to go. Both are checked separately: the ticks alone are worth
+// having at a zoom where a character is not.
+#define DBIT_MIN_PX            4
+
+
+// The colour swatch beside a group's value, where the value NAMES a colour.
+// "#221133" asks the reader to render a colour in their head, which is the
+// one thing an instrument that has the colour should never make them do.
+//
+// A box five pixels wide and one of gutter - exactly one character cell - so
+// it costs one character everywhere the fit arithmetic runs, on the trace and
+// in the panel alike. Outlined rather than bare: an unlit pixel is #000000,
+// and a black square on a dimmed band is indistinguishable from no square at
+// all, which is the one reading it must not have.
+#define DBAND_SW_W     5
+#define DBAND_SW_H     7
+#define DBAND_SW_EDGE  LCD_COLOR(160, 160, 170)
+
+
+// Column-major, one byte per screen column holding the eight pixels of the
+// bit-number row there: the sweep then reads ONE byte per column instead of
+// masking eight rows, and it costs the same memory either way.
+//
+// ...and that memory is the spare SRAM rather than TCM, next to the run
+// tables the decoder already keeps there. Both are the same KIND of thing -
+// derived from the current record, rebuilt whenever it changes, worthless
+// across a reset - and TCM is down to its last few hundred bytes with the
+// stack still to come out of it. The region is not linked into, so it holds
+// garbage at boot; nothing reads these until decode_band_build has cleared
+// them, which is also the only thing that sets g_dbit_on.
+typedef struct
+{
+  uint8_t glyph[GRID_WIDTH];
+  uint8_t edge[(GRID_WIDTH + 7) / 8];
+} DecodeBitGrid;
+
+#define DBIT ((DecodeBitGrid *)(CAPTURE_SPARE_RAM + sizeof(LogicScratch)))
+
+_Static_assert(sizeof(LogicScratch) + sizeof(DecodeBitGrid) <=
+    CAPTURE_SPARE_RAM_SIZE, "decoder scratch overruns the spare SRAM");
+
+
+_Static_assert(LOGIC_MAX_BYTES <= 127, "byte index must fit g_dband_byte");
+_Static_assert(DBAND_TEXT_Y1 + 8 <= DBAND_H2, "second text row must fit the band");
+_Static_assert(DBAND_TEXT_Y2 + 8 <= DBAND_H3, "third text row must fit the band");
+
+#define DBAND_BOTTOM   mpanel_row0()
+#define DECODE_HEX_COLS   8   // per row, two rows of them
+#define DECODE_CHAR_W     6   // FONT_SMALL is 6x8
+
+extern uint8_t g_dband_sw[(GRID_WIDTH + 7) / 8];
+
+// Hot path: read per display column by the sweep
+static inline bool dband_sw_at(int c)
+{
+  return (c >= 0 && c < GRID_WIDTH) &&
+      ((g_dband_sw[c / 8] >> (c % 8)) & 1);
+}
+
 void layout_edit_footer(void);
 void layout_mock_measure(ScopeMeasure *sm);
 void layout_mock_trace(void);
@@ -733,6 +844,7 @@ int layout_used(void);
 int mpanel_chars(void);
 int mpanel_row_h(void);
 int mpanel_rows(void);
+int mpanel_row0(void);
 int mpanel_scale(void);
 void widget_pos(const PanelWidget *w, int wide, int gh, int *px, int *py);
 int widget_scale(int size);
@@ -742,5 +854,29 @@ void widgets_update(const ScopeMeasure *sm);
 const Font *mpanel_font(void);
 const Font *widget_font(int size);
 PanelWidget *layout_selected(void);
+
+/*- Shared state (definitions stay with their owner file) ------------------*/
+extern bool g_dbit_on;
+extern bool g_decode_force;
+extern bool g_decode_hunt;
+extern bool g_decode_hunt_request;
+extern bool g_decode_panel_pending;
+extern bool g_spi_clock_request;
+extern bool g_swd_clock_request;
+extern int g_dband_group_y;
+extern int g_dband_sel_len;
+extern int g_dband_sel_start;
+extern int g_dbit_bot;
+extern int g_dbit_text_row;
+extern int g_dbit_top;
+extern int8_t g_dband_byte[GRID_WIDTH];
+extern uint8_t g_dband_edge[(GRID_WIDTH + 7) / 8];
+extern uint8_t g_dband_gap[(GRID_WIDTH + 7) / 8];
+extern uint8_t g_dband_gedge[(GRID_WIDTH + 7) / 8];
+extern uint8_t g_dband_mask[DBAND_H3][(GRID_WIDTH + 7) / 8];
+
+/*- Shared state (definitions stay with their owner file) ------------------*/
+extern int g_dband_row0;
+extern int g_dband_rows;
 
 #endif // _SCOPE_INTERNAL_H_
