@@ -557,6 +557,7 @@ void redraw_miniview(void);
 void draw_sample_rates(int sample_rate_limit, int sample_rate);
 void update_sample_rate(void);
 int64_t roll_screen_ns(void);   // scope.c (roll)
+void roll_sync(void);
 void draw_status_line(void);
 
 // Still owned by scope.c, called from scope_chrome.c:
@@ -570,6 +571,13 @@ void layout_edit_footer(void);
 void draw_measure(void);
 void cursor_readout(void);
 void trend_readout(void);
+bool measure_format(int metric, const ScopeMeasure *sm, MeasureItem *it);
+int measure_build_items(const ScopeMeasure *sm, MeasureItem *it);
+uint16_t measure_item_color(const MeasureItem *it);
+void signal_info_update(void);
+void trend_view_update(void);
+void trend_toggle(void);
+bool trend_buttons(int buttons, bool shift, bool repeat);
 
 // Auto-calibration phases, in the order autocal_step() walks them
 enum
@@ -674,5 +682,9 @@ extern uint8_t g_fft_samples[FFT_SIZE];
 /*- Shared state (definitions stay with their owner file) ------------------*/
 extern bool g_shadow_valid;
 extern bool g_sweep_force;
+
+/*- Shared state (definitions stay with their owner file) ------------------*/
+extern int  g_trend_timer;
+extern int g_measure_timer;
 
 #endif // _SCOPE_INTERNAL_H_

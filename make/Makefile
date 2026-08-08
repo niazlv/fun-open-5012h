@@ -165,6 +165,7 @@ SRCS += \
   ../src/scope/scope_calib.c \
   ../src/scope/scope_chrome.c \
   ../src/scope/scope_fft.c \
+  ../src/scope/scope_measure.c \
   ../src/scope/scope_menu.c \
 
 # Everything the launcher can start that is not the scope
