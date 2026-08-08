@@ -356,7 +356,7 @@ LogicResult g_logic;
 // several records old.
 //
 // One union, because only one of them is ever live: the snapshot is taken for
-// the protocol the record decoded AS, and every reader switches on that same
+// the protocol the record decoded AS, and every reader dispatches on that same
 // protocol before it looks at anything. Five separate copies would hold a
 // kilobyte and a half of TCM for four protocols that are not on the screen.
 static union
@@ -433,6 +433,157 @@ static int decoder_baud_value(void)
     return 0;
 
   return decoder_baud_values[i];
+}
+
+//-----------------------------------------------------------------------------
+// The same four questions, asked of whichever analysis is live in g_pana:
+// snapshot it, name a byte, name a byte's field, find a byte's group. Each
+// adapter binds one protocol's answer to one signature, so the sites that ask
+// look the protocol up in the table below instead of switching on it.
+static void pres_ow_capture(void) { g_pana.ow = *onewire_analysis(); }
+static void pres_ow_byte(int idx, uint8_t v, char *buf, int n) { onewire_byte_label(&g_pana.ow, idx, v, buf, n); }
+static void pres_ow_field(int idx, uint8_t v, char *buf, int n) { onewire_field_label(&g_pana.ow, idx, v, buf, n); }
+static void pres_ow_group(int idx, int *start, int *len) { onewire_group_at(&g_pana.ow, idx, start, len); }
+
+static void pres_can_capture(void) { g_pana.can = *can_analysis(); }
+static void pres_can_byte(int idx, uint8_t v, char *buf, int n) { can_byte_label(&g_pana.can, idx, v, buf, n); }
+static void pres_can_field(int idx, uint8_t v, char *buf, int n) { can_field_label(&g_pana.can, idx, v, buf, n); }
+static void pres_can_group(int idx, int *start, int *len) { can_group_at(&g_pana.can, idx, start, len); }
+
+static void pres_dht_capture(void) { g_pana.dht = *dht_analysis(); }
+static void pres_dht_byte(int idx, uint8_t v, char *buf, int n) { dht_byte_label(&g_pana.dht, idx, v, buf, n); }
+static void pres_dht_field(int idx, uint8_t v, char *buf, int n) { dht_field_label(&g_pana.dht, idx, v, buf, n); }
+static void pres_dht_group(int idx, int *start, int *len) { dht_group_at(&g_pana.dht, idx, start, len); }
+
+static void pres_sent_capture(void) { g_pana.sent = *sent_analysis(); }
+static void pres_sent_byte(int idx, uint8_t v, char *buf, int n) { sent_byte_label(&g_pana.sent, idx, v, buf, n); }
+static void pres_sent_field(int idx, uint8_t v, char *buf, int n) { sent_field_label(&g_pana.sent, idx, v, buf, n); }
+static void pres_sent_group(int idx, int *start, int *len) { sent_group_at(&g_pana.sent, idx, start, len); }
+
+static void pres_midi_capture(void) { g_pana.midi = *midi_analysis(); }
+static void pres_midi_byte(int idx, uint8_t v, char *buf, int n) { midi_byte_label(&g_pana.midi, idx, v, buf, n); }
+static void pres_midi_field(int idx, uint8_t v, char *buf, int n) { midi_field_label(&g_pana.midi, idx, v, buf, n); }
+static void pres_midi_group(int idx, int *start, int *len) { midi_group_at(&g_pana.midi, idx, start, len); }
+
+static void pres_lin_capture(void) { g_pana.lin = *lin_analysis(); }
+static void pres_lin_byte(int idx, uint8_t v, char *buf, int n) { lin_byte_label(&g_pana.lin, idx, v, buf, n); }
+
+static void pres_ev_capture(void) { g_pana.ev = *ev1527_analysis(); }
+static void pres_ev_byte(int idx, uint8_t v, char *buf, int n) { ev1527_byte_label(&g_pana.ev, idx, v, buf, n); }
+static void pres_ev_field(int idx, uint8_t v, char *buf, int n) { ev1527_field_label(&g_pana.ev, idx, v, buf, n); }
+static void pres_ev_group(int idx, int *start, int *len) { ev1527_group_at(&g_pana.ev, idx, start, len); }
+
+static void pres_dshot_capture(void) { g_pana.dshot = *dshot_analysis(); }
+static void pres_dshot_byte(int idx, uint8_t v, char *buf, int n) { dshot_byte_label(&g_pana.dshot, idx, v, buf, n); }
+static void pres_dshot_field(int idx, uint8_t v, char *buf, int n) { dshot_field_label(&g_pana.dshot, idx, v, buf, n); }
+static void pres_dshot_group(int idx, int *start, int *len) { dshot_group_at(&g_pana.dshot, idx, start, len); }
+
+static void pres_spi_capture(void) { g_pana.spi = *spi_analysis(); }
+static void pres_spi_byte(int idx, uint8_t v, char *buf, int n) { spi_byte_label(&g_pana.spi, idx, v, buf, n); }
+static void pres_spi_field(int idx, uint8_t v, char *buf, int n) { spi_field_label(&g_pana.spi, idx, v, buf, n); }
+static void pres_spi_group(int idx, int *start, int *len) { spi_group_at(&g_pana.spi, idx, start, len); }
+
+static void pres_man_capture(void) { g_pana.man = *manchester_analysis(); }
+static void pres_man_byte(int idx, uint8_t v, char *buf, int n) { manchester_byte_label(&g_pana.man, idx, v, buf, n); }
+static void pres_man_field(int idx, uint8_t v, char *buf, int n) { manchester_field_label(&g_pana.man, idx, v, buf, n); }
+static void pres_man_group(int idx, int *start, int *len) { manchester_group_at(&g_pana.man, idx, start, len); }
+
+static void pres_rc5_capture(void) { g_pana.rc5 = *rc5_analysis(); }
+static void pres_rc5_byte(int idx, uint8_t v, char *buf, int n) { rc5_byte_label(&g_pana.rc5, idx, v, buf, n); }
+static void pres_rc5_field(int idx, uint8_t v, char *buf, int n) { rc5_field_label(&g_pana.rc5, idx, v, buf, n); }
+static void pres_rc5_group(int idx, int *start, int *len) { rc5_group_at(&g_pana.rc5, idx, start, len); }
+
+static void pres_dali_capture(void) { g_pana.dali = *dali_analysis(); }
+static void pres_dali_byte(int idx, uint8_t v, char *buf, int n) { dali_byte_label(&g_pana.dali, idx, v, buf, n); }
+static void pres_dali_field(int idx, uint8_t v, char *buf, int n) { dali_field_label(&g_pana.dali, idx, v, buf, n); }
+static void pres_dali_group(int idx, int *start, int *len) { dali_group_at(&g_pana.dali, idx, start, len); }
+
+static void pres_knx_capture(void) { g_pana.knx = *knx_analysis(); }
+static void pres_knx_byte(int idx, uint8_t v, char *buf, int n) { knx_byte_label(&g_pana.knx, idx, v, buf, n); }
+static void pres_knx_field(int idx, uint8_t v, char *buf, int n) { knx_field_label(&g_pana.knx, idx, v, buf, n); }
+static void pres_knx_group(int idx, int *start, int *len) { knx_group_at(&g_pana.knx, idx, start, len); }
+
+static void pres_ws_capture(void) { g_pana.ws = *ws2812_analysis(); }
+static void pres_ws_byte(int idx, uint8_t v, char *buf, int n) { ws2812_byte_label(&g_pana.ws, idx, v, buf, n); }
+static void pres_ws_field(int idx, uint8_t v, char *buf, int n) { ws2812_field_label(&g_pana.ws, idx, v, buf, n); }
+static void pres_ws_group(int idx, int *start, int *len) { ws2812_group_at(&g_pana.ws, idx, start, len); }
+
+static void pres_swo_capture(void) { g_pana.swo = *swo_analysis(); }
+static void pres_swo_byte(int idx, uint8_t v, char *buf, int n) { swo_byte_label(&g_pana.swo, idx, v, buf, n); }
+static void pres_swo_field(int idx, uint8_t v, char *buf, int n) { swo_field_label(&g_pana.swo, idx, v, buf, n); }
+static void pres_swo_group(int idx, int *start, int *len) { swo_group_at(&g_pana.swo, idx, start, len); }
+
+static void pres_swd_capture(void) { g_pana.swd = *swd_analysis(); }
+static void pres_swd_byte(int idx, uint8_t v, char *buf, int n) { swd_byte_label(&g_pana.swd, idx, v, buf, n); }
+static void pres_swd_field(int idx, uint8_t v, char *buf, int n) { swd_field_label(&g_pana.swd, idx, v, buf, n); }
+static void pres_swd_group(int idx, int *start, int *len) { swd_group_at(&g_pana.swd, idx, start, len); }
+
+static void pres_usb_capture(void) { g_pana.usb = *usb_analysis(); }
+static void pres_usb_byte(int idx, uint8_t v, char *buf, int n) { usb_byte_label(&g_pana.usb, idx, v, buf, n); }
+static void pres_usb_field(int idx, uint8_t v, char *buf, int n) { usb_field_label(&g_pana.usb, idx, v, buf, n); }
+static void pres_usb_group(int idx, int *start, int *len) { usb_group_at(&g_pana.usb, idx, start, len); }
+
+static void pres_pd_capture(void) { g_pana.pd = *pd_analysis(); }
+static void pres_pd_byte(int idx, uint8_t v, char *buf, int n) { pd_byte_label(&g_pana.pd, idx, v, buf, n); }
+static void pres_pd_field(int idx, uint8_t v, char *buf, int n) { pd_field_label(&g_pana.pd, idx, v, buf, n); }
+static void pres_pd_group(int idx, int *start, int *len) { pd_group_at(&g_pana.pd, idx, start, len); }
+
+static void pres_sirc_capture(void) { g_pana.sirc = *sirc_analysis(); }
+static void pres_sirc_byte(int idx, uint8_t v, char *buf, int n) { sirc_byte_label(&g_pana.sirc, idx, v, buf, n); }
+static void pres_sirc_field(int idx, uint8_t v, char *buf, int n) { sirc_field_label(&g_pana.sirc, idx, v, buf, n); }
+static void pres_sirc_group(int idx, int *start, int *len) { sirc_group_at(&g_pana.sirc, idx, start, len); }
+
+static void pres_ppm_capture(void) { g_pana.ppm = *ppm_analysis(); }
+static void pres_ppm_byte(int idx, uint8_t v, char *buf, int n) { ppm_byte_label(&g_pana.ppm, idx, v, buf, n); }
+static void pres_ppm_field(int idx, uint8_t v, char *buf, int n) { ppm_field_label(&g_pana.ppm, idx, v, buf, n); }
+
+//-----------------------------------------------------------------------------
+// One row per protocol that has an analysis to present. A NULL member means
+// the protocol has no such labels; the site's own fallback applies there,
+// exactly as its default arm always did.
+typedef struct
+{
+  proto_t proto;
+  void (*capture)(void);
+  void (*byte_label)(int idx, uint8_t v, char *buf, int n);
+  void (*field_label)(int idx, uint8_t v, char *buf, int n);
+  void (*group_at)(int idx, int *start, int *len);
+} DecodePres;
+
+static const DecodePres g_decode_pres[] =
+{
+  { PROTO_ONEWIRE, pres_ow_capture,    pres_ow_byte,    pres_ow_field,    pres_ow_group    },
+  { PROTO_CAN,     pres_can_capture,   pres_can_byte,   pres_can_field,   pres_can_group   },
+  { PROTO_DHT,     pres_dht_capture,   pres_dht_byte,   pres_dht_field,   pres_dht_group   },
+  { PROTO_SENT,    pres_sent_capture,  pres_sent_byte,  pres_sent_field,  pres_sent_group  },
+  { PROTO_MIDI,    pres_midi_capture,  pres_midi_byte,  pres_midi_field,  pres_midi_group  },
+  { PROTO_LIN,     pres_lin_capture,   pres_lin_byte,   NULL,             NULL             },
+  { PROTO_EV1527,  pres_ev_capture,    pres_ev_byte,    pres_ev_field,    pres_ev_group    },
+  { PROTO_DSHOT,   pres_dshot_capture, pres_dshot_byte, pres_dshot_field, pres_dshot_group },
+  { PROTO_SPI,     pres_spi_capture,   pres_spi_byte,   pres_spi_field,   pres_spi_group   },
+  { PROTO_MANCH,   pres_man_capture,   pres_man_byte,   pres_man_field,   pres_man_group   },
+  { PROTO_RC5,     pres_rc5_capture,   pres_rc5_byte,   pres_rc5_field,   pres_rc5_group   },
+  { PROTO_DALI,    pres_dali_capture,  pres_dali_byte,  pres_dali_field,  pres_dali_group  },
+  { PROTO_KNX,     pres_knx_capture,   pres_knx_byte,   pres_knx_field,   pres_knx_group   },
+  { PROTO_WS2812,  pres_ws_capture,    pres_ws_byte,    pres_ws_field,    pres_ws_group    },
+  { PROTO_SWO,     pres_swo_capture,   pres_swo_byte,   pres_swo_field,   pres_swo_group   },
+  { PROTO_SWD,     pres_swd_capture,   pres_swd_byte,   pres_swd_field,   pres_swd_group   },
+  { PROTO_USB,     pres_usb_capture,   pres_usb_byte,   pres_usb_field,   pres_usb_group   },
+  { PROTO_PD,      pres_pd_capture,    pres_pd_byte,    pres_pd_field,    pres_pd_group    },
+  { PROTO_SIRC,    pres_sirc_capture,  pres_sirc_byte,  pres_sirc_field,  pres_sirc_group  },
+  { PROTO_PPM,     pres_ppm_capture,   pres_ppm_byte,   pres_ppm_field,   NULL             },
+};
+
+//-----------------------------------------------------------------------------
+static const DecodePres *pres_of(proto_t p)
+{
+  for (int i = 0; i < ARRAY_SIZE(g_decode_pres); i++)
+  {
+    if (g_decode_pres[i].proto == p)
+      return &g_decode_pres[i];
+  }
+
+  return NULL;
 }
 
 //-----------------------------------------------------------------------------
@@ -1494,30 +1645,13 @@ static void decode_group_at(int idx, int *start, int *len)
   }
   else
   {
-    switch (g_logic.proto)
-    {
-      case PROTO_SENT:    sent_group_at(&g_pana.sent, idx, start, len); break;
-      case PROTO_CAN:     can_group_at(&g_pana.can, idx, start, len); break;
-      case PROTO_DHT:     dht_group_at(&g_pana.dht, idx, start, len); break;
-      case PROTO_ONEWIRE: onewire_group_at(&g_pana.ow, idx, start, len); break;
-      case PROTO_MIDI:    midi_group_at(&g_pana.midi, idx, start, len); break;
-      case PROTO_EV1527:  ev1527_group_at(&g_pana.ev, idx, start, len); break;
-      case PROTO_DSHOT:   dshot_group_at(&g_pana.dshot, idx, start, len); break;
-      case PROTO_SPI:     spi_group_at(&g_pana.spi, idx, start, len); break;
-      case PROTO_MANCH:   manchester_group_at(&g_pana.man, idx, start, len); break;
-      case PROTO_RC5:     rc5_group_at(&g_pana.rc5, idx, start, len); break;
-      case PROTO_DALI:    dali_group_at(&g_pana.dali, idx, start, len); break;
-      case PROTO_KNX:     knx_group_at(&g_pana.knx, idx, start, len); break;
-      case PROTO_WS2812:  ws2812_group_at(&g_pana.ws, idx, start, len); break;
-      case PROTO_SWO:     swo_group_at(&g_pana.swo, idx, start, len); break;
-      case PROTO_SWD:     swd_group_at(&g_pana.swd, idx, start, len); break;
-      case PROTO_USB:     usb_group_at(&g_pana.usb, idx, start, len); break;
-      case PROTO_PD:      pd_group_at(&g_pana.pd, idx, start, len); break;
-      case PROTO_SIRC:    sirc_group_at(&g_pana.sirc, idx, start, len); break;
-      // PPM is deliberately absent: its channels each stand alone, and a
-      // frame of eight of them is not one value written across eight bytes
-      default: break;
-    }
+    // PPM has no group_at, deliberately: its channels each stand alone, and
+    // a frame of eight of them is not one value written across eight bytes.
+    // It and every other protocol without one keep the one-byte group above.
+    const DecodePres *pres = pres_of(g_logic.proto);
+
+    if (pres && pres->group_at)
+      pres->group_at(idx, start, len);
   }
 
   // The group belongs to the result, not past the end of it
@@ -1605,154 +1739,38 @@ static void dband_meaning_text(char *buf, int size, int idx, uint8_t v)
 {
   static const char *const nec_field[4] = { "ADDR", "~ADDR", "CMD", "~CMD" };
 
-  switch (g_logic.proto)
+  if (g_logic.proto == PROTO_NEC)
   {
-    case PROTO_NEC:
-      snprintf(buf, size, "%s", nec_field[idx & 3]);
-      break;
-
-    case PROTO_WS2812:
-      // The colour of the pixel, written once across the three bytes it took.
-      // The wire sends them G-R-B, so the hex dump is the one form of a
-      // colour nobody can read at a glance
-      ws2812_byte_label(&g_pana.ws, idx, v, buf, size);
-      break;
-
-    case PROTO_ONEWIRE:
-      // The commands, and what the device answered with: which family code
-      // came back, which byte of the ROM is its CRC, and the temperature
-      // itself at the byte that completes it
-      onewire_byte_label(&g_pana.ow, idx, v, buf, size);
-      break;
-
-    case PROTO_CAN:
-      // Which field of which frame: the identifier at the byte it starts on,
-      // the data bytes numbered, and at the end of the frame whether its CRC
-      // checked out and whether anyone acknowledged it
-      can_byte_label(&g_pana.can, idx, v, buf, size);
-      break;
-
-    case PROTO_DHT:
-      // Five bytes, and the reading written at the byte that completes each
-      // pair
-      dht_byte_label(&g_pana.dht, idx, v, buf, size);
-      break;
-
-    case PROTO_SENT:
-      // Nibbles: the status one, the data ones numbered, and the 12-bit
-      // signals written where their third nibble finishes them
-      sent_byte_label(&g_pana.sent, idx, v, buf, size);
-      break;
-
-    case PROTO_MIDI:
-      // What the message says, written once across the bytes it took: a
-      // note and its velocity, a controller and its value, a pitch bend
-      midi_byte_label(&g_pana.midi, idx, v, buf, size);
-      break;
-
-    case PROTO_LIN:
-      // Which field of the frame: the sync, the identifier under its parity
-      // bits, the data numbered, and whether the checksum agreed
-      lin_byte_label(&g_pana.lin, idx, v, buf, size);
-      break;
-
-    case PROTO_EV1527:
-      // Which remote and which button, written once across the three bytes
-      // its twenty-four bits packed into
-      ev1527_byte_label(&g_pana.ev, idx, v, buf, size);
-      break;
-
-    case PROTO_DSHOT:
-      // What the motor was told, written once across the two bytes the
-      // sixteen bits packed into
-      dshot_byte_label(&g_pana.dshot, idx, v, buf, size);
-      break;
-
-    case PROTO_SPI:
-      // A command, or the address it took - and only where a pause said a
-      // transaction began there. Everywhere else a byte is just a byte, and
-      // the character it stands for is as much as can honestly be said about
-      // it, exactly as on a serial line.
-      spi_byte_label(&g_pana.spi, idx, v, buf, size);
-
-      if (0 == buf[0])
-        dband_ascii_text(buf, size, v);
-      break;
-
-    case PROTO_MANCH:
-      // A frame is a bit count and a value; the bytes it packed into are
-      // where eight bits happened to land and are not a reading of anything
-      manchester_byte_label(&g_pana.man, idx, v, buf, size);
-      break;
-
-    case PROTO_RC5:
-      // Which key, on which device, and whether it was pressed again
-      rc5_byte_label(&g_pana.rc5, idx, v, buf, size);
-      break;
-
-    case PROTO_DALI:
-      // Which ballast, and what it was told to do
-      dali_byte_label(&g_pana.dali, idx, v, buf, size);
-      break;
-
-    case PROTO_KNX:
-      // Who told whom: both addresses are packed fields and not numbers
-      knx_byte_label(&g_pana.knx, idx, v, buf, size);
-      break;
-
-    case PROTO_SWO:
-      // What the packet was: a character out of a stimulus port, an exception
-      // the core took, a program counter the DWT sampled
-      swo_byte_label(&g_pana.swo, idx, v, buf, size);
-      break;
-
-    case PROTO_SWD:
-      // Which register the debugger touched, and what came back
-      swd_byte_label(&g_pana.swd, idx, v, buf, size);
-      break;
-
-    case PROTO_USB:
-      // Which packet this is - SETUP, DATA0, ACK - and, on the byte that
-      // completes it, the address and endpoint it named or the CRC16 that
-      // found its end. A payload byte gets nothing here and falls through to
-      // being shown as a character, the way a serial line's does.
-      usb_byte_label(&g_pana.usb, idx, v, buf, size);
-
-      if (0 == buf[0])
-        dband_ascii_text(buf, size, v);
-      break;
-
-    case PROTO_PD:
-      // Which message, and then the answer: what the charger offered on this
-      // object, what the sink asked for, and whether the CRC32 agreed. Held
-      // back to the byte that COMPLETES each field - a data object is four
-      // bytes and one number, and the number is written once across them.
-      pd_byte_label(&g_pana.pd, idx, v, buf, size);
-      break;
-
-    case PROTO_SIRC:
-      // Which key on which device, written once across the two bytes the
-      // frame took - or the three, where an extended byte came with it
-      sirc_byte_label(&g_pana.sirc, idx, v, buf, size);
-      break;
-
-    case PROTO_PPM:
-      // The byte IS the interval, and the units the link is set up in are
-      // the only ones anyone reads it in - the same form the servo decoder
-      // puts the pin next door in
-      ppm_byte_label(&g_pana.ppm, idx, v, buf, size);
-      break;
-
-    case PROTO_SERVO:
-      // The byte IS the width, in tens of microseconds; put it back into the
-      // units the servo is commanded in, which is the only form anyone reads
-      snprintf(buf, size, "%d.%02dms", v / 100, v % 100);
-      break;
-
-    default: // UART and the raw bit stream: text is what they usually carry
-      dband_ascii_text(buf, size, v);
-      break;
+    snprintf(buf, size, "%s", nec_field[idx & 3]);
+    return;
   }
+
+  if (g_logic.proto == PROTO_SERVO)
+  {
+    // The byte IS the width, in tens of microseconds; put it back into the
+    // units the servo is commanded in, which is the only form anyone reads
+    snprintf(buf, size, "%d.%02dms", v / 100, v % 100);
+    return;
+  }
+
+  const DecodePres *pres = pres_of(g_logic.proto);
+
+  if (pres && pres->byte_label)
+  {
+    pres->byte_label(idx, v, buf, size);
+
+    // On SPI and USB a byte the transaction structure never reached is just
+    // a byte, and the character it stands for is as much as can honestly be
+    // said about it, exactly as on a serial line
+    if (0 == buf[0] &&
+        (g_logic.proto == PROTO_SPI || g_logic.proto == PROTO_USB))
+      dband_ascii_text(buf, size, v);
+
+    return;
+  }
+
+  // UART and the raw bit stream: text is what they usually carry
+  dband_ascii_text(buf, size, v);
 }
 
 //-----------------------------------------------------------------------------
@@ -1763,72 +1781,22 @@ static void dband_meaning_text(char *buf, int size, int idx, uint8_t v)
 // bit2 above the bracket labelled "command".
 static void dband_field_text(char *buf, int size, int idx, uint8_t v)
 {
-  switch (g_logic.proto)
+  const DecodePres *pres = pres_of(g_logic.proto);
+
+  if (pres && pres->field_label)
   {
-    case PROTO_SENT:    sent_field_label(&g_pana.sent, idx, v, buf, size); break;
-    case PROTO_CAN:     can_field_label(&g_pana.can, idx, v, buf, size); break;
-    case PROTO_DHT:     dht_field_label(&g_pana.dht, idx, v, buf, size); break;
-    case PROTO_ONEWIRE: onewire_field_label(&g_pana.ow, idx, v, buf, size); break;
-    case PROTO_MIDI:    midi_field_label(&g_pana.midi, idx, v, buf, size); break;
-    case PROTO_EV1527:  ev1527_field_label(&g_pana.ev, idx, v, buf, size); break;
-    case PROTO_DSHOT:   dshot_field_label(&g_pana.dshot, idx, v, buf, size); break;
-    case PROTO_WS2812:  ws2812_field_label(&g_pana.ws, idx, v, buf, size); break;
+    pres->field_label(idx, v, buf, size);
 
-    case PROTO_MANCH:
-      manchester_field_label(&g_pana.man, idx, v, buf, size);
-      break;
+    // On SPI a byte outside any transaction is just a byte, exactly as on
+    // the meaning row below it
+    if (0 == buf[0] && g_logic.proto == PROTO_SPI)
+      dband_ascii_text(buf, size, v);
 
-    case PROTO_RC5:
-      rc5_field_label(&g_pana.rc5, idx, v, buf, size);
-      break;
-
-    case PROTO_DALI:
-      dali_field_label(&g_pana.dali, idx, v, buf, size);
-      break;
-
-    case PROTO_KNX:
-      knx_field_label(&g_pana.knx, idx, v, buf, size);
-      break;
-
-    case PROTO_SPI:
-      spi_field_label(&g_pana.spi, idx, v, buf, size);
-
-      if (0 == buf[0])
-        dband_ascii_text(buf, size, v);
-      break;
-
-    case PROTO_SWO:
-      swo_field_label(&g_pana.swo, idx, v, buf, size);
-      break;
-
-    case PROTO_SWD:
-      swd_field_label(&g_pana.swd, idx, v, buf, size);
-      break;
-
-    case PROTO_USB:
-      usb_field_label(&g_pana.usb, idx, v, buf, size);
-      break;
-
-    case PROTO_PD:
-      pd_field_label(&g_pana.pd, idx, v, buf, size);
-      break;
-
-    case PROTO_SIRC:
-      // The command comes FIRST off the wire, which is the opposite way round
-      // from how anyone writes a remote code down, so the row says which is
-      // which rather than leaving it to be inferred from the order
-      sirc_field_label(&g_pana.sirc, idx, v, buf, size);
-      break;
-
-    case PROTO_PPM:
-      // Which channel of its own frame - numbered from the sync in front of
-      // it, so channel 3 is channel 3 whichever frame the record opened in
-      ppm_field_label(&g_pana.ppm, idx, v, buf, size);
-      break;
-
-    // Everything else names its bytes one at a time already
-    default: dband_meaning_text(buf, size, idx, v); break;
+    return;
   }
+
+  // Everything else names its bytes one at a time already
+  dband_meaning_text(buf, size, idx, v);
 }
 
 //-----------------------------------------------------------------------------
@@ -3808,46 +3776,10 @@ static void decode_update(void)
   {
     g_logic = res;
 
-    if (res.proto == PROTO_ONEWIRE)
-      g_pana.ow = *onewire_analysis();
-    else if (res.proto == PROTO_CAN)
-      g_pana.can = *can_analysis();
-    else if (res.proto == PROTO_DHT)
-      g_pana.dht = *dht_analysis();
-    else if (res.proto == PROTO_SENT)
-      g_pana.sent = *sent_analysis();
-    else if (res.proto == PROTO_MIDI)
-      g_pana.midi = *midi_analysis();
-    else if (res.proto == PROTO_LIN)
-      g_pana.lin = *lin_analysis();
-    else if (res.proto == PROTO_EV1527)
-      g_pana.ev = *ev1527_analysis();
-    else if (res.proto == PROTO_DSHOT)
-      g_pana.dshot = *dshot_analysis();
-    else if (res.proto == PROTO_SPI)
-      g_pana.spi = *spi_analysis();
-    else if (res.proto == PROTO_MANCH)
-      g_pana.man = *manchester_analysis();
-    else if (res.proto == PROTO_RC5)
-      g_pana.rc5 = *rc5_analysis();
-    else if (res.proto == PROTO_DALI)
-      g_pana.dali = *dali_analysis();
-    else if (res.proto == PROTO_KNX)
-      g_pana.knx = *knx_analysis();
-    else if (res.proto == PROTO_WS2812)
-      g_pana.ws = *ws2812_analysis();
-    else if (res.proto == PROTO_SWO)
-      g_pana.swo = *swo_analysis();
-    else if (res.proto == PROTO_SWD)
-      g_pana.swd = *swd_analysis();
-    else if (res.proto == PROTO_USB)
-      g_pana.usb = *usb_analysis();
-    else if (res.proto == PROTO_PD)
-      g_pana.pd = *pd_analysis();
-    else if (res.proto == PROTO_SIRC)
-      g_pana.sirc = *sirc_analysis();
-    else if (res.proto == PROTO_PPM)
-      g_pana.ppm = *ppm_analysis();
+    const DecodePres *pres = pres_of(res.proto);
+
+    if (pres)
+      pres->capture();
 
     g_logic_have = true;
     g_decode_held = false;
