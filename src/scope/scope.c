@@ -7144,12 +7144,6 @@ static void change_horizontal_position_ex(int delta, bool repeat)
 }
 
 //-----------------------------------------------------------------------------
-static void change_horizontal_position(int delta)
-{
-  change_horizontal_position_ex(delta, false);
-}
-
-//-----------------------------------------------------------------------------
 static void change_vertical_scale(int delta)
 {
   // Clamped, not just guarded at the ends: the auto-setup jumps straight to
@@ -7214,12 +7208,6 @@ static void change_vertical_position_ex(int delta, bool repeat)
   draw_vertical_position(true);
   draw_trigger_level();
   refresh_view();
-}
-
-//-----------------------------------------------------------------------------
-static void change_vertical_position(int delta)
-{
-  change_vertical_position_ex(delta, false);
 }
 
 //-----------------------------------------------------------------------------

@@ -198,10 +198,10 @@ SRCS += \
 # and buys back time that was never on the critical path - measured, it is 10 KB
 # of an image that is already 83% full.
 #
-# The 3D applications are deliberately not on this list. Those are the ones that
-# really are compute bound, and -Os would cost them frame rate: cube3d, engine3d
-# and raytrace_test together would give back another 7.5 KB, and it is a trade
-# rather than a free win.
+# The 3D applications are on the list too, and that one IS a trade rather than
+# a free win: cube3d, engine3d and raytrace_test are compute bound, and -Os
+# costs them frame rate for the 7.5 KB it gives back. The flash ceiling won the
+# argument; take them off the list if the headroom ever allows it.
 #
 # A target-specific variable, appended after the -O3 in CFLAGS, so the last -O
 # on the command line is the one that counts.
@@ -248,7 +248,6 @@ SIZE_OPTIMIZED = \
   $(BUILD)/dshot_decode.o \
   $(BUILD)/sent_decode.o \
   $(BUILD)/midi_decode.o \
-  $(BUILD)/ir_decode.o \
   $(BUILD)/manchester_decode.o \
   $(BUILD)/nec_decode.o \
   $(BUILD)/onewire_decode.o \
