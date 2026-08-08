@@ -571,6 +571,32 @@ void draw_measure(void);
 void cursor_readout(void);
 void trend_readout(void);
 
+// Auto-calibration phases, in the order autocal_step() walks them
+enum
+{
+  ACAL_ASK,    // waiting for the user to prepare the input and confirm
+  ACAL_ZERO,   // single channel: put ADC B's mean on ZERO_POINT
+  ACAL_DELTA,  // dual channel: match ADC A's mean to ADC B's
+  ACAL_DAC,    // per range: one position pixel must move the trace one pixel
+  ACAL_LIN,    // sweep the offset DAC across the window and fit the bend in it
+  ACAL_ASK_REF,// waiting for the reference voltage to be connected
+  ACAL_SCALE,  // gain: make the reading equal that reference
+  ACAL_DONE,
+};
+
+// The calibration flows (scope_calib.c), driven from scope.c's task/buttons:
+void autocal_mark(void);
+void autocal_say(const char *l0, const char *l1);
+void autocal_begin(void);
+void autocal_close(void);
+void autocal_finish(bool ok);
+void autocal_step(void);
+void calib_hint_update(void);
+void change_calibration_value(int delta, bool shift, bool repeat);
+void draw_calibration_info(void);
+void gain_ref_step(int dir, bool repeat);
+void gain_range_step(int delta);
+
 /*- Shared state (definitions stay with their owner file) ------------------*/
 extern LogicResult g_logic;
 extern ScopeGeom g_geom;
@@ -589,5 +615,33 @@ extern int g_trace_column;
 extern uint8_t g_roll_row_flags[GRID_WIDTH];
 extern uint8_t g_roll_row_max[GRID_WIDTH];
 extern uint8_t g_roll_row_min[GRID_WIDTH];
+
+/*- Shared state (definitions stay with their owner file) ------------------*/
+extern bool g_autocal_active;
+extern bool g_autocal_gain_only;
+extern bool g_calib_hint;
+extern int g_autocal_phase;
+extern int g_autocal_timer;
+extern int g_calib_hint_param;
+extern uint32_t g_gain_note_until;
+
+// Cross-file (owner: scope.c):
+void autoset_set_horizontal(int hs);
+void autoset_set_scale(int scale);
+void change_vertical_scale(int delta);
+int clip_for_display(int value);
+void mpanel_invalidate(void);
+void mpanel_set_active(bool active);
+void mpanel_set_lines(const char *l0, const char *l1);
+bool mpanel_wanted(void);
+void redraw_trace(void);
+void refresh_view(void);
+void update_display(void);
+
+/*- Shared state (definitions stay with their owner file) ------------------*/
+extern DataBuffer g_data_buffer;
+extern DisplayBuffer g_display_buffer;
+extern bool g_line_owner;
+extern bool g_mpanel_active;
 
 #endif // _SCOPE_INTERNAL_H_

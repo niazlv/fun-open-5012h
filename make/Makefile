@@ -162,6 +162,7 @@ SRCS += \
 # The instrument itself
 SRCS += \
   ../src/scope/scope.c \
+  ../src/scope/scope_calib.c \
   ../src/scope/scope_chrome.c \
   ../src/scope/scope_menu.c \
 
