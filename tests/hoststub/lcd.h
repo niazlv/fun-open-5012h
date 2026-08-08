@@ -9,6 +9,10 @@
 
 #include <stdint.h>
 
+/* The geometry and the RGB565 packing below are copies of src/hal/lcd.h -
+ * nothing checks they agree. If the panel size or the pixel format ever
+ * changes there, change it here too, or the coredump test renders into a
+ * screen that no longer exists. */
 #define LCD_WIDTH   320
 #define LCD_HEIGHT  240
 
