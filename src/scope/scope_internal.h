@@ -739,6 +739,17 @@ void fft_format_db(char *buf, int size, float db);
 /*- Shared state (definitions stay with their owner file) ------------------*/
 typedef struct
 {
+  char text[MPANEL_CHARS_MAX + 1]; // "name value", nothing else
+  uint8_t len;
+  uint8_t label_len;               // leading characters drawn dimmer: the name
+  uint8_t x;                       // first character column of the band's row
+  uint8_t row;
+  uint16_t color;
+} MPanelCell;
+
+
+typedef struct
+{
   char text[MPANEL_CHARS_MAX + 1];
   uint8_t len;
   uint8_t label_len;
@@ -767,6 +778,7 @@ extern uint8_t g_roll_row_min[GRID_WIDTH];
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
 
+
 extern bool g_autocal_active;
 extern bool g_autocal_gain_only;
 extern bool g_calib_hint;
@@ -779,7 +791,6 @@ extern uint32_t g_gain_note_until;
 void autoset_set_horizontal(int hs);
 void autoset_set_scale(int scale);
 void change_vertical_scale(int delta);
-int clip_for_display(int value);
 void mpanel_invalidate(void);
 void mpanel_set_active(bool active);
 void mpanel_set_lines(const char *l0, const char *l1);
@@ -792,12 +803,14 @@ void change_horizontal_scale(int delta);
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
 
+
 extern DataBuffer g_data_buffer;
 extern DisplayBuffer g_display_buffer;
 extern bool g_line_owner;
 extern bool g_mpanel_active;
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
+
 
 extern AliasAnalysis g_fft_alias;
 extern FftAnalysis g_fft_an;
@@ -815,24 +828,29 @@ extern uint8_t g_fft_samples[FFT_SIZE];
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
 
+
 extern bool g_shadow_valid;
 extern bool g_sweep_force;
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
+
 
 extern int  g_trend_timer;
 extern int g_measure_timer;
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
 
+
 extern bool g_autoset_active;
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
+
 
 extern bool g_layout_grab;
 extern int g_layout_sel;
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
+
 
 extern PanelPlaced g_placed[PANEL_WIDGETS_MAX];
 extern bool g_mpanel_is_text;
@@ -856,6 +874,7 @@ const Font *widget_font(int size);
 PanelWidget *layout_selected(void);
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
+
 extern bool g_dbit_on;
 extern bool g_decode_force;
 extern bool g_decode_hunt;
@@ -876,7 +895,67 @@ extern uint8_t g_dband_gedge[(GRID_WIDTH + 7) / 8];
 extern uint8_t g_dband_mask[DBAND_H3][(GRID_WIDTH + 7) / 8];
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
+
 extern int g_dband_row0;
 extern int g_dband_rows;
+
+extern int64_t g_cursor_t[2];
+extern int     g_cursor_v[2];
+extern uint8_t g_shadow_min[GRID_WIDTH];
+extern uint8_t g_shadow_max[GRID_WIDTH];
+extern uint8_t g_shadow_flags[GRID_WIDTH];
+extern int g_shadow_marker_px;
+
+// Hot per-column mappers, inlined into the sweep
+//-----------------------------------------------------------------------------
+static inline int clip_for_display(int value)
+{
+  value = GRID_HEIGHT/2-1 - value;
+
+  if (value > (GRID_HEIGHT-2))
+    value = (GRID_HEIGHT-2);
+  else if (value < 0)
+    value = 0;
+
+  return value;
+}
+//-----------------------------------------------------------------------------
+// Measurement cursors. Both mappings are exactly the arithmetic the trace
+// itself is drawn with, so the cursors track pan and zoom.
+static inline int cursor_t_col(int64_t t_ns)
+{
+  return GRID_WIDTH/2 + (int)((t_ns - config.horizontal_position) /
+      hs_px_value[config.horizontal_scale]);
+}
+
+//-----------------------------------------------------------------------------
+static inline int cursor_v_row(int mv)
+{
+  int px = (mv - config.vertical_position_mv) / vs_mv_px(config.vertical_scale) +
+      config.vertical_position;
+
+  return clip_for_display(px);
+}
+
+
+/*- Shared state (definitions stay with their owner file) ------------------*/
+
+extern MPanelCell g_mpanel_cell[MPANEL_CELLS_MAX];
+extern bool g_recon_strained;
+extern int g_mpanel_cells;
+extern uint32_t g_mpanel_builds;
+extern uint32_t g_mpanel_paints;
+extern uint32_t g_persist_stamp;
+extern uint8_t  g_avg_have[GRID_WIDTH];
+extern uint8_t  g_persist_lvl[GRID_WIDTH];
+
+// Cross-file (owner: scope_trace.c):
+void display_average(void);
+void display_persist_accum(void);
+void draw_trace(void);
+void grid_init(void);
+void mpanel_update(void);
+void persist_build_ramp(void);
+bool trace_ready(void);
 
 #endif // _SCOPE_INTERNAL_H_

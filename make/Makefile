@@ -170,6 +170,7 @@ SRCS += \
   ../src/scope/scope_layout.c \
   ../src/scope/scope_measure.c \
   ../src/scope/scope_roll.c \
+  ../src/scope/scope_trace.c \
   ../src/scope/scope_menu.c \
 
 # Everything the launcher can start that is not the scope
