@@ -178,6 +178,7 @@ uint32_t capture_get_generation(void);
 // ring's period while the full-rate window applies, four times it when the
 // screen needs more time than that window spans.
 int capture_get_record_period(void);
+int capture_get_pending_record_period(void);
 int capture_read_samples(uint8_t *dst, int max_count, int *period_ns, bool consume);
 // The newest samples from the RAW full-rate capture ring (not the decimated
 // storage buffer), usable while acquisition runs. May tear mid-write — meant

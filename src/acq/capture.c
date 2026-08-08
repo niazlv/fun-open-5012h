@@ -199,6 +199,9 @@ static volatile int g_stream_ptr;
 // matches, no record captured under the CURRENT settings exists yet and the
 // one every consumer reads belongs to the settings before them.
 static volatile uint32_t g_retime_gen;
+// Sample period the NEXT record will be captured at, decided at retime.
+// The info's own period keeps describing the bytes already stored.
+static volatile int g_pending_record_period;
 
 /*- Prototypes --------------------------------------------------------------*/
 static inline int dma_get_count(void);
@@ -1088,16 +1091,22 @@ void capture_set_horizontal_parameters(int sr_divider, int trigger_offset)
   g_auto_mode_count = (BASE_SAMPLE_RATE / (1 << sr_divider)) / AUTO_MODE_COUNT_DIV;
 
   // Decide the record mode here rather than per acquisition: it only depends
-  // on the timebase and the pan, and capture_get_record_period() has to be
-  // able to answer before the first frame under the new settings lands.
-  // Never relabel a STOPPED record though - panning a frozen full-rate
-  // window past the point where it "no longer fits" must not stretch its
-  // stored samples 4x; the stored period is a fact about the stored data.
+  // on the timebase and the pan. What the NEXT record will be captured at is
+  // published through capture_get_pending_record_period(); the period stored
+  // in the info is a fact about the bytes already in the buffer and is NEVER
+  // rewritten here. Relabeling it was the scaling bug that lived above the
+  // 125M->31M threshold: a pre-retime record kept rendering under the new
+  // label - in NORMAL, with nothing to replace it, indefinitely - and every
+  // divider step drew the old samples 2x too wide or too narrow.
   g_record_full_rate = record_window_fits(g_sample_period);
+  g_pending_record_period = g_record_full_rate ?
+      g_sample_period : (g_sample_period * STORAGE_BUFFER_RATIO);
 
+  // The stale record may still be DRAWN (at its own true scale), but the
+  // next completed frame must re-fill the storage under the new mode rather
+  // than short-circuiting on a validity that no longer means anything
   if (!g_stopped)
-    g_storage_buffer_info.period = g_record_full_rate ?
-        g_sample_period : (g_sample_period * STORAGE_BUFFER_RATIO);
+    g_storage_buffer_info.valid = false;
 
   if (g_auto_mode_count < CAPTURE_BUFFER_SIZE)
     g_auto_mode_count = CAPTURE_BUFFER_SIZE;
@@ -1836,6 +1845,16 @@ int capture_get_record_period(void)
     return g_capture_buffer_info.period;
 
   return g_storage_buffer_info.period;
+}
+
+//---------------------------------------------------------------------
+// ...and the rate the NEXT record will arrive at, for the top bar: after a
+// retime the stored record still answers with its own (old) period, and the
+// bar has to say what the instrument is now set to, not what it last saw.
+int capture_get_pending_record_period(void)
+{
+  return g_pending_record_period ? g_pending_record_period
+                                 : capture_get_record_period();
 }
 
 //---------------------------------------------------------------------

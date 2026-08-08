@@ -1091,7 +1091,7 @@ void update_sample_rate(void)
   // two differ by 4x whenever the screen needs more time than the full-rate
   // window spans (see update_storage_window in capture.c), and that is the
   // rate that decides whether an input aliases
-  record_period = capture_get_record_period();
+  record_period = capture_get_pending_record_period();
 
   if (record_period > 0)
     sample_rate = (int)(1000000000ll / record_period);
