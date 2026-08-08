@@ -102,7 +102,9 @@ SECTIONS
   .tcm_borrowed (NOLOAD) : ALIGN(8)
   {
     __borrowed_start = .;
-    *scope.o(.bss*)
+    /* The glob is deliberately wide: the scope is several scope_*.o objects,
+       and every one of them must land here or its state escapes the memset. */
+    *scope*.o(.bss*)
     *fft.o(.bss*)
     *trend.o(.bss*)
     *measure.o(.bss*)
