@@ -93,6 +93,7 @@ SRCS += \
   ../src/core/startup_gd32f4.c \
   ../src/core/syscalls.c \
   ../src/core/config.c \
+  ../src/core/config_describe.c \
   ../src/core/timer.c \
   ../src/core/utils.c \
   ../src/core/tcm_borrow.c \
@@ -234,6 +235,7 @@ SIZE_OPTIMIZED = \
   $(BUILD)/key_remap.o \
   $(BUILD)/launcher.o \
   $(BUILD)/config.o \
+  $(BUILD)/config_describe.o \
   $(BUILD)/debug_coredump.o \
   $(BUILD)/game_gfx.o \
   $(BUILD)/snake_game.o \
