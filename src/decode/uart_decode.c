@@ -57,17 +57,6 @@ static int g_forced_baud = 0;
 /*- Implementations ---------------------------------------------------------*/
 
 //-----------------------------------------------------------------------------
-static inline int sample_at(const uint8_t *data, int size, int offset, int i)
-{
-  int index = offset + i;
-
-  if (index >= size)
-    index -= size;
-
-  return data[index];
-}
-
-//-----------------------------------------------------------------------------
 // One decode pass at a given bit time and polarity. Fills out->bytes and
 // returns a score in SAMPLES: how much of the record the frames account for,
 // a decoded frame worth its own length and a framing error costing half as

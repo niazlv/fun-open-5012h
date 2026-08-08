@@ -102,17 +102,6 @@ static const struct { uint8_t id; const char *name; } g_midi_mfr[] =
 /*- Implementations ---------------------------------------------------------*/
 
 //-----------------------------------------------------------------------------
-static inline int sample_at(const uint8_t *data, int size, int offset, int i)
-{
-  int index = offset + i;
-
-  if (index >= size)
-    index -= size;
-
-  return data[index];
-}
-
-//-----------------------------------------------------------------------------
 // How many data bytes follow this status byte. -1 for a byte that is not a
 // status byte at all, and for the four codes the standard leaves undefined
 // (0xF4, 0xF5, 0xF9, 0xFD) - a transmitter does not send those, so a record

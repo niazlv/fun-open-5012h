@@ -100,17 +100,6 @@ static const char *const g_swo_exc[16] =
 /*- Implementations ---------------------------------------------------------*/
 
 //-----------------------------------------------------------------------------
-static inline int sample_at(const uint8_t *data, int size, int offset, int i)
-{
-  int index = offset + i;
-
-  if (index >= size)
-    index -= size;
-
-  return data[index];
-}
-
-//-----------------------------------------------------------------------------
 const SwoAnalysis *swo_analysis(void)
 {
   return &g_swo;

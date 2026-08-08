@@ -152,17 +152,6 @@ const PdAnalysis *pd_analysis(void)
 }
 
 //-----------------------------------------------------------------------------
-static inline int pd_sample(const uint8_t *data, int size, int offset, int i)
-{
-  int index = offset + i;
-
-  if (index >= size)
-    index -= size;
-
-  return data[index];
-}
-
-//-----------------------------------------------------------------------------
 static inline uint8_t pd_rev5(uint8_t v)
 {
   uint8_t r = 0;
@@ -222,7 +211,7 @@ static void pd_walk_init(PdWalk *w, const uint8_t *data, int size, int offset,
   w->offset = offset;
   w->mid = mid;
   w->hyst = hyst;
-  w->level = (pd_sample(data, size, offset, 0) > mid) ? 1 : 0;
+  w->level = (sample_at(data, size, offset, 0) > mid) ? 1 : 0;
   w->i = 1;
   w->start = 0;
 }
@@ -234,7 +223,7 @@ static int pd_walk_run(PdWalk *w, int *pos)
 {
   while (w->i < w->size)
   {
-    int v = pd_sample(w->data, w->size, w->offset, w->i);
+    int v = sample_at(w->data, w->size, w->offset, w->i);
     int nl = w->level;
 
     if (0 == w->level && v > w->mid + w->hyst)
@@ -1237,7 +1226,7 @@ int pd_decode(const uint8_t *data, int size, int offset, int period_ns,
 
   for (int i = 0; i < size; i++)
   {
-    int v = pd_sample(data, size, offset, i);
+    int v = sample_at(data, size, offset, i);
 
     if (v < vmin) vmin = v;
     if (v > vmax) vmax = v;

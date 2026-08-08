@@ -92,17 +92,6 @@ static const struct { uint8_t sid; const char *name; } g_lin_sid[] =
 /*- Implementations ---------------------------------------------------------*/
 
 //-----------------------------------------------------------------------------
-static inline int sample_at(const uint8_t *data, int size, int offset, int i)
-{
-  int index = offset + i;
-
-  if (index >= size)
-    index -= size;
-
-  return data[index];
-}
-
-//-----------------------------------------------------------------------------
 // The two parity bits a protected identifier carries over its six identifier
 // bits. Not a checksum - four bits of the identifier go into each - but it is
 // what catches a header read at the wrong rate before its data is believed.

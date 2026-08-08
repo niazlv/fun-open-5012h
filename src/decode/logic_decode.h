@@ -1332,4 +1332,18 @@ int logic_runs(const uint8_t *data, int size, int offset,
 
 const char *logic_proto_name(proto_t proto);
 
+//-----------------------------------------------------------------------------
+// One sample out of the ring the capture hands every decoder: `offset` is
+// where the record starts inside the buffer, `i` walks forward through time.
+// Was copied verbatim into six decoders before it lived here.
+static inline int sample_at(const uint8_t *data, int size, int offset, int i)
+{
+  int index = offset + i;
+
+  if (index >= size)
+    index -= size;
+
+  return data[index];
+}
+
 #endif // _LOGIC_DECODE_H_

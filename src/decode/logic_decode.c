@@ -22,17 +22,6 @@ LogicAnalysis g_logic_analysis;
 /*- Implementations ---------------------------------------------------------*/
 
 //-----------------------------------------------------------------------------
-static inline int sample_at(const uint8_t *data, int size, int offset, int i)
-{
-  int index = offset + i;
-
-  if (index >= size)
-    index -= size;
-
-  return data[index];
-}
-
-//-----------------------------------------------------------------------------
 const char *logic_proto_name(proto_t proto)
 {
   switch (proto)
