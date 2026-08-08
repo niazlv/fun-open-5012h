@@ -3535,6 +3535,44 @@ static void decode_fit_window(int baud)
 // message every 200 ms means most of the hunt would be spent on those.
 static void trigger_set_50_percent(void); // defined with the other trigger helpers
 
+// The user's trigger, parked while the decoder view owns the acquisition.
+// The hunt deliberately re-arms mode, edge and level to catch a burst; what
+// was there before has to come back when the view is left, or every look at
+// the decoder costs the trigger setup.
+static int  g_decode_saved_level;
+static int  g_decode_saved_mode;
+static int  g_decode_saved_edge;
+static bool g_decode_saved_valid = false;
+
+static void decode_trigger_save(void)
+{
+  if (g_decode_saved_valid) // re-entry (the catch action) keeps the original
+    return;
+
+  g_decode_saved_level = config.trigger_level;
+  g_decode_saved_mode = config.trigger_mode;
+  g_decode_saved_edge = config.trigger_edge;
+  g_decode_saved_valid = true;
+}
+
+static void decode_trigger_restore(void)
+{
+  if (!g_decode_saved_valid)
+    return;
+
+  config.trigger_level = g_decode_saved_level;
+  config.trigger_mode = g_decode_saved_mode;
+  config.trigger_edge = g_decode_saved_edge;
+  g_decode_saved_valid = false;
+
+  scope_apply_trigger_level();
+  capture_set_trigger_mode(config.trigger_mode);
+  capture_set_trigger_edge(config.trigger_edge);
+  draw_trigger_level();
+  draw_trigger_mode();
+  draw_trigger_edge();
+}
+
 static void decode_arm_hunt(void)
 {
   int baud = decoder_baud_value();
@@ -3747,13 +3785,24 @@ static void decode_update(void)
     return;
   }
 
+  // g_logic.pos/end and the three anchors below must always describe the SAME
+  // record: band_column() evaluates (pos - trig_pos) * period_ns, and a pan on
+  // the full-rate window path moves the trigger's index inside the record
+  // without changing a single decoded byte. Publishing new anchors while
+  // keeping old positions shifted every mark by exactly the pan - which is
+  // what byte-stepping does, cumulatively, until the marks sat on idle line.
+  bool moved = (period_ns != g_decode_period_ns) ||
+      (trig_pos != g_decode_trig_pos) || (size != g_decode_size);
+
   g_decode_period_ns = period_ns;
   g_decode_trig_pos = trig_pos;
   g_decode_size = size;
 
-  bool changed = !g_logic_have || g_decode_held || res.count != g_logic.count ||
+  bool changed = !g_logic_have || g_decode_held || moved ||
+      res.count != g_logic.count ||
       res.proto != g_logic.proto || res.rate != g_logic.rate ||
-      memcmp(res.bytes, g_logic.bytes, (size_t)res.count) != 0;
+      memcmp(res.bytes, g_logic.bytes, (size_t)res.count) != 0 ||
+      memcmp(res.pos, g_logic.pos, sizeof(res.pos[0]) * (size_t)res.count) != 0;
 
   if (changed)
   {
@@ -3869,6 +3918,11 @@ static void decode_jump_to_selected(void)
 
   draw_horizontal_position();
   update_sample_rate(); // also repaints the miniview with the new selection
+
+  // The pan above moved the record window under the marks; without a forced
+  // re-decode the band is drawn from the pre-pan record for up to the whole
+  // decode throttle interval
+  g_decode_force = true;
   update_display();
 
   g_decode_panel_pending = true; // the selection highlight moved
@@ -4381,6 +4435,7 @@ static void trigger_set_50_percent(void)
 // having to catch one.
 static void decode_mode_enter(void)
 {
+  decode_trigger_save();
   g_decode_mode = true;
   g_fft_mode = false;
   g_trend_mode = false;
@@ -4391,18 +4446,23 @@ static void decode_mode_enter(void)
   g_decode_hunt = false;
   g_decode_sel = 0;
   g_decode_force = true; // show something without waiting for the throttle
-  // Before anything re-times the acquisition: the window and the trigger set
-  // up below are a record's, and roll pins the rate to something else
+  // Before anything re-times the acquisition: the window set up below is a
+  // record's, and roll pins the rate to something else. The trigger is NOT
+  // auto-levelled here: the hunt path below does its own 50% where catching
+  // a burst asks for it, and a level the user set on purpose survives a
+  // plain look at the decoder view.
   roll_sync();
-  trigger_set_50_percent();
 
   if (decoder_baud_value() > 0 && config.decoder_fit_mode == 0 &&
       (proto_t)config.decoder_proto == PROTO_UART)
   {
     decode_arm_hunt(); // window, trigger and the hunt in one
   }
-  else if (decoder_baud_value() > 0)
+  else if (decoder_baud_value() > 0 &&
+      decode_proto_is_serial((proto_t)config.decoder_proto))
   {
+    // Only for a protocol the baud setting describes: fitting a PD or CAN
+    // window to the UART baud number retimes the acquisition ~28x off
     g_decode_fitted = true;
     decode_fit_window(decoder_baud_value());
   }
@@ -5137,6 +5197,7 @@ void scope_buttons_handler(int buttons)
       {
         g_decode_mode = false;
         g_decode_hunt = false;
+        decode_trigger_restore();
         g_shadow_valid = false;
         g_sweep_force = true;
         roll_sync();
@@ -5258,6 +5319,7 @@ void scope_buttons_handler(int buttons)
       // SHIFT+MODE: toggle the FFT spectrum view
       g_fft_mode = !g_fft_mode;
       g_decode_mode = false;
+      decode_trigger_restore(); // no-op unless the decoder view was on
       g_trend_mode = false;
       g_shadow_valid = false;
       g_sweep_force = true;
