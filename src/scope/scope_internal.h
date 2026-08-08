@@ -597,6 +597,16 @@ void draw_calibration_info(void);
 void gain_ref_step(int dir, bool repeat);
 void gain_range_step(int delta);
 
+// The spectrum view (scope_fft.c):
+void fft_update(void);
+void fft_tick(void);
+bool fft_buttons(int buttons, bool shift, bool repeat);
+void draw_fft_panel(void);
+void fft_fill_row_draw(void);
+bool fft_fill_pending(void);
+void fft_format_hz(char *buf, int size, float hz);
+void fft_format_db(char *buf, int size, float db);
+
 /*- Shared state (definitions stay with their owner file) ------------------*/
 extern LogicResult g_logic;
 extern ScopeGeom g_geom;
@@ -637,11 +647,32 @@ bool mpanel_wanted(void);
 void redraw_trace(void);
 void refresh_view(void);
 void update_display(void);
+void close_gaps(DisplayBuffer *db);
+void change_horizontal_scale(int delta);
 
 /*- Shared state (definitions stay with their owner file) ------------------*/
 extern DataBuffer g_data_buffer;
 extern DisplayBuffer g_display_buffer;
 extern bool g_line_owner;
 extern bool g_mpanel_active;
+
+/*- Shared state (definitions stay with their owner file) ------------------*/
+extern AliasAnalysis g_fft_alias;
+extern FftAnalysis g_fft_an;
+extern bool g_fft_band_auto;
+extern bool g_fft_have;
+extern bool g_fft_panel_on;
+extern bool g_fft_panel_pending;
+extern float g_fft_mag[FFT_BINS];
+extern int g_fft_cursor;
+extern int g_fft_cursor_bin;
+extern int g_fft_timer;
+extern int64_t g_fft_auto_span;
+extern uint16_t g_fft_grad[GRID_HEIGHT_MAX];
+extern uint8_t g_fft_samples[FFT_SIZE];
+
+/*- Shared state (definitions stay with their owner file) ------------------*/
+extern bool g_shadow_valid;
+extern bool g_sweep_force;
 
 #endif // _SCOPE_INTERNAL_H_
