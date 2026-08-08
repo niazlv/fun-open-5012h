@@ -225,7 +225,9 @@ SRCS += \
 # entry is read or written, a fault dump is formatted - so a hundred cycles
 # either way is invisible next to the LCD bus it is waiting for and next to the
 # human who pressed the key. What is not on the list is anything the trace sweep
-# touches: scope.c and capture.c stay at -O3, because those DO run per column.
+# touches: every scope_*.o and capture.c stay at -O3, because those DO run per
+# column. scope_menu.o is the one scope object that IS on the list - it is all
+# menu tables and callbacks, and it was here before the split.
 #
 # It was 5.8 KB of headroom that made this necessary; it is the mechanism the
 # next feature should reach for before anything is cut.

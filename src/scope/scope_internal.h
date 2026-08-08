@@ -776,8 +776,6 @@ extern uint8_t g_roll_row_flags[GRID_WIDTH];
 extern uint8_t g_roll_row_max[GRID_WIDTH];
 extern uint8_t g_roll_row_min[GRID_WIDTH];
 
-/*- Shared state (definitions stay with their owner file) ------------------*/
-
 
 extern bool g_autocal_active;
 extern bool g_autocal_gain_only;
@@ -787,7 +785,6 @@ extern int g_autocal_timer;
 extern int g_calib_hint_param;
 extern uint32_t g_gain_note_until;
 
-// Cross-file (owner: scope.c):
 void autoset_set_horizontal(int hs);
 void autoset_set_scale(int scale);
 void change_vertical_scale(int delta);
@@ -801,15 +798,11 @@ void update_display(void);
 void close_gaps(DisplayBuffer *db);
 void change_horizontal_scale(int delta);
 
-/*- Shared state (definitions stay with their owner file) ------------------*/
-
 
 extern DataBuffer g_data_buffer;
 extern DisplayBuffer g_display_buffer;
 extern bool g_line_owner;
 extern bool g_mpanel_active;
-
-/*- Shared state (definitions stay with their owner file) ------------------*/
 
 
 extern AliasAnalysis g_fft_alias;
@@ -826,37 +819,26 @@ extern int64_t g_fft_auto_span;
 extern uint16_t g_fft_grad[GRID_HEIGHT_MAX];
 extern uint8_t g_fft_samples[FFT_SIZE];
 
-/*- Shared state (definitions stay with their owner file) ------------------*/
-
 
 extern bool g_shadow_valid;
 extern bool g_sweep_force;
-
-/*- Shared state (definitions stay with their owner file) ------------------*/
 
 
 extern int  g_trend_timer;
 extern int g_measure_timer;
 
-/*- Shared state (definitions stay with their owner file) ------------------*/
-
 
 extern bool g_autoset_active;
-
-/*- Shared state (definitions stay with their owner file) ------------------*/
 
 
 extern bool g_layout_grab;
 extern int g_layout_sel;
-
-/*- Shared state (definitions stay with their owner file) ------------------*/
 
 
 extern PanelPlaced g_placed[PANEL_WIDGETS_MAX];
 extern bool g_mpanel_is_text;
 extern int g_placed_n;
 
-// Cross-file (owner: scope.c):
 int layout_unused_metric(void);
 int layout_used(void);
 int mpanel_chars(void);
@@ -873,7 +855,6 @@ const Font *mpanel_font(void);
 const Font *widget_font(int size);
 PanelWidget *layout_selected(void);
 
-/*- Shared state (definitions stay with their owner file) ------------------*/
 
 extern bool g_dbit_on;
 extern bool g_decode_force;
@@ -894,7 +875,6 @@ extern uint8_t g_dband_gap[(GRID_WIDTH + 7) / 8];
 extern uint8_t g_dband_gedge[(GRID_WIDTH + 7) / 8];
 extern uint8_t g_dband_mask[DBAND_H3][(GRID_WIDTH + 7) / 8];
 
-/*- Shared state (definitions stay with their owner file) ------------------*/
 
 extern int g_dband_row0;
 extern int g_dband_rows;
@@ -937,8 +917,6 @@ static inline int cursor_v_row(int mv)
   return clip_for_display(px);
 }
 
-
-/*- Shared state (definitions stay with their owner file) ------------------*/
 
 extern MPanelCell g_mpanel_cell[MPANEL_CELLS_MAX];
 extern bool g_recon_strained;
